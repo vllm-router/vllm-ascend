@@ -331,6 +331,12 @@ class AscendConfig:
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
+        # Payload scramble (edge/cloud hidden-state obfuscation) static
+        # factors: {"device_id": ..., "custom_factor": ...}.  Both keys are
+        # optional; the scrambler falls back to deterministic defaults when
+        # absent.
+        self.payload_scramble: dict = additional_config.get("payload_scramble", {}) or {}
+
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
         if config_key in additional_config:

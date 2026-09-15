@@ -23,6 +23,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm_ascend import envs
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
@@ -134,6 +135,9 @@ class LwdEdgeWorker(NPUWorker):
         # warmup additionally requires both peers to reach it in the same fixed
         # order, which only holds once every rank is past its distributed init.
         super().init_device()
+        # Payload scramble: bind the two static factors once; the per-flight
+        # seed is derived by the comm layer from each request's own fields.
+        self._build_payload_scrambler()
         self.comm_service = get_lwd_comm_service()
         # 多模态缓存:req_id -> mm_features(带 data,首 chunk 随
         # scheduled_new_reqs 到达时登记,chunk 越过全部 mm 段或
@@ -151,6 +155,20 @@ class LwdEdgeWorker(NPUWorker):
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
             self.rank,
+        )
+
+    def _build_payload_scrambler(self) -> None:
+        """Initialize the process-wide scrambler from config (no-op if not LWD)."""
+        if not self.enable_lwd:
+            return
+        from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+            get_payload_scrambler,
+        )
+
+        scramble_cfg = get_ascend_config().payload_scramble
+        get_payload_scrambler(
+            device_id=scramble_cfg.get("device_id"),
+            custom_factor=scramble_cfg.get("custom_factor"),
         )
 
     def compile_or_warm_up_model(self):

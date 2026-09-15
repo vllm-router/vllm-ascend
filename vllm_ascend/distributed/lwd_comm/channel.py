@@ -35,6 +35,28 @@ from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 from vllm_ascend.distributed.lwd_comm.types import LwdCommRequest, LwdChannelType
 
 
+def _scramble_seed_for(request: LwdCommRequest) -> int | None:
+    """Derive the per-flight seed from the request's own fields, or None.
+
+    The seed's three inputs (channel / seqno / num_elements) already live on
+    the request, so the comm layer derives it here instead of having the
+    worker pre-compute and duplicate them.  Returns None when scramble is off
+    (no process-wide scrambler has been built).
+    """
+    from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+        get_payload_scrambler,
+        is_payload_scrambler_initialized,
+    )
+
+    if not is_payload_scrambler_initialized():
+        return None
+    return get_payload_scrambler().seed_for(
+        channel=request.channel.value,
+        seqno=request.seqno,
+        num_elements=request.num_elements,
+    )
+
+
 class LwdChannel:
     """One FIFO of pending requests for one physical
     (channel, direction, instance) wire."""
@@ -127,6 +149,15 @@ class LwdChannel:
         """Give the comm layer ownership of the send payload."""
         assert request.tensor is not None, "send requires tensor"
         owned = request.tensor.detach().clone()
+        seed = _scramble_seed_for(request)
+        if seed is not None:
+            # Scramble the communication-owned snapshot (never the model
+            # tensor the caller still owns).
+            from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+                get_payload_scrambler,
+            )
+
+            get_payload_scrambler().scramble(owned, seed=seed)
         aux_owned = (
             request.aux_tensor.detach().clone()
             if request.aux_tensor is not None
@@ -296,6 +327,21 @@ class LwdChannel:
             else:
                 tensor, aux_tensor, handles = self._wire_recv(req)
             done_event = self._bridge_and_record(handles)
+            seed = _scramble_seed_for(req) if req.op == "recv" else None
+            if seed is not None:
+                # `_bridge_and_record` waits on the HCCL handle, so the recv
+                # payload is already complete here; XOR is its own inverse,
+                # so applying it in place undoes the sender's scramble.  The
+                # completion event is re-recorded AFTER the descramble so the
+                # consumer's wait() cannot observe the tensor mid-scramble.
+                from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+                    get_payload_scrambler,
+                )
+
+                assert tensor is not None, "recv requires tensor"
+                get_payload_scrambler().descramble(tensor, seed=seed)
+                done_event = torch.npu.Event()
+                done_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
             return LwdCommFuture(
