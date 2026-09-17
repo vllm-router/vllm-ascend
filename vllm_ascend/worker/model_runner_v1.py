@@ -1087,8 +1087,7 @@ class NPUModelRunner(GPUModelRunner):
             # fallback below reading fresh per-request acceptance without a
             # blocking sync in _update_states_after_model_execute. Native
             # (non-LWD) deployments keep the previous behavior bit-for-bit.
-            lwd_persist = self._lwd_spec_persist_enabled
-            if lwd_persist:
+            if self._lwd_spec_persist_enabled:
                 self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
@@ -1099,7 +1098,7 @@ class NPUModelRunner(GPUModelRunner):
                         np.where(new_mask, 0, prev_idx)
                     ]
                 )
-                if lwd_persist:
+                if self._lwd_spec_persist_enabled:
                     # A decode request with prev_positions == -1 is not a new
                     # request: use its own last-decode-step acceptance
                     # (persisted in CachedRequestState by
