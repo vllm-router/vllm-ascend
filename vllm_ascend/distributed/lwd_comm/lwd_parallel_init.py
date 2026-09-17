@@ -35,23 +35,29 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         return
     assert torch.distributed.is_initialized()
     lwd = parallel_config.lwd_config
-    edge_count = lwd.edge_npu_count
-    cloud_count = lwd.cloud_npu_count
-    world_per_dp = edge_count + cloud_count
     data_parallel_size = parallel_config.data_parallel_size
+    e_per = lwd.edge_npu_count_per_dp(data_parallel_size)
+    c_per = lwd.cloud_npu_count_per_instance_dp(data_parallel_size)
+    e_total = lwd.edge_rank_count(data_parallel_size)
     world_size = torch.distributed.get_world_size()
-    assert world_size == data_parallel_size * world_per_dp, (
+    assert world_size == lwd.lwd_world_size(data_parallel_size), (
         f"Lwd world size mismatch: got {world_size}, expected "
-        f"{data_parallel_size} * ({edge_count} + {cloud_count})")
+        f"{lwd.lwd_world_size(data_parallel_size)} "
+        f"(edge {e_total} + {lwd.instance_parallel_size} instances x "
+        f"{data_parallel_size} dp x {c_per} cloud ranks)")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 组:按 pp 段划分——段 0 为边 rank,段 1 为该实例的云 rank,
-    # 与 vllm 侧 PP 分组([边0, 云0] 两段链 + 其余单例)的链路语义对齐。
+    # MC2 组:按 (instance, dp) 段划分——每 dp 的边 rank 一段、每个
+    # (实例, dp) 的云 rank 一段,与 vllm 侧 PP/TP 分组(§4.1/§4.2 布
+    # 局)的链路语义对齐;建组顺序同样全局固定(实例主序)。
     mc2_groups: list[list[int]] = []
     for dp_idx in range(data_parallel_size):
-        base = dp_idx * world_per_dp
-        mc2_groups.append([base + r for r in range(edge_count)])
-        mc2_groups.append([base + edge_count + r for r in range(cloud_count)])
+        mc2_groups.append(
+            [dp_idx * e_per + r for r in range(e_per)])
+    for inst in range(lwd.instance_parallel_size):
+        for dp_idx in range(data_parallel_size):
+            base = lwd.lwd_cloud_first_rank(inst, dp_idx, data_parallel_size)
+            mc2_groups.append([base + r for r in range(c_per)])
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
         get_world_group().local_rank,

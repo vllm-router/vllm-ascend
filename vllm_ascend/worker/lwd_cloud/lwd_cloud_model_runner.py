@@ -121,15 +121,24 @@ class LwdCloudModelRunner(NPUModelRunner):
             out_offset[req_id] = off
             off += int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
 
-        for batch_seqno in list(posted.keys()):
-            item = worker._lwd_up_recv_futures.pop(batch_seqno, None)
+        for post_key in list(posted.keys()):
+            item = worker._lwd_up_recv_futures.pop(post_key, None)
             if item is None:
                 continue
             future, meta = item
+            instance_id, batch_seqno = post_key
             _t_wait = time.monotonic()
             import torch.distributed as dist
             _lwd_cfg = worker.parallel_config.lwd_config
-            _is_endpoint = worker.rank == _lwd_cfg.edge_npu_count
+            # 端点判定查线缆表(§4.1:本实例本 dp 的云首卡);表缺失时
+            # 回退旧的全局算术(单实例形态两者一致)。
+            from vllm_ascend.distributed import lwd_wire
+
+            try:
+                _, _cloud_endpoint = lwd_wire.lwd_pair_ranks(instance_id)
+            except RuntimeError:
+                _cloud_endpoint = _lwd_cfg.edge_npu_count
+            _is_endpoint = worker.rank == _cloud_endpoint
             numel = sum(len(t) for t in meta.token_ids) * hidden_size
             # UP 第二段(TP 组内广播)按 prefill_only_demo_br 范式在消费
             # 时刻、本卡计算流上原子完成:launch + handle.wait() 同一流
@@ -161,14 +170,15 @@ class LwdCloudModelRunner(NPUModelRunner):
                 )
                 work.wait()  # 桥接广播完成到当前(计算)流,后续 copy 有序
             logger.info(
-                "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
-                batch_seqno, (time.monotonic() - _t_wait) * 1000,
+                "[Lwd][perf] cloud up-recv-wait seqno=%s instance=%d "
+                "dur=%.2fms",
+                batch_seqno, instance_id, (time.monotonic() - _t_wait) * 1000,
             )
             embeds = up_flat.view(-1, hidden_size)
             logger.info(
-                "[Lwd][cloud-runner] UP embeds consumed seqno=%s rows=%s "
-                "reqs=%s",
-                batch_seqno, embeds.shape[0], meta.req_ids,
+                "[Lwd][cloud-runner] UP embeds consumed seqno=%s instance=%d "
+                "rows=%s reqs=%s",
+                batch_seqno, instance_id, embeds.shape[0], meta.req_ids,
             )
             row = 0
             for req_id, token_ids in zip(meta.req_ids, meta.token_ids):

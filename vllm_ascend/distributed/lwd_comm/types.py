@@ -53,6 +53,20 @@ class LwdCommRequest:
     seqno: int | None = None
     # Explicit global peer rank; None -> the channel's configured peer.
     src_dst: int | None = None
+    # Cloud instance this traffic belongs to (design doc §4.3/§4.4).
+    # ``src_dst`` is an in-group rank inside the instance's channel pair,
+    # so the same in-group peer address is valid for every instance; the
+    # instance selects WHICH physical (communicator, stream, FIFO) the
+    # op runs on.  Stamped by the worker: the edge reads it from
+    # ``LwdBatch.instance_id`` (0 = single-instance / unstamped legacy
+    # traffic), a cloud worker stamps its own
+    # ``instance_parallel_start_rank``.  The scheduler's per-instance
+    # seqno counters and the service's per-instance channels are two
+    # halves of the same contract: without this field every instance's
+    # traffic collapses onto one channel whose seqno space then rejects
+    # the second instance's first batch ("duplicate or replayed
+    # seqno") — treat that error as a missing-stamp tripwire.
+    instance_id: int = 0
 
 
 @dataclass

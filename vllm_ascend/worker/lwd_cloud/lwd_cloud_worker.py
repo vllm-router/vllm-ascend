@@ -75,10 +75,20 @@ class LwdCloudWorker(NPUWorker):
 
     def init_device(self):
         super().init_device()
-        # channel-global DOWN seqno counter (worker layer, send-time alloc)
-        self._lwd_down_next_seqno = 0
-        # req_id -> posted UP recv futures (consumed by the runner's device-side inject)
-        self._lwd_up_recv_futures: dict[str, list] = {}
+        # per-instance DOWN seqno counters (worker layer, send-time
+        # alloc). Keyed by instance: each cloud instance's DOWN channel
+        # has its own seqno space starting at 0. A single-instance
+        # cloud process holds exactly one entry (instance 0 until the
+        # control plane stamps batches).
+        self._lwd_down_next_seqno: dict[int, int] = {}
+        # (instance_id, seqno) -> posted UP recv futures (consumed by
+        # the runner's device-side inject)
+        self._lwd_up_recv_futures: dict[tuple[int, int], tuple] = {}
+        # Identity of THIS cloud instance (§4.1): derived from the
+        # global rank (authoritative — the rank's position inside the
+        # instance-major layout IS the instance), validated against
+        # --instance-parallel-start-rank when the command declares one.
+        self._lwd_own_instance = self._lwd_resolve_own_instance()
         if not self.enable_lwd:
             return
         if self.use_v2_model_runner:
@@ -101,6 +111,33 @@ class LwdCloudWorker(NPUWorker):
 
         lwd_wire.init_lwd_duplex_channels()
         self._register_lwd_prompt_embeds_provider()
+
+    def _lwd_resolve_own_instance(self) -> int:
+        """Instance index of this cloud worker process.
+
+        Derived from the global rank under the §4.1 layout (edge ranks
+        first; cloud instance i's block spans
+        ``[E + i*D*C, E + (i+1)*D*C)``); when the launch command
+        declared ``--instance-parallel-start-rank`` the two must agree —
+        a mismatch means two commands collided on the same rank block
+        (or the edge/cloud counts disagree), so fail fast."""
+        pc = self.parallel_config
+        lwd = pc.lwd_config
+        d = pc.data_parallel_size
+        e_total = lwd.edge_rank_count(d)
+        block = d * lwd.cloud_npu_count_per_instance_dp(d)
+        if self.rank < e_total or block <= 0:
+            return 0
+        derived = (self.rank - e_total) // block
+        declared = lwd.instance_parallel_start_rank
+        if declared is not None and int(declared) != derived:
+            raise RuntimeError(
+                f"cloud rank {self.rank} derives instance {derived} from "
+                f"the §4.1 layout but the command declares "
+                f"--instance-parallel-start-rank {declared}; check "
+                "edge/cloud NPU counts and the start-rank assignment"
+            )
+        return derived
 
     def load_model(self):
         """加载后打实际切片:层数/首末层名/pp 切层参数,启动期即可裁决
@@ -187,7 +224,27 @@ class LwdCloudWorker(NPUWorker):
             return
 
         lwd = self.parallel_config.lwd_config
-        is_endpoint = self.rank == lwd.edge_npu_count
+        # Stamp/identity agreement: the batch's instance stamp (edge
+        # scheduler's pick) must route onto THIS instance's wire pair —
+        # the recv is always posted on the instance this rank actually
+        # belongs to. An unstamped (legacy) batch stamps 0; a mismatched
+        # non-zero stamp is an edge misroute and is surfaced loudly.
+        instance_id = self._lwd_own_instance
+        stamped = int(getattr(batch, "instance_id", 0) or 0)
+        if stamped not in (0, instance_id):
+            logger.error(
+                "[Lwd][MISROUTE] batch seqno=%d stamped instance=%d but "
+                "this cloud process is instance=%d — posting on own "
+                "instance (check edge dispatch / instance start-ranks)",
+                batch.seqno, stamped, instance_id,
+            )
+        from vllm_ascend.distributed import lwd_wire
+
+        try:
+            _, cloud_endpoint = lwd_wire.lwd_pair_ranks(instance_id)
+        except RuntimeError:
+            cloud_endpoint = lwd.edge_npu_count
+        is_endpoint = self.rank == cloud_endpoint
         if is_endpoint:
             future = get_lwd_comm_service().submit_recv(
                 LwdCommRequest(
@@ -195,17 +252,19 @@ class LwdCloudWorker(NPUWorker):
                     op="recv",
                     num_elements=num_tokens * hidden_size,
                     seqno=batch.seqno,
+                    instance_id=instance_id,
                 )
             )
         else:
             # 非端点:不碰跨机通道;广播接收推迟到注入时刻现场发起,
             # None 即"消费时现场广播"标记。
             future = None
-        self._lwd_up_recv_futures[batch.seqno] = (future, meta)
+        self._lwd_up_recv_futures[(instance_id, batch.seqno)] = (future, meta)
         logger.info(
-            "[Lwd][cloud-worker] UP recv posted seqno=%d reqs=%d tokens=%d "
-            "endpoint=%s",
-            batch.seqno, len(meta.req_ids), num_tokens, is_endpoint,
+            "[Lwd][cloud-worker] UP recv posted seqno=%d instance=%d "
+            "reqs=%d tokens=%d endpoint=%s",
+            batch.seqno, instance_id, len(meta.req_ids), num_tokens,
+            is_endpoint,
         )
 
     @torch.inference_mode()
@@ -220,10 +279,12 @@ class LwdCloudWorker(NPUWorker):
             payload = self.model_runner.take_lwd_pending_down_payload()
             if payload is not None and output is not None:
                 hidden, pinned, _event, req_ids, _accepted = payload
-                seqno = self._lwd_next_down_seqno()
+                instance_id = self._lwd_own_instance
+                seqno = self._lwd_next_down_seqno(instance_id)
                 logger.info(
-                    "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
-                    seqno, hidden.numel(),
+                    "[Lwd][cloud-worker] DOWN send seqno=%d instance=%d "
+                    "numel=%d",
+                    seqno, instance_id, hidden.numel(),
                 )
                 get_lwd_comm_service().submit_send(
                     LwdCommRequest(
@@ -232,6 +293,7 @@ class LwdCloudWorker(NPUWorker):
                         num_elements=hidden.numel(),
                         tensor=hidden,
                         seqno=seqno,
+                        instance_id=instance_id,
                     )
                 )
                 # async 包装器下挂到内层,否则 get_output() 解包丢失
@@ -301,7 +363,10 @@ class LwdCloudWorker(NPUWorker):
             _lwd_prompt_embeds_provider
         )
 
-    def _lwd_next_down_seqno(self) -> int:
-        seqno = self._lwd_down_next_seqno
-        self._lwd_down_next_seqno += 1
+    def _lwd_next_down_seqno(self, instance_id: int = 0) -> int:
+        """Allocate the instance's next DOWN seqno (its own channel-local
+        space starting at 0 — the instance axis keeps every instance's
+        counter independent)."""
+        seqno = self._lwd_down_next_seqno.get(int(instance_id), 0)
+        self._lwd_down_next_seqno[int(instance_id)] = seqno + 1
         return seqno

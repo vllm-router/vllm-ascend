@@ -36,11 +36,22 @@ from vllm_ascend.distributed.lwd_comm.types import LwdCommRequest, LwdChannelTyp
 
 
 class LwdChannel:
-    """One FIFO of pending requests for a physical channel/peer wire."""
+    """One FIFO of pending requests for one physical
+    (channel, direction, instance) wire."""
 
-    def __init__(self, channel_type: LwdChannelType, op: str) -> None:
+    def __init__(
+        self,
+        channel_type: LwdChannelType,
+        op: str,
+        instance_id: int = 0,
+    ) -> None:
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
+        # Cloud instance whose wire this FIFO drains. Selects the
+        # instance's physical (communicator, stream, peer) at wire-op
+        # time; the per-instance seqno space and this per-instance FIFO
+        # are two halves of the same routing contract.
+        self.instance_id = int(instance_id)
         self._pending: deque[LwdCommFuture] = deque()
         self._lock = threading.Lock()
         # The pending-queue lock alone cannot prevent two host threads
@@ -297,7 +308,9 @@ class LwdChannel:
         return into
 
     def _stream(self):
-        return lwd_wire.get_lwd_channel_stream(self.channel_type)
+        return lwd_wire.get_lwd_channel_stream(
+            self.channel_type, self.instance_id
+        )
 
     def _order_after(self, predecessor: LwdCommFuture | None) -> None:
         if predecessor is None:
@@ -307,40 +320,44 @@ class LwdChannel:
             self._stream().wait_event(event)
 
     def _wire_send(self, req: LwdCommRequest) -> list[Any]:
-        group = lwd_wire.get_lwd_channel_device_group(self.channel_type)
+        group = lwd_wire.get_lwd_channel_device_group(
+            self.channel_type, self.instance_id
+        )
         peer = req.src_dst
         if peer is None:
-            peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
+            peer = lwd_wire.get_lwd_channel_peer(
+                self.channel_type, self.instance_id
+            )
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
-            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s "
-            "shape=%s dtype=%s op=%s",
-            self.channel_type, dist.get_rank(), peer,
+            "[lwd-comm] SEND post channel=%s instance=%d my_rank=%d "
+            "peer=%s group_ranks=%s shape=%s dtype=%s op=%s",
+            self.channel_type, self.instance_id, dist.get_rank(), peer,
             dist.get_process_group_ranks(group),
             list(tensor.shape), tensor.dtype,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
-            else "isend",
+            "isend",
         )
         # UP(边→云)两层通信:第一段边→云端点 P2P(只等端点 join,
         # 不再被 8 卡 join 拖住);第二段端点在云 TP 组内 broadcast
         # (见 _wire_recv)。DOWN(云 leader→边)保持点对点。
-        if self.channel_type == LwdChannelType.UP:
-            return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _wire_recv(self, req: LwdCommRequest):
-        group = lwd_wire.get_lwd_channel_device_group(self.channel_type)
+        group = lwd_wire.get_lwd_channel_device_group(
+            self.channel_type, self.instance_id
+        )
         peer = req.src_dst
         if peer is None:
-            peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
+            peer = lwd_wire.get_lwd_channel_peer(
+                self.channel_type, self.instance_id
+            )
         logger.debug(
-            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s "
-            "num_elements=%d op=%s",
-            self.channel_type, dist.get_rank(), peer,
+            "[lwd-comm] RECV post channel=%s instance=%d my_rank=%d "
+            "src=%s group_ranks=%s num_elements=%d op=%s",
+            self.channel_type, self.instance_id, dist.get_rank(), peer,
             dist.get_process_group_ranks(group), req.num_elements,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
-            else "irecv",
+            "irecv",
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
