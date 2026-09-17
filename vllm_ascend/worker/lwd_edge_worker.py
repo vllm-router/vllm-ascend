@@ -127,24 +127,34 @@ class LwdEdgeWorker(NPUWorker):
             return None
 
         batch_meta = lwd_batch.batch_meta
+        # 多实例路由 stamp(§4.3/§4.4):控制面(实例派发)落地前默认 0,
+        # 即全部流量走实例 0 的通道对——单实例行为与打标前逐比特一致。
+        instance_id = int(getattr(lwd_batch, "instance_id", 0) or 0)
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
             logger.info(
-                "[Lwd][edge-worker] EMBED seqno=%d reqs=%d tokens=%d",
+                "[Lwd][edge-worker] EMBED seqno=%d instance=%d reqs=%d "
+                "tokens=%d",
                 lwd_batch.seqno,
+                instance_id,
                 len(batch_meta.req_ids),
                 sum(len(token_ids) for token_ids in batch_meta.token_ids),
             )
-            return self._execute_lwd_embed(lwd_batch.seqno, batch_meta)
+            return self._execute_lwd_embed(
+                lwd_batch.seqno, batch_meta, instance_id
+            )
         if lwd_batch.batch_type == LwdBatchType.LWD_UNEMBED:
             logger.info(
-                "[Lwd][edge-worker] UNEMBED seqno=%d reqs=%d accepted=%d "
-                "num_elements=%d",
+                "[Lwd][edge-worker] UNEMBED seqno=%d instance=%d reqs=%d "
+                "accepted=%d num_elements=%d",
                 lwd_batch.seqno,
+                instance_id,
                 len(batch_meta.req_ids),
                 sum(batch_meta.num_accept_tokens),
                 batch_meta.recv_num_elements,
             )
-            return self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
+            return self._execute_lwd_unembed(
+                lwd_batch.seqno, batch_meta, instance_id
+            )
 
         logger.debug(
             "[lwd-edge] unknown LWD batch type %r; nothing to do",
@@ -152,7 +162,9 @@ class LwdEdgeWorker(NPUWorker):
         )
         return None
 
-    def _execute_lwd_embed(self, seqno: int, batch_meta: LwdEmbedBatch) -> None:
+    def _execute_lwd_embed(
+        self, seqno: int, batch_meta: LwdEmbedBatch, instance_id: int = 0
+    ) -> None:
         model = self.model_runner.get_model()
         device = self.model_runner.device
         if not batch_meta.token_ids:
@@ -173,6 +185,7 @@ class LwdEdgeWorker(NPUWorker):
             num_elements=embeds.numel(),                     # total_N * H
             tensor=embeds,
             seqno=seqno,
+            instance_id=instance_id,
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -188,7 +201,7 @@ class LwdEdgeWorker(NPUWorker):
         )
 
     def _execute_lwd_unembed(
-        self, seqno: int, batch_meta: LwdUnembedBatch
+        self, seqno: int, batch_meta: LwdUnembedBatch, instance_id: int = 0
     ) -> ModelRunnerOutput:
         model = self.model_runner.get_model()
         if not batch_meta.req_ids:
@@ -201,6 +214,7 @@ class LwdEdgeWorker(NPUWorker):
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
+                instance_id=instance_id,
             )
         )
         _t_post = time.monotonic()
