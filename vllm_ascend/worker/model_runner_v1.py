@@ -1082,6 +1082,11 @@ class NPUModelRunner(GPUModelRunner):
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
+            # The event also covers the deferred persist copy; landing the
+            # stashed values here keeps the phase-alternation fallback below
+            # reading fresh per-request acceptance without a blocking sync
+            # in _update_states_after_model_execute.
+            self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
@@ -1091,7 +1096,25 @@ class NPUModelRunner(GPUModelRunner):
                         np.where(new_mask, 0, prev_idx)
                     ]
                 )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
+                # A decode request with prev_positions == -1 is not a new
+                # request: use its own last-decode-step acceptance (persisted
+                # in CachedRequestState by _update_states_after_model_execute).
+                # Only genuine new/prefill requests keep the default of 1.
+                for cur_idx in range(num_reqs):
+                    if not new_mask[cur_idx]:
+                        continue
+                    req_state = self.requests.get(
+                        self.input_batch.req_ids[cur_idx]
+                    )
+                    if (
+                        req_state is not None
+                        and req_state.num_computed_tokens
+                        >= req_state.num_prompt_tokens
+                        and req_state.num_accepted_tokens > 0
+                    ):
+                        self.num_accepted_tokens.np[cur_idx] = (
+                            req_state.num_accepted_tokens
+                        )
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
                     self.num_accepted_tokens.np[:num_reqs]
                 )
