@@ -362,12 +362,16 @@ class LwdCloudModelRunner(NPUModelRunner):
 
         hidden_packet = torch.cat(rows_list)
         n_req = sum(1 for i in range(len(batch_req_ids)) if valid[i])
+        seg_lens_host: list[int] | None = None
         if is_spec:
             counts_dev = torch.cat(counts_list).to(torch.int32)
-            seg_lens_dev = torch.tensor(
-                seg_lens_list, dtype=torch.int32, device=logits.device
-            )
-            meta_dev = torch.cat(ranks_list + [counts_dev, seg_lens_dev])
+            meta_dev = torch.cat(ranks_list + [counts_dev])
+            # seg_lens 不上设备:torch.tensor(list, device=...) 是同步
+            # H2D,会在主流上等设备排空——MTP 下等到的恰好是 draft
+            # propose 尾巴(实测 collect rank 段 ~6ms)。改为 host 直写
+            # pinned 尾段:与 D2H 前缀区域不相交,且引擎读 pinned 发生
+            # 在 ready_event 同步(更晚)之后,无竞态。
+            seg_lens_host = seg_lens_list
         else:
             counts_dev = torch.ones(n_req, dtype=torch.int32,
                                     device=logits.device)
@@ -378,9 +382,12 @@ class LwdCloudModelRunner(NPUModelRunner):
         # "响应发出 ⟹ pinned 就绪"成为硬保证(同步在输出线程,
         # 不在计算关键路径)。
         _t_pack = time.monotonic()
-        n_meta = meta_dev.numel()
+        n_dev = meta_dev.numel()
+        n_meta = n_dev + (len(seg_lens_host) if seg_lens_host is not None else 0)
         pinned = self._lwd_meta_pinned(n_meta)
-        pinned[:n_meta].copy_(meta_dev, non_blocking=True)
+        pinned[:n_dev].copy_(meta_dev, non_blocking=True)
+        if seg_lens_host is not None:
+            pinned.numpy()[n_dev:n_meta] = seg_lens_host
         self.worker._lwd_meta_ready_event = torch.npu.Event()
         self.worker._lwd_meta_ready_event.record()
         # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 拼包+拷贝
