@@ -159,8 +159,6 @@ class LwdEdgeWorker(NPUWorker):
 
     def _build_payload_scrambler(self) -> None:
         """Initialize the process-wide scrambler from config (no-op if not LWD)."""
-        if not self.enable_lwd:
-            return
         from vllm_ascend.distributed.lwd_comm.payload_scramble import (
             get_payload_scrambler,
         )
