@@ -156,7 +156,7 @@ def init_lwd_duplex_channels() -> None:
                 _LWD_CHANNEL_GROUPS[(channel, i, j)] = (group, peer)
                 stream_key = (channel, i)
                 if stream_key not in _LWD_CHANNEL_STREAMS:
-                    _LWD_CHANNEL_STREAMS[stream_key] = torch.npu.Stream()
+                    _LWD_CHANNEL_STREAMS[stream_key] = torch.npu.Stream(priority=-1)
     # embeds 组内广播不再自建通信域(自建 new_group 在 torch_npu 下实测
     # 零交付,疑建组顺序错位),改用框架 TP device_group(demo 同款,
     # 建组顺序由框架保证);广播在注入时刻于计算流上发起,与前向 TP
