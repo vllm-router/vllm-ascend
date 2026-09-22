@@ -58,6 +58,25 @@ class LwdCommRequest:
     # None -> 单边一云默认域(与旧行为逐位一致);上层按路由结果/来源边回填。
     edge_id: int | None = None
     cloud_id: int | None = None
+    # Optional second payload of the SAME logical request (currently
+    # UP-only: mrope positions, int64 [n,3], accompanying an embeds chunk
+    # when the batch has mm data).  Physically a second P2P issued right
+    # after the main one on the same channel, but sequencing stays at
+    # logical-request granularity: one seqno covers both frames, so
+    # skip/drain semantics are unchanged.  send: tensor; recv: None and
+    # ``aux_num_elements`` sizes the exact buffer.
+    #
+    # 扩展预留:再增加一种载荷时,把本组字段(aux_tensor/
+    # aux_num_elements/aux_dtype)扩成 list[TensorSpec] 即可——快照、
+    # keepalive、handles 桥接、recv 缓冲分配在 channel/future 里已是
+    # 按"主+aux 两条 op"写成的机械扩展;seqno 纪律与 sizing 预告
+    # (notify 携带逐帧 numel/dtype)同步扩展。
+    aux_tensor: Any | None = None
+    aux_num_elements: int = 0
+    # aux 帧的元素 dtype(torch.dtype;None = int64,mrope positions)。
+    # 收端据此分配精确缓冲;后续其他载荷(如 bf16 的 deepstack 帧)
+    # 显式指定即可,无需改通道结构。
+    aux_dtype: Any | None = None
 
 
 @dataclass
@@ -67,3 +86,6 @@ class LwdCommResult:
     status: LwdCommStatus
     tensor: Any | None = None
     error: BaseException | None = None
+    # Received aux payload (mrope positions int64), None when the
+    # request carried no aux frame.
+    aux_tensor: Any | None = None

@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 
 import torch
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import parse_edge_id
@@ -39,6 +39,13 @@ class LwdCloudModelRunner(NPUModelRunner):
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
+        # Stage per-request prompt lengths for device-side mask refresh.
+        if self.use_async_spec_decode and self.enable_prompt_embeds:
+            self._lwd_prompt_lens_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+        else:
+            self._lwd_prompt_lens_gpu = None
         self.lwd_hash_state = None
         # 用空值表示尚未准备真实批次，区分 dummy 前向。
         self._lwd_hash_step_tokens = None
@@ -115,23 +122,61 @@ class LwdCloudModelRunner(NPUModelRunner):
         if (self.use_async_spec_decode and self.enable_prompt_embeds
                 and intermediate_tensors is None and self.pcp_size == 1):
             self._lwd_refresh_decode_embedding_mask(scheduler_output)
+            if (get_pp_group().is_first_rank
+                    and not self.model_config.is_encoder_decoder
+                    and (not self.supports_mm_inputs or self.input_batch.req_prompt_embeds)):
+                return self._lwd_preprocess_prompt_embeds(scheduler_output, num_input_tokens)
+            # Other model paths keep the parent's preprocessing, which may
+            # still consume the CPU mask (for example encoder-decoder models).
+            count = scheduler_output.total_num_scheduled_tokens
+            self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
         return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+
+    def _lwd_preprocess_prompt_embeds(self, scheduler_output, num_input_tokens):
+        """Consume the corrected device mask on the LWD cloud decoder path."""
+        count = scheduler_output.total_num_scheduled_tokens
+        is_token_ids = self.is_token_ids.gpu[:count]
+        # Remote prompt rows do not carry meaningful token IDs.
+        token_ids = self.input_ids.gpu[:count].masked_fill(~is_token_ids, 0)
+        tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+        embeds = self.inputs_embeds.gpu[:count]
+        embeds.copy_(torch.where(is_token_ids.unsqueeze(-1), tokens_to_embeds, embeds))
+
+        # Match the parent's position layout and clear padding for graph replay.
+        if self.uses_mrope:
+            positions = self.mrope_positions.gpu[:, :num_input_tokens]
+        elif self.uses_xdrope_dim > 0:
+            positions = self.xdrope_positions.gpu[:, :num_input_tokens]
+        else:
+            positions = self.positions[:num_input_tokens]
+            if num_input_tokens > count:
+                self.positions[count:num_input_tokens].zero_()
+        return (
+            None,
+            self.inputs_embeds.gpu[:num_input_tokens],
+            positions,
+            None,
+            self._init_model_kwargs(),
+            None,
+        )
 
     def _lwd_refresh_decode_embedding_mask(self, scheduler_output):
         """根据设备上的实际位置重建掩码，避免 decode 行复用旧 embedding。
 
-        异步投机接受或拒绝后，CPU token 表可能滞后于设备上的输入和位置。
-        保留远端 prompt embedding，仅标记 decode 行需要重新计算 embedding。
-        此处主动同步读取设备位置，以保证掩码与本次模型输入一致。
+        异步上传各请求的 prompt 长度，复用设备上的请求索引展开到 token 行。
+        掩码直接写入设备缓冲区，由 LWD prompt-embeds 路径在设备上消费；
+        不回传 positions，也不刷新 CPU 掩码。
         """
+        num_reqs = len(self.input_batch.req_ids)
         count = scheduler_output.total_num_scheduled_tokens
-        positions = self.positions[:count].detach().cpu().numpy()
-        start = 0
-        for idx, req_id in enumerate(self.input_batch.req_ids):
-            end = start + scheduler_output.num_scheduled_tokens[req_id]
-            self.is_token_ids.np[start:end] = positions[start:end] >= self.input_batch.num_prompt_tokens[idx]
-            start = end
-        self.is_token_ids.copy_to_gpu(count)
+        prompt_lens_gpu = self._lwd_prompt_lens_gpu
+        assert prompt_lens_gpu is not None
+        prompt_lens_gpu[:num_reqs].copy_(
+            self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        prompt_lens_rows = prompt_lens_gpu[self.req_indices.gpu[:count]]
+        self.is_token_ids.gpu[:count] = self.positions[:count] >= prompt_lens_rows
 
     # 在云侧模拟前向前清除真实批次标记，防止复用上次请求路由。
     def _dummy_run(self, *args, **kwargs):
@@ -231,7 +276,16 @@ class LwdCloudModelRunner(NPUModelRunner):
         with stream-ordered H2D copies, so no host sync is needed there
         either.  The base fill loop may have copied stale buffer content
         earlier; our device write happens after it and is authoritative.
-        """
+
+        Chunks stamped ``has_mrope`` carry a second frame of mrope
+        positions ``[n, 3]`` (int64): the rows are written into the
+        request's ``req_state.mrope_positions`` window (overwriting the
+        pure-text passthrough initialization) so the native
+        ``_calc_mrope_positions`` consumes wire positions unchanged;
+        when the last chunk lands, ``mrope_position_delta`` is derived
+        locally (max+1-N) for the decode phase.  The aux frame rides
+        the same two-segment UP path (endpoint P2P + TP-group broadcast
+        at consume time, each its own launch+wait atomic pair)."""
         worker = self.worker
         if worker is None:
             return
@@ -285,16 +339,21 @@ class LwdCloudModelRunner(NPUModelRunner):
                 up_flat = res.tensor
                 if up_flat is None:
                     continue
+                # aux 帧(mrope positions [n,3] int64)与主帧同一逻辑
+                # 请求:端点从 future 结果直接取第二载荷。
+                aux_flat = res.aux_tensor
             else:
                 # 非端点:现场分配接收 buffer,等端点广播转发。
                 up_flat = torch.empty(
                     numel, dtype=torch.bfloat16, device="npu"
                 )
+                aux_flat = None
             from vllm.distributed.parallel_state import get_tp_group
             _tp = get_tp_group()
             if _tp.world_size > 1:
                 # 端点随 edge_id 轮转:广播源 = 本通信域的云端点 rank,
                 # 而非固定 TP0(不同边对应不同端点卡,见 lwd_wire 建组)。
+                # 主帧与 aux(mrope)帧共用同一广播源,保持多边语义一致。
                 _, cloud_endpoint = lwd_wire.get_lwd_channel_endpoint_rank(
                     edge_id=edge_id, cloud_id=None
                 )
@@ -305,6 +364,24 @@ class LwdCloudModelRunner(NPUModelRunner):
                     async_op=True,
                 )
                 work.wait()  # 桥接广播完成到当前(计算)流,后续 copy 有序
+            mrope_flat = None
+            if meta.has_mrope:
+                # aux 帧的第二段广播:独立 launch+wait 原子对(与主广播
+                # 同计算流背靠背,不共用句柄)——保持两段式 UP 的交付
+                # 纪律;非端点现场分配精确尺寸 int64 缓冲。
+                if not _is_endpoint:
+                    aux_flat = torch.empty(
+                        num_tokens * 3, dtype=torch.int64, device="npu",
+                    )
+                if _tp.world_size > 1:
+                    work_aux = dist.broadcast(
+                        aux_flat,
+                        src=cloud_endpoint,
+                        group=_tp.device_group,
+                        async_op=True,
+                    )
+                    work_aux.wait()
+                mrope_flat = aux_flat.view(-1, 3)
             logger.info(
                 "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
                 batch_seqno, (time.monotonic() - _t_wait) * 1000,
@@ -325,8 +402,9 @@ class LwdCloudModelRunner(NPUModelRunner):
                 raise ValueError("LWD requires one explicit prompt chunk offset per request")
             logger.info(
                 "[Lwd][cloud-runner] UP embeds consumed seqno=%s rows=%s "
-                "reqs=%s",
+                "reqs=%s has_mrope=%s",
                 batch_seqno, embeds.shape[0], meta.req_ids,
+                mrope_flat is not None,
             )
             row = 0
             for meta_idx, (req_id, token_ids) in enumerate(zip(meta.req_ids, meta.token_ids)):
@@ -382,6 +460,13 @@ class LwdCloudModelRunner(NPUModelRunner):
                             embeds[row : row + n], non_blocking=True
                         )
                     self.input_batch.is_token_ids[idx, start : start + n] = False
+                    # mrope 行与 embeds 行严格同窗同 row(边侧同批切片):
+                    # 写 req_state 窗口,末 chunk 落地自推 delta。
+                    if mrope_flat is not None:
+                        self._lwd_inject_mrope_positions(
+                            req_id, start, n,
+                            mrope_flat[row : row + n], prompt_len,
+                        )
                 row += n
             # 跨流生命周期登记:端点 recv buffer 由通道流分配与复用
             # (同尺寸 chunk 下分配器几乎总给同一块),本步 copy 在计算流。
@@ -389,11 +474,50 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 下一 seqno 的 irecv 覆写——深异步队列下表现为跨 seqno 串
             # 数据(多请求乱码)。登记后复用即被正确排序。
             up_flat.record_stream(torch.npu.current_stream())
+            # aux 帧同款竞态防护(端点 recv buffer;非端点本地分配,
+            # 登记无害)。
+            if aux_flat is not None:
+                aux_flat.record_stream(torch.npu.current_stream())
 
     # ------------------------------------------------------------------ #
     # Collect probe (measurement only; output discarded, protocol        #
     # still returns token_ids directly)                                   #
     # ------------------------------------------------------------------ #
+
+    def _lwd_inject_mrope_positions(
+        self,
+        req_id: str,
+        start: int,
+        n: int,
+        chunk_positions: torch.Tensor,
+        prompt_len: int,
+    ) -> None:
+        """写入一个 chunk 的线 mrope positions([n,3] int64,NPU)到请求
+        缓存的 [3, prompt] 窗口;末 chunk 落地时自推 delta(=
+        positions.max()+1-prompt_len,与边侧逐值一致)供 decode 期
+        原生 _calc_mrope_positions 现算 completion 段位置。
+
+        req_state.mrope_positions 由 ids=None 直通初始化(arange 纯文
+        本位置)——多模态请求的窗口被逐 chunk 覆盖,纯文本请求永不走
+        本路径(边侧不给它发 mrope 帧)。"""
+        req_state = self.requests.get(req_id)
+        assert chunk_positions.shape == (n, 3), (
+            f"mrope frame shape {tuple(chunk_positions.shape)} != "
+            f"({n}, 3) (req={req_id})"
+        )
+        req_state.mrope_positions[:, start : start + n] = (
+            chunk_positions.t().cpu()
+        )
+        if start + n >= prompt_len:
+            positions = req_state.mrope_positions[:, :prompt_len]
+            req_state.mrope_position_delta = (
+                int(positions.max().item()) + 1 - prompt_len
+            )
+            logger.info(
+                "[Lwd][cloud-runner] mrope complete: req=%s prompt=%d "
+                "delta=%d",
+                req_id, prompt_len, req_state.mrope_position_delta,
+            )
 
     def _sample(self, logits, spec_decode_metadata):
         """Capture the sampler output for the collect probe
@@ -573,4 +697,3 @@ class LwdCloudModelRunner(NPUModelRunner):
         idx = self._lwd_pinned_ring_idx
         self._lwd_pinned_ring_idx = (idx + 1) % len(ring)
         return ring[idx]
-
