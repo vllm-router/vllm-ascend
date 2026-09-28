@@ -1082,6 +1082,13 @@ class NPUModelRunner(GPUModelRunner):
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
+            # LWD-only: the event also covers the deferred persist copy;
+            # landing the stashed values here keeps the phase-alternation
+            # fallback below reading fresh per-request acceptance without a
+            # blocking sync in _update_states_after_model_execute. Native
+            # (non-LWD) deployments keep the previous behavior bit-for-bit.
+            if self._lwd_spec_persist_enabled:
+                self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
@@ -1091,7 +1098,29 @@ class NPUModelRunner(GPUModelRunner):
                         np.where(new_mask, 0, prev_idx)
                     ]
                 )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
+                if self._lwd_spec_persist_enabled:
+                    # A decode request with prev_positions == -1 is not a new
+                    # request: use its own last-decode-step acceptance
+                    # (persisted in CachedRequestState by
+                    # _update_states_after_model_execute). Only genuine
+                    # new/prefill requests keep the default of 1.
+                    for cur_idx in range(num_reqs):
+                        if not new_mask[cur_idx]:
+                            continue
+                        req_state = self.requests.get(
+                            self.input_batch.req_ids[cur_idx]
+                        )
+                        if (
+                            req_state is not None
+                            and req_state.num_computed_tokens
+                            >= req_state.num_prompt_tokens
+                            and req_state.num_accepted_tokens > 0
+                        ):
+                            self.num_accepted_tokens.np[cur_idx] = (
+                                req_state.num_accepted_tokens
+                            )
+                else:
+                    self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
                     self.num_accepted_tokens.np[:num_reqs]
                 )
@@ -2434,6 +2463,25 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if self._lwd_spec_persist_enabled and torch.is_tensor(
+                self._draft_token_ids
+            ):
+                # LWD:按请求持久化本步草稿(设备视图,零拷贝零同步)。
+                # 批次级 _draft_token_ids 会被下一步 propose 覆写,而
+                # 相位交替下恢复请求(prev_positions=-1)需要取回自己
+                # 最后一个 decode 步的草稿;prefill 步的首趟草稿同样
+                # 在此登记(其首个 decode 步也是恢复步)。请求缺席期间
+                # 无新 token 提交,草稿持续合法;离场即清理。
+                n_draft_rows = self._draft_token_ids.shape[0]
+                for row_idx, draft_req_id in enumerate(
+                    self.input_batch.req_ids[:n_draft_rows]
+                ):
+                    self._lwd_draft_stash[draft_req_id] = self._draft_token_ids[
+                        row_idx
+                    ]
+                for stale_req_id in list(self._lwd_draft_stash):
+                    if stale_req_id not in self.requests:
+                        del self._lwd_draft_stash[stale_req_id]
 
         (
             logprobs_lists,

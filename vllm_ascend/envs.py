@@ -32,6 +32,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
+    # LWD diagnostic: when set to 1, the cloud piggybacks per-request
+    # accepted token ids on the c2e notify and the edge skips its
+    # lm_head + rank-replay sampling, delivering those ids directly while
+    # still receiving the DOWN hidden tensor. Used to attribute ITL
+    # regression between edge unembed and cloud collect/transfer.
+    # Default 0 (normal rank-replay). Never enable in production.
+    "VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE", 0)
+    ),
+    # LWD diagnostic: when set to 1, the cloud skips DOWN collect and
+    # tensor send entirely; the c2e notify carries only per-request
+    # token ids (hidden_num_elements=0), and the edge delivers them
+    # directly without dispatching an UNEMBED batch or posting any recv.
+    # Used to measure performance with the whole collect/DOWN path
+    # removed. Default 0. Never enable in production.
+    "VLLM_ASCEND_LWD_DISABLE_DOWN": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_DISABLE_DOWN", 0)
+    ),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
     "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),
