@@ -299,35 +299,9 @@ class LwdEdgeWorker(NPUWorker):
                 seqno, tuple(expert_ids.shape), payload.numel(),
             )
 
-        # aux 帧(mrope positions):pdmix 混批下 has_mrope 是逐请求
-        # 列表——仅标记请求贡献行,按 req_ids 序拼接(云侧注入按同序
-        # 逐请求消费);纯文本请求零 aux 流量。
-        aux_rows = [
-            row
-            for hm, rows in zip(
-                batch_meta.has_mrope, batch_meta.mrope_positions
-            )
-            if hm
-            for row in rows
-        ]
-        aux_tensor = None
-        if aux_rows:
-            aux_tensor = torch.tensor(
-                aux_rows, dtype=torch.int64,
-                device=self.model_runner.device,
-            )
-            expected_rows = sum(
-                len(token_ids)
-                for hm, token_ids in zip(
-                    batch_meta.has_mrope, batch_meta.token_ids
-                )
-                if hm
-            )
-            assert aux_tensor.shape == (expected_rows, 3), (
-                f"mrope rows {aux_tensor.shape[0]} != mrope-req chunk "
-                f"tokens {expected_rows} (seqno={seqno})"
-            )
-
+        # mrope positions 已随 RangeNotify 走控制面(wire_version>=2),
+        # 数据面只发 embeds 主帧;aux 帧机制保留在通道层供 deepstack
+        # 等扩展,mrope 不再使用。
         request = LwdCommRequest(
             channel=LwdChannelType.UP,
             op="send",
@@ -335,10 +309,6 @@ class LwdEdgeWorker(NPUWorker):
             tensor=payload,
             seqno=seqno,
             instance_id=instance_id,
-            aux_tensor=aux_tensor,
-            aux_num_elements=(
-                aux_tensor.numel() if aux_tensor is not None else 0
-            ),
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
