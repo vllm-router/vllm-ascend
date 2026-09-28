@@ -230,15 +230,13 @@ class LwdCloudWorker(NPUWorker):
                     ),
                     seqno=batch.seqno,
                     edge_id=edge_id,
-                    # aux 帧(mrope positions [n,3] int64)仅端点预挂;
-                    # pdmix 混批下 has_mrope 为逐请求列表,aux 帧只含
-                    # 标记请求的行(Σ n_i×3,与边侧组帧同源同序);
-                    # 云 TP 组内扩散由 runner 在消费时刻现场广播补发。
-                    aux_num_elements=sum(
-                        len(t)
-                        for t, hm in zip(meta.token_ids, meta.has_mrope)
-                        if hm
-                    ) * 3,
+                    # mrope positions 已改走控制面(LwdRangeItem
+                    # .mrope_positions 随 RangeNotify 到达,
+                    # wire_version>=2),UP recv 只挂 embeds 主帧,
+                    # aux 恒 0——若残留非零,预挂的 aux irecv 永远收
+                    # 不到数据,水位停摆。aux 机制保留在通道层供
+                    # deepstack 等扩展。
+                    aux_num_elements=0,
                 )
             )
         else:
