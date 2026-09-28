@@ -987,24 +987,32 @@ class LwdCloudModelRunner(NPUModelRunner):
         同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
         尾巴)。环深随单步边数放大(min_depth,与 meta ring 同式):
         每条边一步占一槽,防同槽被下一条边/下一步覆写时异步拷贝
-        尚未执行。"""
+        尚未执行。槽复用安全:主机覆写 stage 前等该槽上一次 H2D
+        的完成事件(同 lwd_edge_worker._lwd_embed_ids_h2d 的教训:
+        CachingHostAllocator 管不到持有张量的显式主机覆写)。"""
         n = arr.size
         depth = max(4, min_depth)
         ring = getattr(self, "_lwd_h2d_ring", None)
         if ring is None or ring[0][0].numel() < n or len(ring) < depth:
             m = max(n, 1024)
             ring = [
-                (
+                [
                     torch.empty(m, dtype=torch.int64, pin_memory=True),
                     torch.empty(m, dtype=torch.int64, device=self.device),
-                )
+                    None,  # 该槽上一次 H2D 的完成事件
+                ]
                 for _ in range(depth)
             ]
             self._lwd_h2d_ring = ring
             self._lwd_h2d_ring_idx = 0
         idx = self._lwd_h2d_ring_idx
         self._lwd_h2d_ring_idx = (idx + 1) % len(ring)
-        stage, dev = ring[idx]
+        stage, dev, last_ev = ring[idx]
+        if last_ev is not None:
+            last_ev.synchronize()
         stage.numpy()[:n] = arr
         dev[:n].copy_(stage[:n], non_blocking=True)
+        ev = torch.npu.Event()
+        ev.record()
+        ring[idx][2] = ev
         return dev[:n]

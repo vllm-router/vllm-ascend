@@ -46,8 +46,10 @@ def select_token_batch(
 
     logits [R,V] rows sorted together (NPU sorts rows in parallel);
     sorted_idx[i, ranks[i]] is the token id at rank ranks[i] for row i.
+    stable=True:云侧 rank = 严格大于的计数,bf16 并列时下标序
+    必须确定,否则并列对里可能取到另一个 token(静默错 token)。
     """
-    _, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+    _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
     row = torch.arange(len(ranks), device=logits.device)
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
 
@@ -208,27 +210,41 @@ class LwdEdgeWorker(NPUWorker):
         non_blocking,替代 torch.tensor(list, device=...) 的 pageable
         同步拷贝——后者在主流上等设备排空(含上一块 chunk 的 UP send
         配对等待),把跨侧锁步传导进边 worker 主线程。同流序保证 embed
-        kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。"""
+        kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。
+
+        槽复用安全:主机覆写 stage 前必须等该槽上一次的异步 H2D 在
+        设备上执行完(逐槽完成事件;CachingHostAllocator 的事件保护
+        只管分配复用,管不到持有张量的显式主机覆写)。embed harvest
+        不等 future,在飞批数可超过环深——不拦即静默错 token
+        (2E1C 实测症状:并发下偶发乱码)。事件等待只在环绕复用时
+        发生,即天然背压点,正常路径零开销。"""
         n = len(flat_token_ids)
         ring = getattr(self, "_lwd_ids_ring", None)
         if ring is None or ring[0][0].numel() < n:
             m = max(n, 8192)
             ring = [
-                (
+                [
                     torch.empty(m, dtype=torch.int64, pin_memory=True),
                     torch.empty(
                         m, dtype=torch.int64, device=self.model_runner.device
                     ),
-                )
+                    None,  # 该槽上一次 H2D 的完成事件
+                ]
                 for _ in range(4)
             ]
             self._lwd_ids_ring = ring
             self._lwd_ids_ring_idx = 0
         idx = self._lwd_ids_ring_idx
         self._lwd_ids_ring_idx = (idx + 1) % len(ring)
-        stage, dev = ring[idx]
+        stage, dev, last_ev = ring[idx]
+        if last_ev is not None:
+            # 等该槽上一次拷贝落地(环绕复用时才等待=天然背压)
+            last_ev.synchronize()
         stage.numpy()[:n] = flat_token_ids
         dev[:n].copy_(stage[:n], non_blocking=True)
+        ev = torch.npu.Event()
+        ev.record()
+        ring[idx][2] = ev
         return dev[:n]
 
     def _execute_lwd_embed(
