@@ -781,6 +781,21 @@ class LwdCloudModelRunner(NPUModelRunner):
         buckets: dict[int, dict[str, list]] = {}
         lg = logits  # bf16 原生,直接比较(cast 无精度增益)
 
+
+        def _req_edge_id(req_id: str) -> int:
+            """严格解析来源边:未包装 id(无 e<num>- 前缀)在
+            parse_edge_id 里静默回退 edge 0——collect 分桶场景这是
+            错路由(别边/本地流量被并入 edge 0 的 DOWN 载荷,边侧按
+            行序错位交付 = 乱码),必须当场暴露而非静默归边。"""
+            edge_id, raw = parse_edge_id(req_id)
+            if raw == req_id:
+                raise RuntimeError(
+                    f"[Lwd][cloud-runner] DOWN collect got unwrapped "
+                    f"req_id={req_id}: cannot determine source edge "
+                    f"(cloud-reuse requires wrapped ids)"
+                )
+            return edge_id
+
         def _bucket(edge_id: int) -> dict[str, list]:
             b = buckets.get(edge_id)
             if b is None:
@@ -799,7 +814,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             thresh = lg_sel.gather(1, sm_sel.long().unsqueeze(1))
             ranks_all = (lg_sel > thresh).sum(dim=1).to(torch.int32)
             for k, i in enumerate(idx):
-                edge_id, _ = parse_edge_id(batch_req_ids[i])
+                edge_id = _req_edge_id(batch_req_ids[i])
                 b = _bucket(edge_id)
                 b["rows"].append(sample_hidden_states[i : i + 1])
                 b["ranks"].append(ranks_all[k : k + 1])
@@ -837,7 +852,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 每边一次 pinned 异步 H2D(pageable 同步 H2D 会在主流上
             # 等设备排空,见 seg_lens 同款教训)
             edge_per_req = np.array(
-                [parse_edge_id(batch_req_ids[i])[0] for i in vidx_np]
+                [_req_edge_id(batch_req_ids[i]) for i in vidx_np]
             )
             edge_ids_sorted = sorted(set(edge_per_req.tolist()))
             for edge_id in edge_ids_sorted:
