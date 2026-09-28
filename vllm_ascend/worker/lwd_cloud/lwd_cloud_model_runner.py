@@ -527,6 +527,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
             # 窗口核验 + mrope 行写入(当步生效的前提:super() 内的
             # _calc_mrope_positions 随即按窗读 req_state)
+            ghost_ids = set(getattr(meta, "ghost_req_ids", None) or [])
             mrope_row = 0
             for k, (req_id, token_ids) in enumerate(
                 zip(meta.req_ids, meta.token_ids)
@@ -534,6 +535,13 @@ class LwdCloudModelRunner(NPUModelRunner):
                 n = len(token_ids)
                 idx = self.input_batch.req_id_to_index.get(req_id)
                 if idx is None:
+                    if req_id in ghost_ids:
+                        # 幽灵条目(请求已 abort,行在载荷里不可撤):
+                        # 照收不注入——跳过全部核验与状态写入,
+                        # mrope 游标照常推进(aux 帧含幽灵行)
+                        if meta.has_mrope[k]:
+                            mrope_row += n
+                        continue
                     # fail-fast:embeds 已收齐但请求不在本步 batch——继续
                     # 走下去该请求将用未注入的脏 embeds 解码(静默乱码),
                     # 必须当场暴露而非丢弃。出现即调度/数据面时序契约
@@ -628,10 +636,16 @@ class LwdCloudModelRunner(NPUModelRunner):
                 batch_seqno, embeds.shape[0], meta.req_ids,
             )
             row = 0
+            ghost_ids = set(getattr(meta, "ghost_req_ids", None) or [])
             for meta_idx, (req_id, token_ids) in enumerate(zip(meta.req_ids, meta.token_ids)):
                 n = len(token_ids)
                 idx = self.input_batch.req_id_to_index.get(req_id)
                 if idx is None:
+                    if req_id in ghost_ids:
+                        # 幽灵条目:行照收不注入(abort 在飞 chunk,
+                        # 保 HCCL numel 配对);row 游标照常推进
+                        row += n
+                        continue
                     # 与收割期同款防线(双阶段各自独立核验)
                     raise RuntimeError(
                         f"[Lwd][cloud-runner] INJECT req={req_id} seqno="
