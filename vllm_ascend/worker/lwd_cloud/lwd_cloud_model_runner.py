@@ -964,29 +964,28 @@ class LwdCloudModelRunner(NPUModelRunner):
         记 event,覆写前 synchronize(环深 16 下该等待通常已到期,
         no-op)。"""
         n = arr.size
-        ring = getattr(self, "_lwd_h2d_ring", None)
-        if ring is None or ring[0][0].numel() < n:
-            m = max(n, 1024)
-            ring = [
-                (
-                    torch.empty(m, dtype=torch.int64, pin_memory=True),
-                    torch.empty(m, dtype=torch.int64, device=self.device),
-                )
-                for _ in range(16)
-            ]
-            self._lwd_h2d_ring = ring
-            self._lwd_h2d_ring_idx = 0
-            self._lwd_h2d_ring_events = [None] * len(ring)
-        idx = self._lwd_h2d_ring_idx
-        self._lwd_h2d_ring_idx = (idx + 1) % len(ring)
-        stage, dev = ring[idx]
-        events = self._lwd_h2d_ring_events
-        if events[idx] is not None:
-            events[idx].synchronize()
-        stage.numpy()[:n] = arr
-        dev[:n].copy_(stage[:n], non_blocking=True)
+        # 正确性重构(真机实录 200 并发):环复用暂存(NPU event 同步
+        # 保护被证明不可靠)在设备队列积压时仍会把陈旧索引送上游——
+        # 设备侧 vlen 用了别步的值,min 封顶失效(counts 3/2 > seg=1)、
+        # row_sel 选错 hidden 行。改为每步新分配 stage/dev,引用挂在
+        # 保留队列里直到其 H2D 确认完成后才允许释放:正确性只依赖
+        # "持有引用不被复用 + 释放前 event 同步"两个显式保证,不依赖
+        # 环序时假设。队列满时同步最老者(N=32 步滞后的拷贝必然早已
+        # 执行完,同步通常是 no-op);内存开销 32×n×8B,KB 量级
+        keep = getattr(self, "_lwd_h2d_keep", None)
+        if keep is None:
+            from collections import deque
+            keep = deque(maxlen=32)
+            self._lwd_h2d_keep = keep
+        stage = torch.empty(n, dtype=torch.int64, pin_memory=True)
+        stage.numpy()[:] = arr
+        dev = torch.empty(n, dtype=torch.int64, device=self.device)
+        dev.copy_(stage, non_blocking=True)
         ev = torch.npu.Event()
         ev.record()
-        events[idx] = ev
-        return dev[:n]
+        if len(keep) == keep.maxlen:
+            _old_stage, _old_dev, _old_ev = keep[0]
+            _old_ev.synchronize()
+        keep.append((stage, dev, ev))
+        return dev
 
