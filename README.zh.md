@@ -13,29 +13,16 @@ vLLM Ascend Plugin
 | <a href="https://www.hiascend.com/en/"><b>关于昇腾</b></a> | <a href="https://docs.vllm.ai/projects/ascend/en/latest/"><b>官方文档</b></a> | <a href="https://slack.vllm.ai"><b>#sig-ascend</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/vllm-ascend-support"><b>用户论坛</b></a> | <a href="https://tinyurl.com/vllm-ascend-meeting"><b>社区例会</b></a> |
 </p>
 
-<p align="center">
-<a href="README.md"><b>English</b></a> | <a><b>中文</b></a>
-</p>
-
 ---
 *最新消息* 🔥
 
-- [2026/07] 我们发布了首个候选版本 [v0.23.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0rc1)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/)开始在 Ascend 上部署 vLLM Ascend Plugin。
-- [2026/05] 我们发布了新的正式版本 [v0.18.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.18.0)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.18.0/)开始在Ascend上部署vLLM Ascend Plugin。
-- [2026/02] 我们发布了新的正式版本 [v0.13.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.13.0)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.13.0/)开始在Ascend上部署vLLM Ascend Plugin。
+- [2026/09] 我们发布了首个边云协同版本 [v0.23.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0rc1)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/)开始在 Ascend 上部署边云协同推理服务。
 
 <details>
 <summary>更多内容</summary>
 
-- [2025/12] 我们发布了新的正式版本 [v0.11.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.11.0)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.11.0/)开始在Ascend上部署vLLM Ascend Plugin。
-- [2025/09] 我们发布了新的正式版本 [v0.9.1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.9.1)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.9.1/tutorials/large_scale_ep.html)开始在Ascend上部署大型专家并行 (EP)。
-- [2025/08] 我们与vLLM和腾讯合作举办了[vLLM北京Meetup](https://mp.weixin.qq.com/s/7n8OYNrCC_I9SJaybHA_-Q)，！请查阅[活动幻灯片](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF)。
-- [2025/06] [用户案例](https://docs.vllm.ai/projects/ascend/en/latest/community/user_stories/index.html)现已上线！展示了LLaMA-Factory/verl/TRL/GPUStack等用户案例，展示了vLLM Ascend如何帮助昇腾用户在模型微调、评估、强化学习 (RL) 以及部署等场景中提升体验。
-- [2025/06] [贡献者](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)页面现已上线！所有的贡献都值得被记录，感谢所有的贡献者。
-- [2025/05] 我们发布了首个正式版本 [v0.7.3](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.7.3)！我们与 vLLM 社区合作发布了一篇博客文章，分享了我们的实践：[Introducing vLLM Hardware Plugin, Best Practice from Ascend NPU](https://blog.vllm.ai/2025/05/12/hardware-plugin.html)。
-- [2025/03] 我们和vLLM团队举办了[vLLM Beijing Meetup](https://mp.weixin.qq.com/s/CGDuMoB301Uytnrkc2oyjg)! 请查阅[活动幻灯片](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF).
-- [2025/02] vLLM社区正式创建了[vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend)仓库，让vLLM可以无缝运行在Ascend NPU。
-- [2024/12] 我们正在与 vLLM 社区合作，以支持 [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162).
+- [2026/09] vLLM社区正式创建了[vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend)仓库，让vLLM可以无缝运行在Ascend NPU。
+- [2026/9] 我们正在与 vLLM 社区合作，以支持 [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162).
 
 </details>
 
@@ -68,31 +55,26 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 | Version    | Release type | Doc                                  |
 |------------|--------------|--------------------------------------|
 | v0.23.0rc1 | 最新RC版本 | 请查看[快速开始](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/quick_start.html)和[安装指南](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/installation.html)了解更多 |
-| v0.18.0 | 最新正式/稳定版本 | 请查看[快速开始](https://docs.vllm.ai/projects/ascend/en/v0.18.0/quick_start.html)和[安装指南](https://docs.vllm.ai/projects/ascend/en/v0.18.0/installation.html)了解更多 |
 
-## 分支策略
+## [快速入门](quick_start.md)
 
-vllm-ascend有主干分支和开发分支。
+## 支持模型
+图例说明
 
-- **main**: 主干分支，与vLLM的主干分支对应，并通过昇腾CI持续进行质量看护。
-- **releases/vX.Y.Z**: 开发分支，随vLLM部分新版本发布而创建，比如`releases/v0.13.0`是vllm-ascend针对vLLM `v0.13.0` 版本的开发分支。
+- ●：充分验证支持
+- ●：仅功能支持
+- ✅：支持该列的特性
+- ❌：不支持该列特性
 
-下面是维护中的分支：
-
-| 分支              | 状态         | 备注                  |
-|------------------|--------------|----------------------|
-| main             | Maintained   | 基于vLLM main分支和vLLM最新版本（v0.23.0）CI看护   |
-| v0.7.1-dev       | Unmaintained | 不再维护 |
-| v0.7.3-dev       | Unmaintained | 只允许Bug修复，不会再发布新版本 |
-| v0.9.1-dev       | Unmaintained | 只允许Bug修复，不会再发布新版本 |
-| v0.11.0-dev      | Unmaintained | 只允许Bug修复，不会再发布新版本 |
-| releases/v0.13.0 | Maintained   | 基于vLLM v0.13.0版本CI看护 |
-| releases/v0.18.0 | Maintained   | 基于vLLM v0.18.0版本CI看护 |
-| releases/v0.20.2rc | Maintained | 基于vLLM v0.20.2版本CI看护 |
-| rfc/feature-name | Maintained   | 为协作创建的[特性分支](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html#feature-branches) |
-| releases/v0.23.0 | Maintained   | 基于vLLM v0.23.0版本CI看护 |
-
-请参阅[版本策略](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html)了解更多详细信息。
+| 模型 | Support | 最大上下文长度 | W8A8 | W4A8 | W8A16 | LoRA | atbgraph | aclgraph | 硬件规格 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek‑R1‑Distill‑Llama‑8B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐2卡)   Atlas 800I A3：1/2/4卡(推荐1卡)   Atlas 300I Duo：1/2/4卡(推荐1卡) |
+| DeepSeek‑R1‑Distill‑Llama‑70B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：8卡   Atlas 800I A3：4卡 |
+| DeepSeek‑R1‑Distill‑Qwen‑1.5B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4卡(推荐2卡)   Atlas 800I A3：1/2卡(推荐1卡)   Atlas 300I Duo：1/2卡（推荐1卡） |
+| DeepSeek‑R1‑Distill‑Qwen‑7B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4卡(推荐2卡)   Atlas 800I A3：1/2卡(推荐1卡)   Atlas 300I Duo：1/2卡(推荐1卡) |
+| DeepSeek‑R1‑Distill‑Qwen‑14B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐4卡)   Atlas 800I A3：1/2/4卡(推荐2卡)   Atlas 300I Duo：2/4卡(推荐2卡) |
+| DeepSeek‑R1‑Distill‑Qwen‑32B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐4卡)   Atlas 800I A3：1/2/4卡(推荐2卡)   Atlas 300I Duo：1/2/4卡(推荐2卡) |
+[更多](model_support_lists.md)
 
 ## 贡献
 
