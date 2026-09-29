@@ -147,6 +147,23 @@ def _is_glm_model(model_config) -> bool:
     return "glm" in str(model_type).lower()
 
 
+def _backup_token_id(req_state, idx: int) -> int:
+    """get_token_id 的占位 embeds 容错。
+
+    LWD(prefill_only)云侧请求的 prompt 以 embeds 注入,
+    prompt_token_ids 为 None,对 prompt 位置取 id 会 raise
+    (gpu_input_batch.py:get_token_id)。backup 值只在该请求本步
+    无有效采样 token 时才被 torch.where 选中:对 prefill 半途
+    (chunk)请求,该位置的 draft 输入由 provider embeds 覆写
+    (_lwd_build_first_pass_embeds 的 prompt 段覆写),id 不会真实
+    落进 draft 前向,回填 0 占位即可;decode/完结请求恒有有效
+    采样 token,backup 不被消费。
+    """
+    if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
+        return 0
+    return req_state.get_token_id(idx)
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -1367,19 +1384,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         Alignment with ``set_inputs_first_pass``: after the one-position
         right shift, position j of request i holds prompt token j+1, so
         its input embedding is exactly prompt_embeds[j+1]; the sampling
-        position of each request holds the next token, embedded by the
-        draft model itself (its own embed table — only the prompt span is
-        replaced by the received embeddings).
+        position of each request holds the next token (already shifted
+        into ``self.input_ids`` by the caller).
+
+        逐请求混合构造(mixed 组批后批内可同时存在 prefill/decode 请求):
+        先用 token-id 路径整批打底——右移后 decode 段是真实 token、采样
+        位置是 next token,只有 prompt 段是占位零值;再仅对段内含
+        prompt 行(base+1 < prompt_len)的请求用 provider embeds 覆写。
+        decode 请求(装配缓冲已随 prefill 完结释放)不查 provider,不再
+        像原实现那样因任一请求缺缓冲而整批回退——那会让同批 prefill
+        请求的 prompt 段退回占位零值,draft 状态从根上脏掉(MTP 混批
+        下的已知缺陷)。
 
         Returns None (caller falls back to the token-id path) when no
-        provider is configured, any request lacks received embeds, the
-        chunk's rows are not yet fully assembled, the draft model does
-        not consume ``inputs_embeds``, or a CP (pcp) manager rewrites
-        first-pass inputs (different layout).
+        provider is configured, a request that needs prompt embeds lacks
+        received rows / the chunk's rows are not yet fully assembled, the
+        draft model does not consume ``inputs_embeds``, or a CP (pcp)
+        manager rewrites first-pass inputs (different layout).
         """
-        provider = self._lwd_prompt_embeds_provider
         runner = self.runner
-        if provider is None or runner is None:
+        if runner is None:
             return None
         # The draft model must actually consume inputs_embeds (checked
         # once); otherwise the token-id path stays authoritative.
@@ -1413,27 +1437,35 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         computed = getattr(runner.input_batch, "num_computed_tokens_cpu", None)
         if computed is None:
             return None
+        num_prompt = runner.input_batch.num_prompt_tokens
         qsl = (cad.query_start_loc_cpu.tolist()
                if getattr(cad, "query_start_loc_cpu", None) is not None
                else cad.query_start_loc.tolist())
         out = self.inputs_embeds  # persistent buffer (graph-safe)
+        # 打底:右移后的 input_ids 在 decode 段/采样位置都是真实 token,
+        # 整批嵌入一次;prompt 段的占位零值嵌入在下方逐请求覆写
+        out[:num_tokens] = self.model.embed_input_ids(
+            self.input_ids[:num_tokens]
+        )
         wrote_any = False
         for i, req_id in enumerate(req_ids):
             s, e = int(qsl[i]), int(qsl[i + 1])
             seg_len = e - s
             base = int(computed[i]) if i < len(computed) else 0
-            prompt_embeds = provider(req_id)  # [prompt_len, H] or None
-            if prompt_embeds is None or prompt_embeds.shape[0] < base + seg_len:
-                return None  # chunk rows not fully assembled -> token-id path
-            # positions s..e-2 hold prompt tokens base+1..base+seg_len-1
-            out[s: e - 1] = prompt_embeds[base + 1: base + seg_len]
+            prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
+            if base + 1 >= prompt_len:
+                # 段内无 prompt 行(decode 请求):打底已正确,跳过
+                continue
+            # 直读主模型 inputs_embeds.gpu(替代 CPU 装配缓冲):
+            # 注入期该窗口已写入权威 embeds,与装配缓冲逐位同源
+            # (缓冲本就从这张量 D2H 出去)。窗口映射:调度段 [s,e) 的
+            # 行 = prompt 位置 [base, base+seg_len),provider 需要
+            # [base+1, base+seg_len) ⇒ gpu[s+1:e]。消除每 chunk
+            # 84MB 的 D2H 同步长尾(实测占 inject 段大头)。
+            out[s : e - 1] = runner.inputs_embeds.gpu[s + 1 : e]
             wrote_any = True
         if not wrote_any:
             return None
-        # sampling positions hold the next token (embedded by the draft
-        # model's own table)
-        next_embeds = self.model.embed_input_ids(next_token_ids)
-        out[token_indices_to_sample] = next_embeds
         return out[:num_input_tokens]
 
     def set_inputs_first_pass(
@@ -1826,10 +1858,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
+        # (_backup_token_id:LWD 占位 embeds 请求的 prompt 位 id 不可知,
+        # 回填 0 占位——该值真实被消费的位置必由 provider embeds 覆写)
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
+            [_backup_token_id(requests[gpu_input_batch.req_ids[i]], seq_lens_list[i]) for i in range(num_reqs)]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 

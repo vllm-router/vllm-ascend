@@ -37,6 +37,7 @@ from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommReques
 #（对齐 worker.py 的导入顺序）
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.worker.lwd_cloud.lwd_cloud_model_runner import LwdCloudModelRunner
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
 from vllm_ascend.worker.worker import NPUWorker
 
 
@@ -209,7 +210,7 @@ class LwdCloudWorker(NPUWorker):
 
         All control info rides the SchedulerOutput (edge -> cloud
         control plane fills it in):batch.seqno 为边侧派发号(跨机段
-        配对键),recv 尺寸 = sum(len(token_ids)) x H。"""
+        配对键),recv 尺寸包含 embedding 及可选的 Hash 专家 ID。"""
         from vllm.v1.core.sched.output import LwdBatchType
 
         batch = getattr(scheduler_output, "lwd_batch", None)
@@ -222,7 +223,6 @@ class LwdCloudWorker(NPUWorker):
         num_tokens = sum(len(t) for t in meta.token_ids)
         if num_tokens <= 0:
             return
-
         lwd = self.parallel_config.lwd_config
         # Stamp/identity agreement: the batch's instance stamp (edge
         # scheduler's pick) must route onto THIS instance's wire pair —
@@ -250,9 +250,21 @@ class LwdCloudWorker(NPUWorker):
                 LwdCommRequest(
                     channel=LwdChannelType.UP,
                     op="recv",
-                    num_elements=num_tokens * hidden_size,
+                    num_elements=hash_payload_numel(
+                        num_tokens, hidden_size, hash_layer_count(self.model_config.hf_config),
+                        getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
+                    ),
                     seqno=batch.seqno,
                     instance_id=instance_id,
+                    # aux 帧(mrope positions [n,3] int64)仅端点预挂;
+                    # pdmix 混批下 has_mrope 为逐请求列表,aux 帧只含
+                    # 标记请求的行(Σ n_i×3,与边侧组帧同源同序);
+                    # 云 TP 组内扩散由 runner 在消费时刻现场广播补发。
+                    aux_num_elements=sum(
+                        len(t)
+                        for t, hm in zip(meta.token_ids, meta.has_mrope)
+                        if hm
+                    ) * 3,
                 )
             )
         else:
@@ -266,6 +278,10 @@ class LwdCloudWorker(NPUWorker):
             batch.seqno, instance_id, len(meta.req_ids), num_tokens,
             is_endpoint,
         )
+
+    # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
+    # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内
+    # 现场广播),worker 层只保留 post 侧;aux(mrope)帧同路径消费。
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -334,6 +350,8 @@ class LwdCloudWorker(NPUWorker):
             "[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids)
         )
         for req_id in finished_req_ids:
+            if self.model_runner.lwd_hash_state is not None:
+                self.model_runner.lwd_hash_state.discard(req_id)
             idx = req_id_to_index.get(req_id)
             if idx is not None:
                 embeds_map.pop(idx, None)
