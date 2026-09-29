@@ -16,13 +16,12 @@ vLLM Ascend Plugin
 ---
 *最新消息* 🔥
 
-- [2026/09] 我们发布了首个边云协同版本 [v0.23.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0rc1)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/)开始在 Ascend 上部署边云协同推理服务。
+- [2026/09] 我们发布了首个边云协同版本 [v0.23.0rc1]()! 请按照[官方指南]()开始在 Ascend 上部署边云协同推理服务。
 
 <details>
 <summary>更多内容</summary>
 
-- [2026/09] vLLM社区正式创建了[vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend)仓库，让vLLM可以无缝运行在Ascend NPU。
-- [2026/9] 我们正在与 vLLM 社区合作，以支持 [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162).
+- [2026/09] vLLM社区正式创建了[vllm-router/vllm-ascend]()仓库，让vLLM可以无缝运行在Ascend NPU。
 
 </details>
 
@@ -36,7 +35,6 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 
 使用 vLLM 昇腾插件，可以让类Transformer、混合专家(MOE)、嵌入、多模态等流行的大语言模型在 Ascend NPU 上无缝运行。
 
-支持的模型详细信息，请参考[模型支持列表](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/support_matrix/supported_models.html)。
 
 ## 准备
 
