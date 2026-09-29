@@ -899,7 +899,19 @@ class LwdCloudModelRunner(NPUModelRunner):
             hidden_packet,
             pinned[:n_meta],
             None,
-            [r for i, r in enumerate(batch_req_ids) if valid[i]],
+            # req_ids 必须与 meta(counts/seg_lens/ranks)逐位对齐——
+            # 引擎按 len(req_ids) 切 pinned 尾段。spec 路径的 meta 只收
+            # vidx(valid 且 rows_per_req>=1)请求:本步 spec 段被实际
+            # hidden 行数截断为 0 行的 valid 请求不在 meta 里,若仍按
+            # "全部 valid" 返回 req_ids,切片窗口错位 → counts 读到
+            # ranks 段(假 0)→ 边侧空行 ERROR(真机实录 seqno=700:
+            # 97 req_ids vs 91 meta,count 前 6 假 0、尾 2 个 count>seg)。
+            # 非 spec 路径 idx == 全部 valid,保持原式
+            (
+                [batch_req_ids[i] for i in vidx_np.tolist()]
+                if is_spec
+                else [r for i, r in enumerate(batch_req_ids) if valid[i]]
+            ),
             None,
         )
 
