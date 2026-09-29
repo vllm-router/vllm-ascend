@@ -5,7 +5,7 @@
 本文档以 Atlas 800I A2 推理服务器和 Qwen3.6‑27B 模型为例，让开发者快速开始使用 VLLM 进行大模型推理流程。
 
 ### 前提条件
-1、服务器安装
+1. 服务器安装
 
 （1）Atlas服务器
 
@@ -23,10 +23,9 @@ SP681网卡驱动安装参考：[SP220&SP600 标准网卡 用户指南](https://
 [驱动下载地址](https://support.huawei.com/enterprise/zh/computing-module/in220-pid-253287505/software/268628573?idAbsPath=fixnode01|23710424|269761301|269764423|269766398|253287505)
 
 
-### 获取模型权重
+2. 获取模型权重
 
-1. 请先下载权重，这里以 Qwen3.6‑27B 为例，将权重文件上传至服务器任意目录（如 /home/weight）。
-2. 修改权重文件权限：
+下载权重，这里以 Qwen3.6‑27B 为例，将权重文件上传至服务器任意目录（如 /home/weight），修改权重文件权限：
 
 ```
 chmod -R 755 /home/weight
@@ -35,7 +34,7 @@ chmod -R 755 /home/weight
 ## docker部署
 ### 使用vllm-ascend预构建镜像
 
-1、进入[昇腾官方镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)，根据设备型号选择下载对应的镜像。
+1. 进入[昇腾官方镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)，根据设备型号选择下载对应的镜像。
 
 该镜像已具备模型运行所需的基础环境，包括：CANN、FrameworkPTAdapter、VLLM 与 VLLM‑Ascend，可实现模型快速上手推理。
 
@@ -84,7 +83,7 @@ docker run -itd --privileged --name=<container-name> --ipc=host --net=host  --sh
 ```
 docker exec -it <container-name> bash
 ```
-4、编译安装
+4. 编译安装
 
 下载vllm和vllm-ascend代码，并编译
 ```
@@ -99,9 +98,9 @@ cd /vllm-workspace/vllm
 
 
 ## 边云协同分布式推理服务部署
-### 1、[使用标准服务器](README_server.md)
+1. [使用标准服务器](README_server.md)
 
-### 2、[使用一体机进](README_all-in-one.md)
+2. [使用一体机](README_all-in-one.md)
 
 ## [更多模型部署参考](examples.md)
 
