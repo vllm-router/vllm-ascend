@@ -318,6 +318,35 @@ class LwdCloudWorker(NPUWorker):
                 target.lwd_down_carrier = (
                     pinned, req_ids, hidden.numel(), seqno
                 )
+                # [LWD][diag] 生产点即时校验(诊断期保留):同步本步 meta
+                # 落地事件后按引擎同款规则读 pinned——生产点即已违规 =
+                # 损坏发生在 D2H/组包(runner 侧);生产点干净而引擎侧
+                # 同 seqno 违规 = 损坏发生在响应传输路径(worker->engine)
+                _ev = getattr(self, "_lwd_meta_ready_event", None)
+                if _ev is not None:
+                    _ev.synchronize()
+                    _vals = pinned.tolist()
+                    _n = len(req_ids)
+                    _cnt = _vals[-2 * _n : -_n]
+                    _seg = _vals[-_n:]
+                    _bad = [
+                        i for i, (c, s) in enumerate(zip(_cnt, _seg))
+                        if c < 1 or c > s
+                    ]
+                    if _n and _bad:
+                        logger.error(
+                            "[LWD][diag][cloud/prod] down seqno=%d n=%d "
+                            "rows=%d bad@%s cnt[h=%s t=%s] seg[h=%s t=%s] "
+                            "— 生产点 pinned 已损坏(D2H/组包侧)",
+                            seqno, _n, hidden.shape[0], _bad[:6],
+                            _cnt[:6], _cnt[-6:], _seg[:6], _seg[-6:],
+                        )
+                    else:
+                        logger.info(
+                            "[LWD][diag][cloud/prod] down seqno=%d n=%d "
+                            "rows=%d ok",
+                            seqno, _n, hidden.shape[0],
+                        )
                 # [Lwd][perf] 云侧每步计时:sample=采样+采集(含秩计算);
                 # send=DOWN 提交(快照clone+isend+bridge wait);total=全步
                 logger.info(
