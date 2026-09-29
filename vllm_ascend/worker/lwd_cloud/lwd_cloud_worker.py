@@ -299,8 +299,9 @@ class LwdCloudWorker(NPUWorker):
                 seqno = self._lwd_next_down_seqno(instance_id)
                 logger.info(
                     "[Lwd][cloud-worker] DOWN send seqno=%d instance=%d "
-                    "numel=%d",
+                    "numel=%d reqs=%d rows=%d",
                     seqno, instance_id, hidden.numel(),
+                    len(req_ids), hidden.shape[0],
                 )
                 get_lwd_comm_service().submit_send(
                     LwdCommRequest(
