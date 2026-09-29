@@ -1,4 +1,4 @@
-# # 快速入门
+# 快速入门
 
 ## 环境准备
 
@@ -32,7 +32,7 @@ SP681网卡驱动安装参考：[SP220&SP600 标准网卡 用户指南](https://
 chmod -R 755 /home/weight
 ```
 
-### docker部署
+## docker部署
 ### 使用vllm-ascend预构建镜像
 
 1、进入[昇腾官方镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)，根据设备型号选择下载对应的镜像。
