@@ -821,6 +821,21 @@ class LwdCloudModelRunner(NPUModelRunner):
             if vidx_np.size == 0:
                 return None
             vlen_np = rows_per_req[vidx_np].astype(np.int64)
+            # [LWD][diag] 配对上下文(诊断期):生产点违规时由 worker 侧
+            # 一并打出——判定 sampled 行数/批请求数/段表长度/有效请求数
+            # 是否两两相配(不配即采样-批配对错位,非缓冲问题)
+            self._lwd_last_collect_ctx = dict(
+                sampled_shape=tuple(sampled.shape),
+                n_batch=len(batch_req_ids),
+                n_draft=len(seg_lens),
+                n_valid=int(vidx_np.size),
+                n_valid_mask=int(np.count_nonzero(valid[: len(batch_req_ids)])),
+                total_rows=int(total_rows),
+                seg_head=[int(x) for x in seg_lens_np[:6]],
+                seg_tail=[int(x) for x in seg_lens_np[-6:]],
+                rows_per_req_head=[int(x) for x in rows_per_req[:6]],
+                rows_per_req_tail=[int(x) for x in rows_per_req[-6:]],
+            )
             starts_v = seg_starts[vidx_np].astype(np.int64)
             n_rows = int(vlen_np.sum())
             req_idx_np = np.repeat(vidx_np, vlen_np)
