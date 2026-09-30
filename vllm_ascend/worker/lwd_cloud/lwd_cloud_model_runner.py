@@ -826,15 +826,22 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 是否两两相配(不配即采样-批配对错位,非缓冲问题)
             self._lwd_last_collect_ctx = dict(
                 sampled_shape=tuple(sampled.shape),
+                logits_rows=int(lg.shape[0]),
+                hidden_rows=int(sample_hidden_states.shape[0]),
                 n_batch=len(batch_req_ids),
                 n_draft=len(seg_lens),
                 n_valid=int(vidx_np.size),
                 n_valid_mask=int(np.count_nonzero(valid[: len(batch_req_ids)])),
                 total_rows=int(total_rows),
+                n_rows_sum_vlen=int(rows_per_req[: len(batch_req_ids)].sum()),
                 seg_head=[int(x) for x in seg_lens_np[:6]],
                 seg_tail=[int(x) for x in seg_lens_np[-6:]],
                 rows_per_req_head=[int(x) for x in rows_per_req[:6]],
                 rows_per_req_tail=[int(x) for x in rows_per_req[-6:]],
+                num_draft_zeros=int(sum(
+                    1 for d in spec_decode_metadata.num_draft_tokens
+                    if d == 0
+                )),
             )
             starts_v = seg_starts[vidx_np].astype(np.int64)
             n_rows = int(vlen_np.sum())

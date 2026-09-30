@@ -337,6 +337,24 @@ class LwdCloudWorker(NPUWorker):
                         _ctx = getattr(
                             self.model_runner, "_lwd_last_collect_ctx", None
                         ) or {}
+                        # 边界扫描:ranks 区值域无界(可达 vocab 量级),
+                        # counts/seg 区值域 ≤8——从预期边界前后各 16 格
+                        # 找首段 16 连小值,实测 ranks 区结束位置。
+                        # shift = 实测边界 − hidden 行数:>0 即 ranks 比
+                        # hidden 行数多 shift 行(counts 被挤后,引擎切片
+                        # 全线错位;真机实录 shift 恰 = num_draft_zeros)
+                        _rows = hidden.shape[0]
+                        _est = None
+                        for _b in range(max(0, _rows - 16), _rows + 16):
+                            if all(0 <= v <= 8 for v in _vals[_b : _b + 16]):
+                                _est = _b
+                                break
+                        _ctx = dict(
+                            _ctx,
+                            boundary_shift=(
+                                None if _est is None else _est - _rows
+                            ),
+                        )
                         logger.error(
                             "[LWD][diag][cloud/prod] down seqno=%d n=%d "
                             "rows=%d bad@%s cnt_full=%s seg_full=%s "
