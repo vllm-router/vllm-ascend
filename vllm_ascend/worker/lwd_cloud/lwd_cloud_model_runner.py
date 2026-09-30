@@ -896,19 +896,23 @@ class LwdCloudModelRunner(NPUModelRunner):
                                     device=logits.device)
             seg_lens_dev = counts_dev
             meta_dev = torch.cat(ranks_list + [counts_dev, seg_lens_dev])
-        # pinned 拷贝排主流末尾(异步),紧随记录就绪事件;
-        # 由 worker 响应入队处在发送前 synchronize——
-        # "响应发出 ⟹ pinned 就绪"成为硬保证(同步在输出线程,
-        # 不在计算关键路径)。
+        # meta 组包改为阻塞 D2H + 每步私有普通 CPU 张量(真机实录定
+        # 案):本栈上 Event.record()+synchronize() 不能保证 non_blocking
+        # pinned D2H 完成——worker/引擎在"同步"后仍读到 meta 环槽里
+        # 十几步前占用者的残留(ranks 值/别步 counts/陈旧 seg),基于
+        # event 的两级防护(环槽 event、enqueue 同步)全部无效,与
+        # kv_connector 注释的 NPU event 不可靠先例一致。私有张量 +
+        # 阻塞拷贝:copy_ 返回即内容就绪,不依赖任何 event/环/pinned
+        # 语义;meta 仅 ~KB,阻塞代价可接受
         _t_pack = time.monotonic()
         n_dev = meta_dev.numel()
         n_meta = n_dev + (len(seg_lens_host) if seg_lens_host is not None else 0)
-        pinned = self._lwd_meta_pinned(n_meta)
-        pinned[:n_dev].copy_(meta_dev, non_blocking=True)
+        pinned = torch.empty(n_meta, dtype=torch.int32)
+        pinned[:n_dev].copy_(meta_dev)  # 阻塞:返回即完成
         if seg_lens_host is not None:
-            pinned.numpy()[n_dev:n_meta] = seg_lens_host
-        self.worker._lwd_meta_ready_event = torch.npu.Event()
-        self.worker._lwd_meta_ready_event.record()
+            pinned[n_dev:n_meta] = torch.tensor(
+                seg_lens_host, dtype=torch.int32
+            )
         # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 拼包+拷贝
         logger.info(
             "[Lwd][perf] collect rows=%d rank=%.2f pinned=%.2f total=%.2fms",

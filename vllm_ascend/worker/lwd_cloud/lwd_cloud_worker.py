@@ -318,13 +318,11 @@ class LwdCloudWorker(NPUWorker):
                 target.lwd_down_carrier = (
                     pinned, req_ids, hidden.numel(), seqno
                 )
-                # [LWD][diag] 生产点即时校验(诊断期保留):同步本步 meta
-                # 落地事件后按引擎同款规则读 pinned——生产点即已违规 =
-                # 损坏发生在 D2H/组包(runner 侧);生产点干净而引擎侧
-                # 同 seqno 违规 = 损坏发生在响应传输路径(worker->engine)
-                _ev = getattr(self, "_lwd_meta_ready_event", None)
-                if _ev is not None:
-                    _ev.synchronize()
+                # [LWD][diag] 生产点即时校验(诊断期保留):meta 已是
+                # 阻塞拷贝的私有主机张量,直接读即可——生产点即已违规 =
+                # 组包数学问题(runner 侧);生产点干净而引擎侧同 seqno
+                # 违规 = 损坏在响应传输路径(worker->engine)
+                if True:
                     _vals = pinned.tolist()
                     _n = len(req_ids)
                     _cnt = _vals[-2 * _n : -_n]
