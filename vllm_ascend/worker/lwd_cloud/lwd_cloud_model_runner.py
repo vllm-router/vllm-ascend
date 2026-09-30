@@ -940,18 +940,11 @@ class LwdCloudModelRunner(NPUModelRunner):
         return ring[idx]
 
     def _lwd_h2d_stage_i64(self, arr: "np.ndarray") -> torch.Tensor:
-        """int64 host 索引数组的异步 H2D 暂存(pinned 槽轮换 +
+        """int64 host 索引数组的异步 H2D 暂存(pinned 4 槽轮换 +
         non_blocking):替代 torch.tensor(arr, device=...) 的 pageable
         同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
-        尾巴)。
-
-        正确性前提(真机实录 200 并发):host 覆写 stage 前必须确认该槽
-        上一次 H2D 拷贝已在设备上执行——设备队列积压超过环深时,
-        non_blocking 拷贝会读到被后步覆写的 stage,设备侧 vidx/vlen/
-        row_sel 变成别步的布局:counts 用陈旧 vlen 封顶(4>seg=1)、
-        row_sel 选错 hidden 行(DOWN 发错内容,静默错 token)。故每槽
-        记 event,覆写前 synchronize(环深 16 下该等待通常已到期,
-        no-op)。"""
+        尾巴)。环深与 meta ring 同理:覆盖 batch_queue 深度 + 引擎滞后,
+        防止下步 host 覆写时上步拷贝尚未执行。"""
         n = arr.size
         ring = getattr(self, "_lwd_h2d_ring", None)
         if ring is None or ring[0][0].numel() < n:
@@ -961,21 +954,14 @@ class LwdCloudModelRunner(NPUModelRunner):
                     torch.empty(m, dtype=torch.int64, pin_memory=True),
                     torch.empty(m, dtype=torch.int64, device=self.device),
                 )
-                for _ in range(16)
+                for _ in range(4)
             ]
             self._lwd_h2d_ring = ring
             self._lwd_h2d_ring_idx = 0
-            self._lwd_h2d_ring_events = [None] * len(ring)
         idx = self._lwd_h2d_ring_idx
         self._lwd_h2d_ring_idx = (idx + 1) % len(ring)
         stage, dev = ring[idx]
-        events = self._lwd_h2d_ring_events
-        if events[idx] is not None:
-            events[idx].synchronize()
         stage.numpy()[:n] = arr
         dev[:n].copy_(stage[:n], non_blocking=True)
-        ev = torch.npu.Event()
-        ev.record()
-        events[idx] = ev
         return dev[:n]
 
