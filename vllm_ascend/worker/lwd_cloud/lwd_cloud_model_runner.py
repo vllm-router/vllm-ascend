@@ -964,4 +964,3 @@ class LwdCloudModelRunner(NPUModelRunner):
         stage.numpy()[:n] = arr
         dev[:n].copy_(stage[:n], non_blocking=True)
         return dev[:n]
-
