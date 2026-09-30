@@ -11,6 +11,39 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 class LwdMTPProposer(AscendEagleProposer):
     """Adapt externally supplied LWD embeddings to the MTP SP layout."""
 
+    def _lwd_build_first_pass_embeds(
+        self,
+        num_tokens,
+        num_input_tokens,
+        next_token_ids,
+        token_indices_to_sample,
+        cad,
+    ):
+        # Prefix reuse skips input rows permanently. Never fall back to the
+        # cloud's placeholder token IDs when a resumed prompt needs embeddings.
+        enabled = self.vllm_config.cache_config.enable_prefix_caching
+        needs_prompt = False
+        if enabled:
+            batch = self.runner.input_batch
+            if len(batch.num_computed_tokens_cpu) < len(batch.req_ids):
+                raise RuntimeError("LWD MTP is missing computed-token offsets")
+            needs_prompt = any(
+                int(batch.num_computed_tokens_cpu[i]) + 1
+                < int(batch.num_prompt_tokens[i])
+                for i in range(len(batch.req_ids))
+            )
+            if needs_prompt and getattr(self.runner, "pcp_manager", None) is not None:
+                raise RuntimeError("LWD prefix MTP cannot use PCP embedding layout")
+        result = super()._lwd_build_first_pass_embeds(
+            num_tokens, num_input_tokens, next_token_ids,
+            token_indices_to_sample, cad,
+        )
+        if enabled and needs_prompt and result is None:
+            raise RuntimeError(
+                "LWD prefix MTP requires authoritative prompt embeddings"
+            )
+        return result
+
     def _run_merged_draft(
         self,
         num_input_tokens,
