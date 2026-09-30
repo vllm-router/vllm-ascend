@@ -332,17 +332,12 @@ class LwdCloudWorker(NPUWorker):
                         if c < 1 or c > s
                     ]
                     if _n and _bad:
-                        _ctx = getattr(
-                            self.model_runner, "_lwd_last_collect_ctx", None
-                        ) or {}
                         logger.error(
                             "[LWD][diag][cloud/prod] down seqno=%d n=%d "
-                            "rows=%d bad@%s cnt_full=%s seg_full=%s "
-                            "ctx=%s — 生产点 pinned 已损坏:看 ctx 配对"
-                            "(sampled_shape/n_batch/n_draft/n_valid 不相配"
-                            "=采样-批配对错位;相配=索引/缓冲问题)",
+                            "rows=%d bad@%s cnt[h=%s t=%s] seg[h=%s t=%s] "
+                            "— 生产点 pinned 已损坏(D2H/组包侧)",
                             seqno, _n, hidden.shape[0], _bad[:6],
-                            _cnt, _seg, _ctx,
+                            _cnt[:6], _cnt[-6:], _seg[:6], _seg[-6:],
                         )
                     else:
                         logger.info(
