@@ -920,18 +920,13 @@ class LwdCloudModelRunner(NPUModelRunner):
         )
 
     def _lwd_meta_pinned(self, n: int):
-        """轮换 pinned 缓冲(深度 16,原 4):
-        避免后续步的边流拷贝覆盖引擎尚未读完的上一步 meta。真机实录
-        (200 并发)高负载下输出线程滞后可超过 4 步,槽位被后步覆写、
-        引擎解析到后步 meta(counts 出现 rank 量级值/前导假 0/尾部
-        count>seg)→ 边侧空行 ERROR。现响应入队处已加克隆私有拷贝
-        (multiproc_executor.enqueue_output,根治),环深再放到 16 只作
-        序时余量。"""
+        """轮换 pinned 缓冲(深度 4 > batch_queue 深度 2 + 引擎滞后 1):
+        避免下一/N+2 步的边流拷贝覆盖引擎尚未读完的上一步 meta。"""
         ring = getattr(self, "_lwd_pinned_ring", None)
         if ring is None or ring[0].numel() < n:
             ring = [
                 torch.empty(max(n, 4096), dtype=torch.int32, pin_memory=True)
-                for _ in range(16)
+                for _ in range(4)
             ]
             self._lwd_pinned_ring = ring
             self._lwd_pinned_ring_idx = 0
