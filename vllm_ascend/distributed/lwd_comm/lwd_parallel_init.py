@@ -4,8 +4,8 @@
 """Lwd 边云模式的 ascend 侧并行组初始化。
 
 原生 ``init_ascend_model_parallel`` 按 (dp, pp, pcp, tp) 均匀网格切分
-全局 rank,表达不了"边 edge_npu_count + 云 cloud_npu_count"的非对称
-拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
+全局 rank,表达不了"边共享 edge_npu_count + 每云 engine
+cloud_npu_count(×cloud_dp_size)"的非对称拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
 ``vllm_ascend.distributed.parallel_state``,由 LwdCloudWorker /
 LwdEdgeWorker 覆写的 ``_init_worker_distributed_environment`` 调用,
 替代原生入口。
@@ -37,21 +37,19 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
     lwd = parallel_config.lwd_config
     edge_count = lwd.edge_npu_count
     cloud_count = lwd.cloud_npu_count
-    world_per_dp = edge_count + cloud_count
-    data_parallel_size = parallel_config.data_parallel_size
+    cloud_dp = lwd.cloud_dp_size
     world_size = torch.distributed.get_world_size()
-    assert world_size == data_parallel_size * world_per_dp, (
+    assert world_size == lwd.lwd_world_size, (
         f"Lwd world size mismatch: got {world_size}, expected "
-        f"{data_parallel_size} * ({edge_count} + {cloud_count})")
+        f"{edge_count} + {cloud_count} * {cloud_dp}")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 组:按 pp 段划分——段 0 为边 rank,段 1 为该实例的云 rank,
-    # 与 vllm 侧 PP 分组([边0, 云0] 两段链 + 其余单例)的链路语义对齐。
-    mc2_groups: list[list[int]] = []
-    for dp_idx in range(data_parallel_size):
-        base = dp_idx * world_per_dp
-        mc2_groups.append([base + r for r in range(edge_count)])
-        mc2_groups.append([base + edge_count + r for r in range(cloud_count)])
+    # MC2 组:边 rank 一组;每云 engine 的云 rank 各一组,与 vllm 侧
+    # TP 分组([[边], [engine0], [engine1], ...])的实例语义对齐。
+    mc2_groups: list[list[int]] = [[r for r in range(edge_count)]]
+    for dp_idx in range(cloud_dp):
+        base = lwd.cloud_engine_rank_base(dp_idx)
+        mc2_groups.append([base + r for r in range(cloud_count)])
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
         get_world_group().local_rank,
