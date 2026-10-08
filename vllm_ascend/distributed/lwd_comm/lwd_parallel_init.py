@@ -4,8 +4,8 @@
 """Lwd 边云模式的 ascend 侧并行组初始化。
 
 原生 ``init_ascend_model_parallel`` 按 (dp, pp, pcp, tp) 均匀网格切分
-全局 rank,表达不了"边 edge_npu_count + 云 cloud_npu_count"的非对称
-拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
+全局 rank,表达不了"边共享 edge_npu_count + 每云 engine
+cloud_npu_count(×cloud_dp_size)"的非对称拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
 ``vllm_ascend.distributed.parallel_state``,由 LwdCloudWorker /
 LwdEdgeWorker 覆写的 ``_init_worker_distributed_environment`` 调用,
 替代原生入口。
@@ -35,28 +35,34 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         return
     assert torch.distributed.is_initialized()
     lwd = parallel_config.lwd_config
-    data_parallel_size = parallel_config.data_parallel_size
-    e_per = lwd.edge_npu_count_per_dp(data_parallel_size)
-    c_per = lwd.cloud_npu_count_per_instance_dp(data_parallel_size)
-    e_total = lwd.edge_rank_count(data_parallel_size)
+    # 云 DP engine 数以 cloud_dp_size 为准:边侧本地 data_parallel_size
+    # 可能为 1(A 侧 per-engine 部署),不能作为云拓扑真值。
+    d = lwd.cloud_dp_size
+    e_per = lwd.edge_npu_count_per_dp(d)
+    c_per = lwd.cloud_npu_count_per_instance_dp(d)
+    e_total = lwd.edge_rank_count(d)
     world_size = torch.distributed.get_world_size()
-    assert world_size == lwd.lwd_world_size(data_parallel_size), (
+    assert world_size == lwd.lwd_world_size(d), (
         f"Lwd world size mismatch: got {world_size}, expected "
-        f"{lwd.lwd_world_size(data_parallel_size)} "
+        f"{lwd.lwd_world_size(d)} "
         f"(edge {e_total} + {lwd.instance_parallel_size} instances x "
-        f"{data_parallel_size} dp x {c_per} cloud ranks)")
+        f"{d} dp x {c_per} cloud ranks)")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 组:按 (instance, dp) 段划分——每 dp 的边 rank 一段、每个
-    # (实例, dp) 的云 rank 一段,与 vllm 侧 PP/TP 分组(§4.1/§4.2 布
-    # 局)的链路语义对齐;建组顺序同样全局固定(实例主序)。
+    # MC2 组:共享边(E==1 且 D>1)时唯一的边卡单例(所有云 engine 复用);
+    # 否则按 dp 切边卡段。云侧每 (实例, dp) 一段,与 vllm 侧 PP/TP 分组
+    # (§4.1/§4.2 布局)的链路语义对齐;建组顺序全局固定(实例主序)。
     mc2_groups: list[list[int]] = []
-    for dp_idx in range(data_parallel_size):
-        mc2_groups.append(
-            [dp_idx * e_per + r for r in range(e_per)])
+    shared_edge = d > 1 and e_total == 1
+    if shared_edge:
+        mc2_groups.append(list(range(e_total)))
+    else:
+        for dp_idx in range(d):
+            mc2_groups.append(
+                [dp_idx * e_per + r for r in range(e_per)])
     for inst in range(lwd.instance_parallel_size):
-        for dp_idx in range(data_parallel_size):
-            base = lwd.lwd_cloud_first_rank(inst, dp_idx, data_parallel_size)
+        for dp_idx in range(d):
+            base = lwd.lwd_cloud_first_rank(inst, dp_idx, d)
             mc2_groups.append([base + r for r in range(c_per)])
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
