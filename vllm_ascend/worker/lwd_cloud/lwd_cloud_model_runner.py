@@ -31,6 +31,7 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     hash_payload_numel,
     unpack_hash_payload,
 )
+from vllm_ascend.worker.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -41,6 +42,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
+        self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         self._lwd_draft_cache = (
             LwdDraftCache()
             if self.use_async_scheduling and self.speculative_config is not None
@@ -782,8 +784,8 @@ class LwdCloudModelRunner(NPUModelRunner):
                 return None
             lg_sel = lg if full_cover else lg[idx]
             sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
-            thresh = lg_sel.gather(1, sm_sel.long().unsqueeze(1))
-            ranks_list.append((lg_sel > thresh).sum(dim=1).to(torch.int32))
+            # 与边侧稳定排序一致：并列候选按 token ID 升序编码为唯一排名。
+            ranks_list.append(self._lwd_token_rank_encoder.encode(lg_sel, sm_sel))
             rows_list.extend(sample_hidden_states[i : i + 1] for i in idx)
             accepted.extend([1] * len(idx))
         else:
@@ -846,8 +848,8 @@ class LwdCloudModelRunner(NPUModelRunner):
             else:
                 lg_rows = lg[sel_d]
                 hidden_packet = sample_hidden_states[sel_d]
-            thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
-            ranks_list.append((lg_rows > thresh).sum(dim=1).to(torch.int32))
+            # 投机与非投机共用排名规则；拒绝后的 -1 行只保留占位，不交付。
+            ranks_list.append(self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows))
             # 过期 sampled 位(spec 未运行的请求可能残留上个 spec 步的
             # token):accepted/秩/段长一律按实际 hidden 行数封顶——
             # 行数才是真实采样位置的真相
