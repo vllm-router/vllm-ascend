@@ -91,12 +91,13 @@ def init_lwd_duplex_channels() -> None:
 
     Endpoint ranks are resolved from existing deployment info, in
     order:
-      1. ``lwd_config`` NPU counts — one pair per (instance i, dp j):
-         ``(j * E_per, cloud_first(i, j))`` where ``cloud_first(i, j)
-         = E + i*D*C + j*C`` (vllm ``LwdParallelConfig`` layout);
+      1. ``lwd_config`` NPU counts — one pair per (instance i, engine j):
+         ``(edge_rank, cloud_first(i, j))`` where
+         ``cloud_first(i, j) = E + i*D*C + j*C`` and ``edge_rank`` is 0
+         for the shared edge (E==1, D>1), otherwise ``j*E_per``;
       2. PP-group convention fallback (demo 1E1C topology, counts
          unset): a 2-rank PP group spans exactly the edge/cloud pair
-         (rank[0]=edge, rank[1]=cloud), recorded as instance 0, dp 0.
+         (rank[0]=edge, rank[1]=cloud), recorded as instance 0, engine 0.
 
     Only the two endpoint ranks of each pair ever touch its channels;
     interior ranks (extra cloud TP ranks) join every group collective
@@ -115,18 +116,24 @@ def init_lwd_duplex_channels() -> None:
     # order: instance ascending, dp ascending.
     pair_list: list[tuple[int, int, tuple[int, int]]] = []
     if lwd_cfg.enable_lwd and lwd_cfg.edge_npu_count > 0:
-        d = parallel_config.data_parallel_size
+        # 云 DP 轴以 cloud_dp_size 为准(边侧本地 data_parallel_size
+        # 可能为 1);实例维度保留 B 的 instance_parallel_size。
+        d = lwd_cfg.cloud_dp_size
         n = lwd_cfg.instance_parallel_size
         e_per = lwd_cfg.edge_npu_count_per_dp(d)
         e_total = lwd_cfg.edge_rank_count(d)
         c_per = lwd_cfg.cloud_npu_count_per_instance_dp(d)
+        # 共享边(E==1 且 D>1):唯一边卡被所有 engine 复用,端点边 rank
+        # 恒为 0;否则按 dp 切边卡段(j*E_per)。
+        shared_edge = d > 1 and e_total == 1
         for i in range(n):
             for j in range(d):
+                edge_rank = 0 if shared_edge else j * e_per
                 pair_list.append(
                     (
                         i,
                         j,
-                        (j * e_per, lwd_cfg.lwd_cloud_first_rank(i, j, d)),
+                        (edge_rank, lwd_cfg.lwd_cloud_first_rank(i, j, d)),
                     )
                 )
         _MY_DP = _dp_of_rank(my_rank, e_per, e_total, d, c_per)
@@ -154,7 +161,7 @@ def init_lwd_duplex_channels() -> None:
             if my_rank in ranks:
                 peer = ranks[1] if my_rank == ranks[0] else ranks[0]
                 _LWD_CHANNEL_GROUPS[(channel, i, j)] = (group, peer)
-                stream_key = (channel, i)
+                stream_key = (channel, i, j)
                 if stream_key not in _LWD_CHANNEL_STREAMS:
                     _LWD_CHANNEL_STREAMS[stream_key] = torch.npu.Stream(priority=-1)
     # embeds 组内广播不再自建通信域(自建 new_group 在 torch_npu 下实测
@@ -204,22 +211,22 @@ def warmup_lwd_duplex_channels() -> None:
         payload = torch.zeros(8, dtype=torch.bfloat16, device="npu")
         if am_sender:
             logger.info(
-                "[lwd-warmup] SEND post channel=%s instance=%d my_rank=%d "
-                "peer=%d group_ranks=%s",
-                channel, i, my_rank, peer,
+                "[lwd-warmup] SEND post channel=%s instance=%d engine=%d "
+                "my_rank=%d peer=%d group_ranks=%s",
+                channel, i, j, my_rank, peer,
                 dist.get_process_group_ranks(group))
             handle = dist.isend(payload, dst=peer, group=group)
         else:
             logger.info(
-                "[lwd-warmup] RECV post channel=%s instance=%d my_rank=%d "
-                "src=%d group_ranks=%s",
-                channel, i, my_rank, peer,
+                "[lwd-warmup] RECV post channel=%s instance=%d engine=%d "
+                "my_rank=%d src=%d group_ranks=%s",
+                channel, i, j, my_rank, peer,
                 dist.get_process_group_ranks(group))
             handle = dist.irecv(payload, src=peer, group=group)
         handle.wait()
         logger.info(
-            "[lwd-warmup] DONE channel=%s instance=%d my_rank=%d",
-            channel, i, my_rank,
+            "[lwd-warmup] DONE channel=%s instance=%d engine=%d my_rank=%d",
+            channel, i, j, my_rank,
         )
     get_world_group().barrier()
     logger.info(
@@ -233,17 +240,17 @@ def lwd_channels_initialized() -> bool:
 
 
 def _owned_key(
-    channel: LwdChannelType, instance_id: int, dp_rank: int | None
+    channel: LwdChannelType, instance_id: int, engine_index: int | None
 ) -> tuple[LwdChannelType, int, int]:
     key = (
         channel,
         int(instance_id),
-        _MY_DP if dp_rank is None else int(dp_rank),
+        _MY_DP if engine_index is None else int(engine_index),
     )
     if key not in _LWD_CHANNEL_GROUPS:
         raise RuntimeError(
             f"no lwd duplex channel record for channel={channel} "
-            f"instance={instance_id} dp={key[2]}: this rank "
+            f"instance={instance_id} engine={key[2]}: this rank "
             f"({dist.get_rank()}) is not an endpoint of that pair "
             "(or the wire layer is not initialized)"
         )
@@ -251,51 +258,61 @@ def _owned_key(
 
 
 def get_lwd_channel_device_group(
-    channel: LwdChannelType, instance_id: int = 0, dp_rank: int | None = None
+    channel: LwdChannelType,
+    instance_id: int = 0,
+    engine_index: int | None = None,
 ) -> dist.ProcessGroup:
-    key = _owned_key(channel, instance_id, dp_rank)
+    key = _owned_key(channel, instance_id, engine_index)
     return _LWD_CHANNEL_GROUPS[key][0]
 
 
 def get_lwd_channel_peer(
-    channel: LwdChannelType, instance_id: int = 0, dp_rank: int | None = None
+    channel: LwdChannelType,
+    instance_id: int = 0,
+    engine_index: int | None = None,
 ) -> int:
-    """Global rank of this process's P2P peer on the instance's channel."""
-    key = _owned_key(channel, instance_id, dp_rank)
+    """Global rank of this process's P2P peer on the (instance, engine) channel."""
+    key = _owned_key(channel, instance_id, engine_index)
     return _LWD_CHANNEL_GROUPS[key][1]
 
 
 def get_lwd_channel_stream(
-    channel: LwdChannelType, instance_id: int = 0
+    channel: LwdChannelType,
+    instance_id: int = 0,
+    engine_index: int | None = None,
 ) -> "torch.npu.Stream":
-    key = (channel, int(instance_id))
+    key = (
+        channel,
+        int(instance_id),
+        _MY_DP if engine_index is None else int(engine_index),
+    )
     stream = _LWD_CHANNEL_STREAMS.get(key)
     if stream is None:
         raise RuntimeError(
             f"no lwd channel stream for channel={channel} "
-            f"instance={instance_id}: this rank owns no endpoint of "
-            "that instance's pair (streams exist on endpoints only)"
+            f"instance={instance_id} engine={key[2]}: this rank owns no "
+            "endpoint of that pair (streams exist on endpoints only)"
         )
     return stream
 
 
 def lwd_pair_ranks(
-    instance_id: int = 0, dp_rank: int | None = None
+    instance_id: int = 0, engine_index: int | None = None
 ) -> tuple[int, int]:
-    """``(edge_rank, cloud_rank)`` of one (instance, dp) channel pair.
+    """``(edge_rank, cloud_rank)`` of one (instance, engine) channel pair.
 
     Layout knowledge available on EVERY rank (endpoint or not); the
-    cloud endpoint check is ``rank == lwd_pair_ranks(i)[1]``."""
+    cloud endpoint check is ``rank == lwd_pair_ranks(i, j)[1]``."""
     key = (
         LwdChannelType.UP,
         int(instance_id),
-        _MY_DP if dp_rank is None else int(dp_rank),
+        _MY_DP if engine_index is None else int(engine_index),
     )
     ranks = _LWD_CHANNEL_PAIRS.get(key)
     if ranks is None:
         raise RuntimeError(
             f"no lwd channel pair record for instance={instance_id} "
-            f"dp={key[2]} (wire layer not initialized?)"
+            f"engine={key[2]} (wire layer not initialized?)"
         )
     return ranks
 

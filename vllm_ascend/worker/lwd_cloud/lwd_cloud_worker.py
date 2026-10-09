@@ -96,6 +96,9 @@ class LwdCloudWorker(NPUWorker):
         # instance-major layout IS the instance), validated against
         # --instance-parallel-start-rank when the command declares one.
         self._lwd_own_instance = self._lwd_resolve_own_instance()
+        # 本进程所属云 engine(= dp_rank):数据面通道按 (instance, engine)
+        # 选择;单云恒 0。
+        self._lwd_engine_index = self.parallel_config.data_parallel_rank
         # [Lwd][pre-recv] 提前收:端点 rank(= 唯一持跨机 P2P 通道的云 rank,
         # 与 lwd_wire 同款约定)才提前挂真实 irecv 并上报收完水位;其余 rank
         # 的数据在注入时刻由 TP 组内广播取到,既不挂 recv 也不上报。
@@ -128,9 +131,13 @@ class LwdCloudWorker(NPUWorker):
         # 环境变量;done MQ 由本处建 writer,handle 随 READY 握手回传引擎)。
         # 其余 rank 只登记"非端点"。
         try:
-            _, cloud_endpoint = lwd_wire.lwd_pair_ranks(self._lwd_own_instance)
+            _, cloud_endpoint = lwd_wire.lwd_pair_ranks(
+                self._lwd_own_instance, self._lwd_engine_index
+            )
         except RuntimeError:
-            cloud_endpoint = self.parallel_config.lwd_config.edge_npu_count
+            cloud_endpoint = self.parallel_config.lwd_config.cloud_engine_rank_base(
+                self._lwd_engine_index
+            )
         self._lwd_early_recv_endpoint = self.rank == cloud_endpoint
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         logger.info(
@@ -389,6 +396,8 @@ class LwdCloudWorker(NPUWorker):
             # LwdBatch.instance_id 同戳。漏了会恒落 0 号实例的通道——非 0
             # 实例的 recv 与边侧的 send 配不上,收不完、水位不前进、闸门死锁。
             instance_id=self._lwd_own_instance,
+            # 云侧 engine 戳:UP/DOWN 通道按 (instance, engine) 选择
+            engine_index=self._lwd_engine_index,
             # aux 第二载荷与主帧同 seqno;mrope 退役后恒 0(零 aux 流量),
             # 未来载荷(如 deepstack)显式传行数即可
             aux_num_elements=int(aux_rows) * 3,
@@ -672,6 +681,7 @@ class LwdCloudWorker(NPUWorker):
                         tensor=hidden,
                         seqno=seqno,
                         instance_id=instance_id,
+                        engine_index=self._lwd_engine_index,
                     )
                 )
                 # async 包装器下挂到内层,否则 get_output() 解包丢失

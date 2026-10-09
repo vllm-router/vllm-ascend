@@ -68,6 +68,10 @@ class LwdCommRequest:
     # the second instance's first batch ("duplicate or replayed
     # seqno") — treat that error as a missing-stamp tripwire.
     instance_id: int = 0
+    # 目标/来源云 engine(= dp_rank),多云 DP 下选择 per-engine 通道组
+    # 与该 engine 的 seqno 流;单云恒 0。seqno 契约是 per-(instance,
+    # engine, channel, op) 的。
+    engine_index: int = 0
     # Optional second payload of the SAME logical request (currently
     # UP-only: mrope positions, int64 [n,3], accompanying an embeds chunk
     # when the batch has mm data).  Physically a second P2P issued right

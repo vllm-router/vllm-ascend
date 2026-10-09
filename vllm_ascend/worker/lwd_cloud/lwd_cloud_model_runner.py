@@ -430,7 +430,7 @@ class LwdCloudModelRunner(NPUModelRunner):
 
         _tp = get_tp_group()
         _lwd_cfg = worker.parallel_config.lwd_config
-        _is_endpoint = worker.rank == _lwd_cfg.edge_npu_count
+        _engine_index = getattr(worker, "_lwd_engine_index", 0)
         for post_key in list(posted.keys()):
             item = worker._lwd_up_recv_futures.pop(post_key, None)
             if item is None:
@@ -445,9 +445,11 @@ class LwdCloudModelRunner(NPUModelRunner):
             from vllm_ascend.distributed import lwd_wire
 
             try:
-                _, _cloud_endpoint = lwd_wire.lwd_pair_ranks(instance_id)
+                _, _cloud_endpoint = lwd_wire.lwd_pair_ranks(
+                    instance_id, _engine_index
+                )
             except RuntimeError:
-                _cloud_endpoint = _lwd_cfg.edge_npu_count
+                _cloud_endpoint = _lwd_cfg.cloud_engine_rank_base(_engine_index)
             _is_endpoint = worker.rank == _cloud_endpoint
             # UP 第二段(TP 组内广播)按 prefill_only_demo_br 范式在消费
             # 时刻、本卡计算流上原子完成:launch + handle.wait() 同一流

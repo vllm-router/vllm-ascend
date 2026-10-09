@@ -35,21 +35,20 @@ class LwdCommService:
             return cls._instance
 
     def __init__(self) -> None:
-        # HCCL ordering is per physical (channel, direction, instance):
-        # send and recv have INDEPENDENT seqno streams (each peer's send
-        # order must match the other side's recv-post order), and each
-        # cloud instance owns a dedicated wire pair whose seqno space
-        # starts at 0 — so the FIFO key is
-        # (channel, op, instance_id, effective_peer).  Merging op would
-        # make a process's sends and recvs on one channel collide on a
-        # shared seqno counter; dropping instance_id collapses every
-        # instance's traffic onto one FIFO whose seqno space then
-        # rejects the second instance's first batch.  The peer axis is
-        # redundant in the per-rank topology (one endpoint per
-        # (channel, instance) pair) but keeps the shared-edge form (one
-        # process, several peers per instance) correct.
+        # HCCL ordering is per physical (instance, engine, channel,
+        # direction): send and recv have INDEPENDENT seqno streams (each
+        # peer's send order must match the other side's recv-post
+        # order), and each (cloud instance, cloud engine) pair owns a
+        # dedicated wire pair whose seqno space starts at 0 — so the
+        # FIFO key is
+        # (instance_id, engine_index, channel, op, effective_peer).
+        # Merging any axis would make seqno streams collide across
+        # instances/engines/directions.  The peer axis is redundant in
+        # the per-rank topology (one endpoint per (channel, instance,
+        # engine) pair) but keeps the shared-edge form (one process,
+        # several peers per pair) correct.
         self._channels: dict[
-            tuple[LwdChannelType, str, int, int], LwdChannel
+            tuple[int, int, LwdChannelType, str, int], LwdChannel
         ] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
@@ -89,15 +88,23 @@ class LwdCommService:
         seqno: int,
         op: str = "recv",
         instance_id: int = 0,
+        engine_index: int = 0,
     ) -> None:
         """Mark a seqno as never-to-arrive (aborted request) on the given
-        channel+direction FIFO of one instance.  Recv managers' drop path
-        passes op="recv"; the sender-side abort glue passes op="send".
-        Both peers must skip the same seqnos on the same instance."""
+        channel+direction FIFO of one (instance, engine).  Recv managers'
+        drop path passes op="recv"; the sender-side abort glue passes
+        op="send".  Both peers must skip the same seqnos on the same
+        (instance, engine)."""
         with self._lock:
-            peer = _wire_peer_or_none(channel_type, instance_id)
+            peer = _wire_peer_or_none(channel_type, instance_id, engine_index)
             channel = self._channels.get(
-                (channel_type, op, int(instance_id), peer)
+                (
+                    int(instance_id),
+                    int(engine_index),
+                    channel_type,
+                    op,
+                    peer,
+                )
             )
         if channel is not None:
             channel.skip_seqno(seqno)
@@ -127,33 +134,47 @@ class LwdCommService:
 
     def _submit(self, request: LwdCommRequest) -> LwdCommFuture:
         instance_id = int(getattr(request, "instance_id", 0) or 0)
+        engine_index = int(getattr(request, "engine_index", 0) or 0)
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("lwd-comm service is shutting down")
             peer = request.src_dst
             if peer is None:
-                peer = _resolve_wire_peer(request.channel, instance_id)
-            key = (request.channel, request.op, instance_id, peer)
+                peer = _resolve_wire_peer(
+                    request.channel, instance_id, engine_index
+                )
+            key = (
+                instance_id,
+                engine_index,
+                request.channel,
+                request.op,
+                peer,
+            )
             channel = self._channels.get(key)
             if channel is None:
                 channel = LwdChannel(
-                    request.channel, request.op, instance_id=instance_id
+                    request.channel,
+                    request.op,
+                    instance_id=instance_id,
+                    engine_index=engine_index,
                 )
                 self._channels[key] = channel
                 logger.info(
-                    "[lwd-comm] created channel %s/%s (instance=%d peer=%s)",
+                    "[lwd-comm] created channel %s/%s (instance=%d "
+                    "engine=%d peer=%s)",
                     request.channel.value,
                     request.op,
                     instance_id,
+                    engine_index,
                     peer,
                 )
         return channel.submit(request)
 
 
 def _resolve_wire_peer(
-    channel: LwdChannelType, instance_id: int
+    channel: LwdChannelType, instance_id: int, engine_index: int = 0
 ) -> int:
-    """Default peer of (channel, instance) from the wire table."""
+    """Default peer of (channel, instance, engine) from the wire table."""
     from vllm_ascend.distributed import lwd_wire
 
     if not lwd_wire.lwd_channels_initialized():
@@ -161,16 +182,18 @@ def _resolve_wire_peer(
             "lwd duplex channels are not initialized; call "
             "init_lwd_duplex_channels() before submitting comm requests"
         )
-    return lwd_wire.get_lwd_channel_peer(channel, instance_id)
+    return lwd_wire.get_lwd_channel_peer(
+        channel, instance_id, engine_index
+    )
 
 
 def _wire_peer_or_none(
-    channel: LwdChannelType, instance_id: int
+    channel: LwdChannelType, instance_id: int, engine_index: int = 0
 ) -> int | None:
     """Peer used at channel-creation time, for skip_seqno lookups; None
     when the wire layer is not up (no channel could exist either)."""
     try:
-        return _resolve_wire_peer(channel, instance_id)
+        return _resolve_wire_peer(channel, instance_id, engine_index)
     except RuntimeError:
         return None
 

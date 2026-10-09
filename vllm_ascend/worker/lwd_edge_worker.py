@@ -338,6 +338,7 @@ class LwdEdgeWorker(NPUWorker):
             tensor=payload,
             seqno=seqno,
             instance_id=instance_id,
+            engine_index=batch_meta.engine_index,
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -525,6 +526,7 @@ class LwdEdgeWorker(NPUWorker):
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
                 instance_id=instance_id,
+                engine_index=batch_meta.engine_index,
             )
         )
         _t_post = time.monotonic()
