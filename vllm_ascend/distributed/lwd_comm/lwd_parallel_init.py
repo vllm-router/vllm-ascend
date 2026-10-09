@@ -44,12 +44,17 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         f"{edge_count} + {cloud_count} * {cloud_dp}")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 组:边 rank 一组;每云 engine 的云 rank 各一组,与 vllm 侧
-    # TP 分组([[边], [engine0], [engine1], ...])的实例语义对齐。
+    # MC2 组(EP/MoE all2all 的载体,fused_moe 经 get_mc2_group() 取):
+    # 对齐原生 init_ascend_model_parallel 的 dp×tp 建组语义——EP 开启时
+    # 专家按 ep_size=dp×tp 分片(跨 engine),all2all 组必须罩住全部云
+    # rank,否则每个 token 只能路由到半数专家,MoE 输出错(乱码)。
+    # 边 rank 一组(不跑 MoE);锁步由 DPEngineCoreProc 的 wave 机制保证。
     mc2_groups: list[list[int]] = [[r for r in range(edge_count)]]
+    cloud_ranks_all: list[int] = []
     for dp_idx in range(cloud_dp):
         base = lwd.cloud_engine_rank_base(dp_idx)
-        mc2_groups.append([base + r for r in range(cloud_count)])
+        cloud_ranks_all.extend(base + r for r in range(cloud_count))
+    mc2_groups.append(cloud_ranks_all)
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
         get_world_group().local_rank,
