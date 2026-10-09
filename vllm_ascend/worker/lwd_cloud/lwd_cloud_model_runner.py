@@ -32,6 +32,7 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     hash_payload_numel,
     unpack_hash_payload,
 )
+from vllm_ascend.worker.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -42,6 +43,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
+        self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         self._lwd_draft_cache = (
             LwdDraftCache()
             if self.use_async_scheduling and self.speculative_config is not None
@@ -836,8 +838,8 @@ class LwdCloudModelRunner(NPUModelRunner):
             full_cover = all(valid[: len(batch_req_ids)])
             lg_sel = lg if full_cover else lg[idx]
             sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
-            thresh = lg_sel.gather(1, sm_sel.long().unsqueeze(1))
-            ranks_all = (lg_sel > thresh).sum(dim=1).to(torch.int32)
+            # 与边侧稳定排序一致：并列候选按 token ID 升序编码为唯一排名。
+            ranks_all = self._lwd_token_rank_encoder.encode(lg_sel, sm_sel)
             for k, i in enumerate(idx):
                 edge_id = _req_edge_id(batch_req_ids[i])
                 b = _bucket(edge_id)
@@ -907,8 +909,8 @@ class LwdCloudModelRunner(NPUModelRunner):
                 sampled_rows = sampled[req_d, pos_d]
                 lg_rows = lg[sel_d]
                 hidden_e = sample_hidden_states[sel_d]
-                thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
-                rank = (lg_rows > thresh).sum(dim=1).to(torch.int32)
+                # 投机与非投机共用排名规则；拒绝后的 -1 行只保留占位，不交付。
+                rank = self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows)
                 count = torch.minimum(counts_all[vidx_d], vlen_d).to(
                     torch.int32
                 )

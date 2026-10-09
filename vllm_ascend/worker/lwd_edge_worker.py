@@ -8,22 +8,22 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.distributed import (
+    ensure_model_parallel_initialized,
+    init_distributed_environment,
+)
+from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.logger import logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-
 from vllm.v1.core.sched.output import (
     LwdBatchType,
     LwdEmbedBatch,
     LwdUnembedBatch,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.distributed import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-)
-from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
-from vllm_ascend.ascend_config import get_ascend_config
+
 from vllm_ascend import envs
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
@@ -50,6 +50,8 @@ def select_token_batch(
     stable=True:云侧 rank = 严格大于的计数,bf16 并列时下标序
     必须确定,否则并列对里可能取到另一个 token(静默错 token)。
     """
+    # 词表列按全局 token ID 升序排列；稳定降序排序保留同分候选的 ID 顺序。
+    # 必须与云侧唯一排名同时更新，不能与旧版“严格更高分计数”协议混用。
     _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
     row = torch.arange(len(ranks), device=logits.device)
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
@@ -58,7 +60,8 @@ def select_token_batch(
 def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
     """Look up the descending-logits ordinal of ``token_id`` (cloud side)."""
     logits = logits.reshape(-1)
-    order = torch.argsort(logits, descending=True)
+    # 单 token 辅助函数也遵循同一并列规则。
+    order = torch.argsort(logits, descending=True, stable=True)
     return int((order == token_id).nonzero()[0].item())
 
 
@@ -184,11 +187,11 @@ class LwdEdgeWorker(NPUWorker):
         logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")
         return CompilationTimes(language_model=0.0, encoder=0.0)
 
-    def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """The LWD edge runs no attention/transformer, so it needs no KV cache."""
         return {}
 
-    def execute_model(self, scheduler_output: "SchedulerOutput"):
+    def execute_model(self, scheduler_output: SchedulerOutput):
         lwd_batch = scheduler_output.lwd_batch
         # 多模态缓存生命周期:请求完结(含 abort)即摘除其 mm 特征/
         # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部
@@ -277,7 +280,7 @@ class LwdEdgeWorker(NPUWorker):
         self,
         seqno: int,
         batch_meta: LwdEmbedBatch,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
     ) -> None:
         model = self.model_runner.get_model()
         if not batch_meta.token_ids:
