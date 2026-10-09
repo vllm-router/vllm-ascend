@@ -428,7 +428,16 @@ class LwdCloudModelRunner(NPUModelRunner):
 
         _tp = get_tp_group()
         _lwd_cfg = worker.parallel_config.lwd_config
-        _is_endpoint = worker.rank == _lwd_cfg.edge_npu_count
+        # 端点 = 本 engine TP 组首卡(共享边布局 rank = E + dp_rank*C);
+        # 多云下不能再用绝对值 edge_npu_count——那只命中 engine0,
+        # 其余 engine 的首卡会被误判为非端点,把空 buffer 广播给全组
+        # 注入(该 engine 输出乱码)。
+        _is_endpoint = (
+            worker.rank
+            == _lwd_cfg.cloud_engine_rank_base(
+                worker.parallel_config.data_parallel_rank
+            )
+        )
         for batch_seqno in list(posted.keys()):
             item = worker._lwd_up_recv_futures.pop(batch_seqno, None)
             if item is None:
