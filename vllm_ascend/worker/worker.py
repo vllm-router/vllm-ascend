@@ -56,6 +56,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
@@ -593,7 +594,32 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
 
-        logger.debug(profile_result)
+        # [Lwd][mem-debug] VLLM_ASCEND_LWD_MEM_DEBUG=1 时把 torch 显存分解
+        # 打全(profile 结束点):all.peak=分配峰值,all.reserved=预留,
+        # 差值≈碎片/未用预留;两侧部署(LWD vs 集中式)对比该行即可定位
+        # torch_peak 差额的构成。
+        if ascend_envs.VLLM_ASCEND_LWD_MEM_DEBUG:
+            stats = torch.npu.memory_stats(self.device)
+            logger.info(
+                "[Lwd][mem-debug] rank=%s allocated_cur=%.2fGiB "
+                "allocated_peak=%.2fGiB reserved_cur=%.2fGiB "
+                "reserved_peak=%.2fGiB num_segments=%d",
+                getattr(self, "rank", "?"),
+                stats.get("allocated_bytes.all.current", 0) / GiB_bytes,
+                stats.get("allocated_bytes.all.peak", 0) / GiB_bytes,
+                stats.get("reserved_bytes.all.current", 0) / GiB_bytes,
+                stats.get("reserved_bytes.all.peak", 0) / GiB_bytes,
+                stats.get("segment.all.current", 0),
+            )
+            try:
+                snap_path = f"/tmp/lwd_mem_snap_rank{getattr(self, 'rank', 'x')}.pkl"
+                torch.npu.memory._dump_snapshot(snap_path)
+                logger.info("[Lwd][mem-debug] snapshot dumped to %s", snap_path)
+            except Exception:
+                logger.warning("[Lwd][mem-debug] snapshot dump failed",
+                               exc_info=True)
+
+        logger.info(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
