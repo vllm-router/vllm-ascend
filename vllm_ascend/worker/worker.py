@@ -557,6 +557,11 @@ class NPUWorker(WorkerBase):
             )
             return kv_cache_memory_bytes
 
+        # [Lwd][mem-debug] 记录分配历史(含瞬态分配,profile 的 +1GB
+        # 峰值就靠它定位)——必须在 profile 之前开录
+        if ascend_envs.VLLM_ASCEND_LWD_MEM_DEBUG:
+            torch.npu.memory._record_memory_history(max_entries=200000)
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -612,6 +617,8 @@ class NPUWorker(WorkerBase):
                 stats.get("segment.all.current", 0),
             )
             try:
+                # 含分配历史(record_memory_history 已在 profile 前开录),
+                # 用 torch 官网的 memory_viz 打开可逐分配看堆栈
                 snap_path = f"/tmp/lwd_mem_snap_rank{getattr(self, 'rank', 'x')}.pkl"
                 torch.npu.memory._dump_snapshot(snap_path)
                 logger.info("[Lwd][mem-debug] snapshot dumped to %s", snap_path)
