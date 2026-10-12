@@ -51,11 +51,11 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_LWD_DISABLE_DOWN", 0)
     ),
     # LWD diagnostic: when set to 1, each worker logs a torch memory
-    # breakdown (allocated/reserved peak, segments) at the end of
-    # profile-based memory sizing and dumps a torch memory snapshot to
-    # /tmp/lwd_mem_snap_rank<N>.pkl. Used to attribute KV-pool-size
-    # differences between deployments. Default 0. Never enable in
-    # production.
+    # breakdown (allocated/reserved peak, segments) plus top-10 largest
+    # allocations aggregated by stack (recorded history, transients
+    # included) at the end of profile-based memory sizing. Used to
+    # attribute KV-pool-size differences between deployments.
+    # Default 0. Never enable in production.
     "VLLM_ASCEND_LWD_MEM_DEBUG": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_MEM_DEBUG", 0)
     ),
