@@ -913,23 +913,11 @@ class NPUWorker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-            # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).
-            #
-            # When eagle3 is enabled with num_speculative_tokens>1, mamba blocks may be reallocated to full blocks if
-            # the target and draft models share the same kv cache tensor (e.g. unaligned full attn layers with
-            # different num_kv_heads and head_size). In addition, for performance reasons, the current mtp/eagle path
-            # does not update seq_lens_cpu with num_rejected_tokens for step>1, since it would require d2h sync. As a
-            # result, seq_lens_cpu can become stale and some blocks will be unintentionally used.
-            #
-            # If an uncleared mamba block is later reused, the stale state combined with the incorrect seq_lens_cpu may
-            # lead to NaNs and reduced acceptance rate.
-            if (
-                kv_cache_config.needs_kv_cache_zeroing
-                and hasattr(self.model_runner, "_init_kv_zero_meta")
-                and self.vllm_config is not None
-                and self.vllm_config.speculative_config is not None
-                and self.vllm_config.speculative_config.method == "eagle3"
-                and self.vllm_config.speculative_config.num_speculative_tokens > 1
+            # 混合 mamba 模型:回收块携带上一请求的循环状态,污染 SSM
+            # 计算。对齐 GPU worker 语义,needs_kv_cache_zeroing 即初始化
+            # 清零器(mtp/eagle 同样会回绕复用状态块,不限定 eagle3)。
+            if kv_cache_config.needs_kv_cache_zeroing and hasattr(
+                self.model_runner, "_init_kv_zero_meta"
             ):
                 self.model_runner._init_kv_zero_meta()
 
