@@ -560,7 +560,13 @@ class NPUWorker(WorkerBase):
         # [Lwd][mem-debug] 记录分配历史(含瞬态分配,profile 的 +1GB
         # 峰值就靠它定位)——必须在 profile 之前开录
         if ascend_envs.VLLM_ASCEND_LWD_MEM_DEBUG:
-            torch.npu.memory._record_memory_history(max_entries=200000)
+            try:
+                torch.npu.memory._record_memory_history(max_entries=200000)
+            except Exception:
+                logger.warning(
+                    "[Lwd][mem-debug] record_memory_history unsupported",
+                    exc_info=True,
+                )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -616,14 +622,39 @@ class NPUWorker(WorkerBase):
                 stats.get("reserved_bytes.all.peak", 0) / GiB_bytes,
                 stats.get("segment.all.current", 0),
             )
+            # 不落盘:进程内聚合分配历史,按调用栈打印 Top-10 大额分配
+            # (含瞬态),日志直接可看
             try:
-                # 含分配历史(record_memory_history 已在 profile 前开录),
-                # 用 torch 官网的 memory_viz 打开可逐分配看堆栈
-                snap_path = f"/tmp/lwd_mem_snap_rank{getattr(self, 'rank', 'x')}.pkl"
-                torch.npu.memory._dump_snapshot(snap_path)
-                logger.info("[Lwd][mem-debug] snapshot dumped to %s", snap_path)
+                from torch.npu.memory import _snapshot
+
+                agg: dict[str, list] = {}
+                for dev_trace in _snapshot().get("device_traces") or []:
+                    for ev in dev_trace:
+                        if ev.get("action") != "alloc":
+                            continue
+                        size = int(ev.get("size", 0))
+                        frames = ev.get("frames") or []
+                        key = " <- ".join(
+                            f"{f.get('name', '?')}"
+                            f"({f.get('filename', '?').split('/')[-1]}"
+                            f":{f.get('line', '?')})"
+                            for f in frames[:8]
+                        ) or "<no frames>"
+                        entry = agg.setdefault(key, [0, 0, 0])
+                        entry[0] += size
+                        entry[1] += 1
+                        entry[2] = max(entry[2], size)
+                top = sorted(
+                    agg.items(), key=lambda kv: kv[1][2], reverse=True
+                )[:10]
+                for key, (total, count, peak) in top:
+                    logger.info(
+                        "[Lwd][mem-debug] top-alloc max=%.2fGiB "
+                        "total=%.2fGiB n=%d: %s",
+                        peak / GiB_bytes, total / GiB_bytes, count, key,
+                    )
             except Exception:
-                logger.warning("[Lwd][mem-debug] snapshot dump failed",
+                logger.warning("[Lwd][mem-debug] history aggregation failed",
                                exc_info=True)
 
         logger.info(profile_result)
