@@ -561,6 +561,12 @@ class NPUWorker(WorkerBase):
         # 峰值就靠它定位)——必须在 profile 之前开录
         if ascend_envs.VLLM_ASCEND_LWD_MEM_DEBUG:
             try:
+                # 优先录 Python 栈(C++ 栈在 libtorch_npu 无符号时全是
+                # CapturedTraceback::gather,定位不到调用点)
+                torch.npu.memory._record_memory_history(
+                    max_entries=200000, stacks="python"
+                )
+            except TypeError:
                 torch.npu.memory._record_memory_history(max_entries=200000)
             except Exception:
                 logger.warning(
