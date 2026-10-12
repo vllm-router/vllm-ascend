@@ -22,6 +22,7 @@ from vllm.distributed import (
     init_distributed_environment,
 )
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend import envs
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
@@ -133,6 +134,9 @@ class LwdEdgeWorker(NPUWorker):
         # warmup additionally requires both peers to reach it in the same fixed
         # order, which only holds once every rank is past its distributed init.
         super().init_device()
+        # Payload scramble: bind the two static factors once; the per-flight
+        # seed is derived by the comm layer from each request's own fields.
+        self._build_payload_scrambler()
         self.comm_service = get_lwd_comm_service()
         # 多模态请求级缓存:req_id -> mm_features(带 data,首 chunk 随
         # scheduled_new_reqs 到达时登记) / req_id -> [(mm_position,
@@ -147,6 +151,28 @@ class LwdEdgeWorker(NPUWorker):
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
             self.rank,
+        )
+
+    def _build_payload_scrambler(self) -> None:
+        """Initialize the process-wide scrambler when enabled (else no-op).
+
+        Opt-in: a missing ``payload_scramble`` block, or one without
+        ``enable: true``, leaves scramble off -- no error.  With ``enable:
+        true`` the two static factors are required; a missing one fails fast
+        rather than silently deriving a seed that differs from the peer's.
+        """
+        if not self.enable_lwd:
+            return
+        scramble_cfg = get_ascend_config().payload_scramble
+        if not scramble_cfg.get("enable", False):
+            return
+        from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+            get_payload_scrambler,
+        )
+
+        get_payload_scrambler(
+            device_id=scramble_cfg.get("device_id"),
+            custom_factor=scramble_cfg.get("custom_factor"),
         )
 
     def compile_or_warm_up_model(self):

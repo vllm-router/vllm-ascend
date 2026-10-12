@@ -26,6 +26,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
@@ -76,6 +77,9 @@ class LwdCloudWorker(NPUWorker):
 
     def init_device(self):
         super().init_device()
+        # Payload scramble: bind the two static factors once; the per-flight
+        # seed is derived by the comm layer from each request's own fields.
+        self._build_payload_scrambler()
         # per-edge DOWN seqno counter (worker layer, send-time alloc);
         # 多边各边独立 seqno 流。
         self._lwd_down_next_seqno: dict[int, int] = {}
@@ -103,6 +107,28 @@ class LwdCloudWorker(NPUWorker):
 
         lwd_wire.init_lwd_duplex_channels()
         self._register_lwd_prompt_embeds_provider()
+
+    def _build_payload_scrambler(self) -> None:
+        """Initialize the process-wide scrambler when enabled (else no-op).
+
+        Opt-in: a missing ``payload_scramble`` block, or one without
+        ``enable: true``, leaves scramble off -- no error.  With ``enable:
+        true`` the two static factors are required; a missing one fails fast
+        rather than silently deriving a seed that differs from the peer's.
+        """
+        if not self.enable_lwd:
+            return
+        scramble_cfg = get_ascend_config().payload_scramble
+        if not scramble_cfg.get("enable", False):
+            return
+        from vllm_ascend.distributed.lwd_comm.payload_scramble import (
+            get_payload_scrambler,
+        )
+
+        get_payload_scrambler(
+            device_id=scramble_cfg.get("device_id"),
+            custom_factor=scramble_cfg.get("custom_factor"),
+        )
 
     def load_model(self):
         """加载后打实际切片:层数/首末层名/pp 切层参数,启动期即可裁决
