@@ -474,6 +474,15 @@ class LwdCloudModelRunner(NPUModelRunner):
                 up_flat = res.tensor
                 if up_flat is None:
                     continue
+                # 跨流生命周期登记(收割时刻):端点 recv buffer 由通道流
+                # 分配(_wire_recv 在通道流上下文 torch.empty),收割后的
+                # 消费(TP 广播读 + 后续注入 copy)全在计算流。不登记
+                # record_stream,分配器可在计算流 copy 尚未执行时把块交给
+                # 下一 seqno 的 irecv 覆写——深异步队列下表现为跨 seqno
+                # 串数据(预测开头重复/乱码)。登记后复用即被正确排序。
+                # 非端点 rank 的 torch.empty 在计算流上下文分配(同流
+                # 使用),无此问题,不用登记。
+                up_flat.record_stream(torch.npu.current_stream())
                 # aux 帧与主帧同一逻辑请求:端点从 future 结果直接取
                 # 第二载荷。
                 aux_flat = res.aux_tensor
