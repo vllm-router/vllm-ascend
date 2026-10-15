@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from types import NoneType
 
 import torch
@@ -449,6 +450,17 @@ class NPUWorker(WorkerBase):
             device = torch.device(f"npu:{self.local_rank}")
 
         torch.npu.set_device(device)
+        # [Lwd][dp-diag] rank↔设备映射(HCCL 建组失败排查的第一现场):
+        # 云内 DP 下两引擎的切片必须互不重叠(engine i 占物理卡
+        # [i*C,(i+1)*C));两引擎打到同一批卡即 MC2 comm init UNAVAIL
+        logger.info(
+            "[Lwd][dp-diag] worker device assignment: rank=%s "
+            "local_rank=%s device=%s ASCEND_RT_VISIBLE_DEVICES=%s "
+            "dp_rank=%s",
+            getattr(self, "rank", "?"), self.local_rank, device,
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "<unset>"),
+            self.parallel_config.data_parallel_rank,
+        )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
