@@ -290,10 +290,12 @@ class LwdChannel:
         into: LwdCommFuture | None = None,
     ) -> LwdCommFuture:
         """Issue the wire op, bridge it onto the channel stream, record
-        the completion event."""
+        the completion event (and, for staged recvs, the D2H event)."""
         tensor: torch.Tensor | None = None
         aux_tensor: torch.Tensor | None = None
         keepalive: Any = None
+        staged_event: torch.npu.Event | None = None
+        staged_tensor: torch.Tensor | None = None
         stream = self._stream()
         # Capture the producer stream BEFORE entering the channel-stream
         # context: inside the `with` block torch.npu.current_stream() IS
@@ -331,6 +333,23 @@ class LwdChannel:
                 get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
+            if req.op == "recv" and req.stage_buffer is not None:
+                # Host staging (docs/design/lwd_host_staging.md §4.3): copy the
+                # whole main frame into the caller's pinned buffer on THIS
+                # stream, right behind the (already bridged, already
+                # descrambled) recv.  Two reasons it must be this stream:
+                #   1. the channel FIFO already gives us "data complete" -
+                #      no host-side wait is needed, and the comm thread can
+                #      poll a pure-CPU event instead of blocking;
+                #   2. the D2H ops are then ordered by seqno too, so the
+                #      staged-completion order is the seqno order and the
+                #      readiness watermark stays a prefix (design invariant 4).
+                # The event is recorded AFTER the copy, so query()==true
+                # means the pinned host payload is complete.
+                staged_tensor = req.stage_buffer
+                staged_tensor.copy_(tensor, non_blocking=True)
+                staged_event = torch.npu.Event()
+                staged_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
             return LwdCommFuture(
@@ -340,6 +359,9 @@ class LwdChannel:
                 tensor=tensor,
                 keepalive=keepalive,
                 aux_tensor=aux_tensor,
+                staged_event=staged_event,
+                staged_tensor=staged_tensor,
+                slot=req.recv_slot,
             )
         into._bind(
             handles=handles,
@@ -347,6 +369,9 @@ class LwdChannel:
             tensor=tensor,
             keepalive=keepalive,
             aux_tensor=aux_tensor,
+            staged_event=staged_event,
+            staged_tensor=staged_tensor,
+            slot=req.recv_slot,
         )
         return into
 
@@ -413,9 +438,23 @@ class LwdChannel:
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
-        buffer = torch.empty(
-            req.num_elements, dtype=torch.bfloat16, device="npu"
-        )
+        # Host-staging callers (worker ping-pong pool) pass their own
+        # slot view in ``recv_buffer`` so the receive lands in memory the
+        # pool owns and can reuse the moment the D2H completes.
+        buffer = req.recv_buffer
+        if buffer is None:
+            buffer = torch.empty(
+                req.num_elements, dtype=torch.bfloat16, device="npu"
+            )
+        elif buffer.numel() != req.num_elements:
+            # HCCL P2P would fail on a mismatch, and a silent short/long
+            # buffer desynchronises the counterpart's isend; assert here
+            # so the failure names the pool slot instead of the wire.
+            raise RuntimeError(
+                f"recv_buffer numel {buffer.numel()} != requested "
+                f"num_elements {req.num_elements} on channel "
+                f"{self.channel_type.value} seqno={req.seqno}"
+            )
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
             # aux 帧尺寸 = num_tokens*3(mrope positions);dtype 取

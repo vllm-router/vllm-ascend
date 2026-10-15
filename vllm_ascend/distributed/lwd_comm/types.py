@@ -74,6 +74,30 @@ class LwdCommRequest:
     # 显式指定即可,无需改通道结构。
     aux_dtype: Any | None = None
 
+    # ------------------------------------------------------------------ #
+    # recv 侧可选落点(host 暂存方案,见 docs/design/lwd_host_staging.md)  #
+    # ------------------------------------------------------------------ #
+    # recv:调用方预提供的**主帧接收 buffer**(NPU 上的乒乓槽视图)。
+    # 给了就用它、不再自己 torch.empty —— 这是"接收缓冲随 D2H 完成即
+    # 归还并被下一批复用"的落点。numel 必须与 num_elements 严格相等
+    # (HCCL P2P 要求两端等长),本层会断言。
+    recv_buffer: Any | None = None
+    # recv:pinned host 落点。非 None 即表示"收完后把主帧整批搬一份到
+    # host",需与 stage_to_host 同时给出(冗余给出是为了让 channel 层
+    # 不必自己去猜 None 的语义)。
+    stage_buffer: Any | None = None
+    # recv:是否在主帧收完后做 D2H 暂存。语义等价于
+    # ``stage_buffer is not None``,显式留一个开关便于调用方只翻转行为、
+    # 不动缓冲管理。
+    stage_to_host: bool = False
+    # recv:aux 帧的 host 落点(预留;mrope 自 wire_version 2 起走控制面,
+    # 当前恒为 None)。字段先落位,避免将来扩 aux 暂存时再动 dataclass。
+    aux_stage_buffer: Any | None = None
+    # recv:该 recv 落在哪个设备槽(-1 = 非池化分配)。纯诊断:池的账
+    # (占用/归还)由调用方的 stager 维护,通道层只把它透传到 future 上,
+    # 让日志与泄漏排查能对上号。
+    recv_slot: int = -1
+
 
 @dataclass
 class LwdCommResult:
@@ -85,3 +109,7 @@ class LwdCommResult:
     # Received aux payload (mrope positions int64), None when the
     # request carried no aux frame.
     aux_tensor: Any | None = None
+    # Host-staged copy of the main frame when ``stage_to_host`` was set
+    # and the D2H has completed (``staged_event.query()`` true); None
+    # otherwise.
+    staged_tensor: Any | None = None

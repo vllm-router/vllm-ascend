@@ -67,42 +67,79 @@ logger = init_logger("vllm.lwd.pre_recv")
 #: ``init_device`` 里重建 reader —— 两侧只认这一处常量名。
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
-# 旁路 MQ 规格:每槽 1KB、共 64 槽。一批一条提示/上报,边侧 pending 闸门
-# (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)把未消费 chunk 数压在
+# 旁路 MQ 规格:每槽 4KB、共 64 槽。一批一条提示/上报,边侧 pending 闸门
+# (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS``)把未消费 chunk 数压在
 # 个位数,而提示是正确性依赖(丢一条 = 该 recv 不提前挂、水位不前进、闸门后的
 # 批永不下发),所以留足余量、不做流控。
-_SIDEBAND_MAX_CHUNK_BYTES = 1024
+#
+# 4KB(原 1KB)是为 host 暂存方案的 ``rows`` 逐请求行数留的:max_num_seqs
+# 上限内一批的 rows 列表实测几百字节,1KB 在 pickle 开销下余量偏薄;槽数不变
+# 时多出的只是共享内存里的空洞,不占常驻。
+_SIDEBAND_MAX_CHUNK_BYTES = 4096
 _SIDEBAND_MAX_CHUNKS = 64
 
 
 # ---------------------------------------------------------------------- #
 # 提示(hint):调度侧生产,worker 通信线程消费                              #
 # ---------------------------------------------------------------------- #
-def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
+def make_recv_hint(
+    seqno: int,
+    num_tokens: int,
+    aux_rows: int = 0,
+    req_ids: list[str] | None = None,
+    rows: list[int] | None = None,
+    offsets: list[int] | None = None,
+) -> dict:
     """构造一条 UP 提前收提示。
 
     * ``num_tokens``:本批 flat token 数(主帧尺寸由 worker 按 hash 载荷公式推)
     * ``aux_rows``:本批带 mrope 的 token 行数(0 = 纯文本批,零 aux 流量)
+    * ``req_ids``/``rows``/``offsets``:本批**逐请求**的 id、token 行数、以及
+      这段行在各自 prompt 里的起点(与 notify.items 同序)。
+
+    后三项是 host 暂存方案(design v7 §4.3)新增的:暂存提交要在**挂 recv 的
+    时刻**就把整块接收载荷按请求拆到各自 buffer 里,而那个时刻早于
+    SchedulerOutput、拿不到 batch_meta。``offsets`` 让"一个请求跨多个批到达"
+    也能落到正确的位置(否则第 2 段会覆盖第 1 段)。
+    提示仍然只带"事实",尺寸公式仍只在 worker 侧算一次。
     """
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),
+        "req_ids": [str(r) for r in (req_ids or ())],
+        "rows": [int(r) for r in (rows or ())],
+        "offsets": [int(o) for o in (offsets or ())],
     }
 
 
-def hint_fields(hint: dict) -> tuple[int, int, int] | None:
-    """提示自检:返回 (seqno, num_tokens, aux_rows);坏提示返回 None。"""
+def hint_fields(hint: dict) -> tuple | None:
+    """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows, offsets)``。
+
+    坏提示返回 None(调用方丢弃 + 告警)。行表与总数不符 = 边云版本或组批发散;
+    若放行,暂存池会按错的行表切窗口、把 embedding 写到别的请求的位置
+    (静默错算),所以必须在入口判死。
+    """
     try:
         seqno = int(hint["seqno"])
         num_tokens = int(hint["num_tokens"])
         aux_rows = int(hint.get("aux_rows", 0))
+        req_ids = [str(r) for r in hint.get("req_ids", ())]
+        rows = [int(r) for r in hint.get("rows", ())]
+        offsets = [int(o) for o in hint.get("offsets", ())]
     except (KeyError, TypeError, ValueError):
         return None
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
         return None
-    return seqno, num_tokens, aux_rows
+    if rows or req_ids:
+        if len(rows) != len(req_ids):
+            return None
+        if any(r <= 0 for r in rows) or sum(rows) != num_tokens:
+            return None
+        if offsets and (len(offsets) != len(rows) or any(o < 0 for o in offsets)):
+            return None
+    return seqno, num_tokens, aux_rows, req_ids, rows, offsets
 
 
 # ---------------------------------------------------------------------- #
