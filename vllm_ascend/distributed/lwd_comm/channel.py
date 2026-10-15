@@ -58,7 +58,8 @@ def _scramble_seed_for(request: LwdCommRequest) -> int | None:
 
 
 class LwdChannel:
-    """One FIFO of pending requests for a physical channel/peer wire."""
+    """One FIFO of pending requests for a physical
+    (edge, cloud, engine, channel, op) wire."""
 
     def __init__(
         self,
@@ -66,11 +67,13 @@ class LwdChannel:
         op: str,
         edge_id: int | None = None,
         cloud_id: int | None = None,
+        engine_index: int | None = None,
     ) -> None:
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self.edge_id = edge_id
         self.cloud_id = cloud_id
+        self.engine_index = engine_index  # 目标/来源云 engine(= 云 dp_rank)
         self._pending: deque[LwdCommFuture] = deque()
         self._lock = threading.Lock()
         # The pending-queue lock alone cannot prevent two host threads
@@ -360,7 +363,8 @@ class LwdChannel:
 
     def _stream(self):
         return lwd_wire.get_lwd_channel_stream(
-            self.channel_type, self.edge_id, self.cloud_id
+            self.channel_type, self.edge_id, self.cloud_id,
+            self.engine_index,
         )
 
     def _order_after(self, predecessor: LwdCommFuture | None) -> None:
@@ -372,19 +376,21 @@ class LwdChannel:
 
     def _wire_send(self, req: LwdCommRequest) -> list[Any]:
         group = lwd_wire.get_lwd_channel_device_group(
-            self.channel_type, self.edge_id, self.cloud_id
+            self.channel_type, self.edge_id, self.cloud_id,
+            self.engine_index,
         )
         peer = req.src_dst
         if peer is None:
             peer = lwd_wire.get_lwd_channel_peer(
-                self.channel_type, self.edge_id, self.cloud_id
+                self.channel_type, self.edge_id, self.cloud_id,
+                self.engine_index,
             )
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
-            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s "
-            "shape=%s dtype=%s op=%s",
-            self.channel_type, dist.get_rank(), peer,
+            "[lwd-comm] SEND post channel=%s engine=%s my_rank=%d peer=%s "
+            "group_ranks=%s shape=%s dtype=%s op=%s",
+            self.channel_type, self.engine_index, dist.get_rank(), peer,
             dist.get_process_group_ranks(group),
             list(tensor.shape), tensor.dtype,
             "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
@@ -413,17 +419,19 @@ class LwdChannel:
 
     def _wire_recv(self, req: LwdCommRequest):
         group = lwd_wire.get_lwd_channel_device_group(
-            self.channel_type, self.edge_id, self.cloud_id
+            self.channel_type, self.edge_id, self.cloud_id,
+            self.engine_index,
         )
         peer = req.src_dst
         if peer is None:
             peer = lwd_wire.get_lwd_channel_peer(
-                self.channel_type, self.edge_id, self.cloud_id
+                self.channel_type, self.edge_id, self.cloud_id,
+                self.engine_index,
             )
         logger.debug(
-            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s "
-            "num_elements=%d aux_elements=%d op=%s",
-            self.channel_type, dist.get_rank(), peer,
+            "[lwd-comm] RECV post channel=%s engine=%s my_rank=%d src=%s "
+            "group_ranks=%s num_elements=%d aux_elements=%d op=%s",
+            self.channel_type, self.engine_index, dist.get_rank(), peer,
             dist.get_process_group_ranks(group), req.num_elements,
             req.aux_num_elements,
             "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP

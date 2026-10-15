@@ -4,11 +4,15 @@
 Owns the physical data-plane channels.  In the single-edge/single-cloud
 case this is exactly the two direction-only channels (UP edge->cloud,
 DOWN cloud->edge).  In multi-edge/multi-cloud deployments the same
-machinery is replicated per ``(edge, cloud)`` pair:
+machinery is replicated per ``(edge, cloud, engine)`` triple (the cloud
+side may run several DP engines, each owning its own channel pair):
 
-  * one HCCL communicator + one NPU stream per ``(edge, cloud, channel)``;
-  * per-channel seqno stream stays independent (see ``lwd_comm``);
-  * init-time warmup of every channel in a fixed global order (moves the
+  * one HCCL communicator + one NPU stream per
+    ``(edge, cloud, engine, channel)``;
+  * per-(triple, channel) seqno stream stays independent (see
+    ``lwd_comm``);
+  * init-time warmup of every channel in a fixed global order
+    (lexicographic ``(edge, cloud, engine)``, UP then DOWN — moves the
     first-use HCCL rendezvous out of the pipeline, where two sides could
     otherwise arrive on different channels and deadlock).
 
@@ -25,21 +29,22 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 
-# (edge_id, cloud_id, channel) -> (device_group, peer_global_rank)
+# (edge_id, cloud_id, engine_index, channel) -> (device_group, peer_global_rank)
 _LWD_CHANNEL_GROUPS: dict[
-    tuple[int, int, LwdChannelType], tuple[dist.ProcessGroup, int]
+    tuple[int, int, int, LwdChannelType], tuple[dist.ProcessGroup, int]
 ] = {}
-# (edge_id, cloud_id, channel) -> stream
+# (edge_id, cloud_id, engine_index, channel) -> stream
 _LWD_CHANNEL_STREAMS: dict[
-    tuple[int, int, LwdChannelType], "torch.npu.Stream"
+    tuple[int, int, int, LwdChannelType], "torch.npu.Stream"
 ] = {}
-# (edge_id, cloud_id) -> (edge_global_rank, cloud_global_rank)
-_LWD_ENDPOINTS: dict[tuple[int, int], tuple[int, int]] = {}
-_LWD_PAIRS: list[tuple[int, int]] = []
+# (edge_id, cloud_id, engine_index) -> (edge_global_rank, cloud_global_rank)
+_LWD_ENDPOINTS: dict[tuple[int, int, int], tuple[int, int]] = {}
+_LWD_TRIPLES: list[tuple[int, int, int]] = []
 # 本进程身份(由 role registry + 全局 rank 推导),供 None 维度回填
 _SELF_ROLE: str | None = None
 _SELF_EDGE_ID = 0
 _SELF_CLOUD_ID = 0
+_SELF_ENGINE_ID = 0
 _INITIALIZED = False
 
 
@@ -106,7 +111,7 @@ def _load_registry():
 
 
 def _compute_self_ids(registry) -> None:
-    global _SELF_ROLE, _SELF_EDGE_ID, _SELF_CLOUD_ID
+    global _SELF_ROLE, _SELF_EDGE_ID, _SELF_CLOUD_ID, _SELF_ENGINE_ID
     my_rank = dist.get_rank()
     role, edge_id, cloud_id = registry.self_ids(my_rank)
     if role is not None:
@@ -114,15 +119,49 @@ def _compute_self_ids(registry) -> None:
     else:
         # 非边非云 rank(理论不出现):保持单边一云默认身份
         _SELF_ROLE, _SELF_EDGE_ID, _SELF_CLOUD_ID = None, 0, 0
+    # 本进程所属云 engine:本 rank 落在该云哪一段连续 ranks 内
+    # (engine i 占 ranks[i*C:(i+1)*C])。registry 未升级(无 engine 维
+    # API)/非云 rank 时恒 0,退化为单 (e, c, 0) 域。
+    _SELF_ENGINE_ID = 0
+    if _SELF_ROLE == "cloud":
+        engine_ranks = getattr(registry, "cloud_engine_ranks", None)
+        engine_ids = getattr(registry, "engine_ids", None)
+        if callable(engine_ranks) and callable(engine_ids):
+            for i in engine_ids(_SELF_CLOUD_ID):
+                if my_rank in engine_ranks(_SELF_CLOUD_ID, i):
+                    _SELF_ENGINE_ID = i
+                    break
+
+
+def _registry_triples(registry) -> list[tuple[int, int, int]]:
+    """全部 (edge_id, cloud_id, engine_index) 通信域,全局固定字典序。
+
+    registry 未升级(无 triples API)时由 pairs() 展开 engine=0,
+    行为与 (edge, cloud) 键逐值一致。"""
+    triples_fn = getattr(registry, "triples", None)
+    if callable(triples_fn):
+        return sorted(triples_fn())
+    return [(e, c, 0) for (e, c) in registry.pairs()]
+
+
+def _engine_endpoint_rank(registry, edge_id: int, cloud_id: int,
+                          engine_index: int) -> int:
+    """云端点 rank:engine 感知(端点在该引擎的 C 个 rank 内随 edge_id
+    轮转);registry 未升级时回退 cloud 级轮转(等价 engine0)。"""
+    ep_fn = getattr(registry, "engine_endpoint_rank", None)
+    if callable(ep_fn):
+        return ep_fn(edge_id, cloud_id, engine_index)
+    return registry.cloud_endpoint_rank(edge_id, cloud_id)
 
 
 def init_lwd_duplex_channels() -> None:
-    """Create the duplex channels for every ``(edge, cloud)`` pair.
+    """Create the duplex channels for every ``(edge, cloud, engine)`` triple.
 
     Called once per worker process when ``is_prefill_only`` is on.
     Idempotent.  ``dist.new_group`` is a world collective — every rank
-    must participate in every creation in the same fixed order, so pairs
-    are iterated sorted and channels in ``LwdChannelType`` enum order.
+    must participate in every creation in the same fixed order, so
+    triples are iterated in lexicographic order and channels in
+    ``LwdChannelType`` enum order (UP then DOWN).
     """
     global _INITIALIZED
     if _INITIALIZED:
@@ -134,14 +173,16 @@ def init_lwd_duplex_channels() -> None:
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
 
-    pairs = registry.pairs()
-    _LWD_PAIRS[:] = pairs
-    for edge_id, cloud_id in pairs:
+    triples = _registry_triples(registry)
+    _LWD_TRIPLES[:] = triples
+    for edge_id, cloud_id, engine_index in triples:
         edge_rank = registry.edge_rank(edge_id)
-        # 端点随 edge_id 在该云各 rank 间轮转(分摊跨机 P2P 压力),
-        # 而非固定取云 TP0 首卡。
-        cloud_rank = registry.cloud_endpoint_rank(edge_id, cloud_id)
-        _LWD_ENDPOINTS[(edge_id, cloud_id)] = (edge_rank, cloud_rank)
+        # 端点随 edge_id 在该引擎的 C 个 rank 间轮转(分摊跨机 P2P
+        # 压力),而非固定取引擎 TP0 首卡。
+        cloud_rank = _engine_endpoint_rank(
+            registry, edge_id, cloud_id, engine_index)
+        _LWD_ENDPOINTS[(edge_id, cloud_id, engine_index)] = (
+            edge_rank, cloud_rank)
         ranks = [edge_rank, cloud_rank]
         for channel in LwdChannelType:
             group = dist.new_group(ranks, backend=backend)
@@ -151,44 +192,52 @@ def init_lwd_duplex_channels() -> None:
                 peer = edge_rank
             else:
                 peer = -1
-            _LWD_CHANNEL_GROUPS[(edge_id, cloud_id, channel)] = (group, peer)
-            _LWD_CHANNEL_STREAMS[(edge_id, cloud_id, channel)] = torch.npu.Stream()
+            _LWD_CHANNEL_GROUPS[(edge_id, cloud_id, engine_index, channel)] = (group, peer)
+            _LWD_CHANNEL_STREAMS[(edge_id, cloud_id, engine_index, channel)] = torch.npu.Stream()
 
     _INITIALIZED = True
     logger.info(
-        "[lwd-wire] duplex channels created over %d pair(s) %s "
-        "(my_rank=%d self=%s e%d c%d)",
-        len(pairs), pairs, my_rank, _SELF_ROLE, _SELF_EDGE_ID, _SELF_CLOUD_ID,
+        "[lwd-wire] duplex channels created over %d triple(s) %s "
+        "(my_rank=%d self=%s e%d c%d i%d)",
+        len(triples), triples, my_rank, _SELF_ROLE, _SELF_EDGE_ID,
+        _SELF_CLOUD_ID, _SELF_ENGINE_ID,
     )
     warmup_lwd_duplex_channels()
 
 
-def _resolve_pair(edge_id: int | None, cloud_id: int | None) -> tuple[int, int]:
-    """None 维度用本进程身份回填,得到完整 (edge, cloud) 通信域。"""
+def _resolve_triple(
+    edge_id: int | None,
+    cloud_id: int | None,
+    engine_index: int | None = None,
+) -> tuple[int, int, int]:
+    """None 维度用本进程身份回填,得到完整 (edge, cloud, engine) 通信域。"""
     if edge_id is None:
         edge_id = _SELF_EDGE_ID
     if cloud_id is None:
         cloud_id = _SELF_CLOUD_ID
-    if (edge_id, cloud_id) not in _LWD_ENDPOINTS:
+    if engine_index is None:
+        engine_index = _SELF_ENGINE_ID
+    if (edge_id, cloud_id, engine_index) not in _LWD_ENDPOINTS:
         raise RuntimeError(
-            f"[lwd-wire] unknown (edge, cloud) pair ({edge_id}, {cloud_id}); "
-            f"known pairs={list(_LWD_ENDPOINTS)}"
+            f"[lwd-wire] unknown (edge, cloud, engine) triple "
+            f"({edge_id}, {cloud_id}, {engine_index}); "
+            f"known triples={list(_LWD_ENDPOINTS)}"
         )
-    return edge_id, cloud_id
+    return edge_id, cloud_id, engine_index
 
 
 def warmup_lwd_duplex_channels() -> None:
     """Pre-establish every channel's P2P link at init time.
 
-    Pairs and channels are warmed up in a fixed global order (sorted pairs,
-    UP then DOWN), so both sides rendezvous identically regardless of when
-    the first real message is posted.
+    Triples and channels are warmed up in a fixed global order
+    (lexicographic triples, UP then DOWN), so both sides rendezvous
+    identically regardless of when the first real message is posted.
     """
     my_rank = dist.get_rank()
-    for edge_id, cloud_id in _LWD_PAIRS:
-        edge_rank, cloud_rank = _LWD_ENDPOINTS[(edge_id, cloud_id)]
+    for edge_id, cloud_id, engine_index in _LWD_TRIPLES:
+        edge_rank, cloud_rank = _LWD_ENDPOINTS[(edge_id, cloud_id, engine_index)]
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-            group, peer = _LWD_CHANNEL_GROUPS[(edge_id, cloud_id, channel)]
+            group, peer = _LWD_CHANNEL_GROUPS[(edge_id, cloud_id, engine_index, channel)]
             am_sender = (
                 (channel is LwdChannelType.UP and my_rank == edge_rank)
                 or (channel is LwdChannelType.DOWN and my_rank == cloud_rank)
@@ -202,22 +251,22 @@ def warmup_lwd_duplex_channels() -> None:
             payload = torch.zeros(8, dtype=torch.bfloat16, device="npu")
             if am_sender:
                 logger.info(
-                    "[lwd-warmup] SEND pair=(%d,%d) channel=%s my_rank=%d "
-                    "peer=%d group_ranks=%s",
-                    edge_id, cloud_id, channel, my_rank, peer,
-                    dist.get_process_group_ranks(group))
+                    "[lwd-warmup] SEND triple=(%d,%d,%d) channel=%s "
+                    "my_rank=%d peer=%d group_ranks=%s",
+                    edge_id, cloud_id, engine_index, channel, my_rank,
+                    peer, dist.get_process_group_ranks(group))
                 handle = dist.isend(payload, dst=peer, group=group)
             else:
                 logger.info(
-                    "[lwd-warmup] RECV pair=(%d,%d) channel=%s my_rank=%d "
-                    "src=%d group_ranks=%s",
-                    edge_id, cloud_id, channel, my_rank, peer,
-                    dist.get_process_group_ranks(group))
+                    "[lwd-warmup] RECV triple=(%d,%d,%d) channel=%s "
+                    "my_rank=%d src=%d group_ranks=%s",
+                    edge_id, cloud_id, engine_index, channel, my_rank,
+                    peer, dist.get_process_group_ranks(group))
                 handle = dist.irecv(payload, src=peer, group=group)
             handle.wait()
             logger.info(
-                "[lwd-warmup] DONE pair=(%d,%d) channel=%s my_rank=%d",
-                edge_id, cloud_id, channel, my_rank)
+                "[lwd-warmup] DONE triple=(%d,%d,%d) channel=%s my_rank=%d",
+                edge_id, cloud_id, engine_index, channel, my_rank)
     get_world_group().barrier()
     logger.info("[lwd-wire] duplex channels warmed up")
 
@@ -230,9 +279,10 @@ def get_lwd_channel_device_group(
     channel: LwdChannelType,
     edge_id: int | None = None,
     cloud_id: int | None = None,
+    engine_index: int | None = None,
 ) -> dist.ProcessGroup:
-    pair = _resolve_pair(edge_id, cloud_id)
-    group, _ = _LWD_CHANNEL_GROUPS[(pair[0], pair[1], channel)]
+    triple = _resolve_triple(edge_id, cloud_id, engine_index)
+    group, _ = _LWD_CHANNEL_GROUPS[(triple[0], triple[1], triple[2], channel)]
     return group
 
 
@@ -240,46 +290,53 @@ def get_lwd_channel_peer(
     channel: LwdChannelType,
     edge_id: int | None = None,
     cloud_id: int | None = None,
+    engine_index: int | None = None,
 ) -> int:
     """Global rank of this process's P2P peer on the channel."""
-    pair = _resolve_pair(edge_id, cloud_id)
-    _, peer = _LWD_CHANNEL_GROUPS[(pair[0], pair[1], channel)]
+    triple = _resolve_triple(edge_id, cloud_id, engine_index)
+    _, peer = _LWD_CHANNEL_GROUPS[(triple[0], triple[1], triple[2], channel)]
     return peer
 
 
 def get_lwd_channel_endpoint_rank(
     edge_id: int | None = None,
     cloud_id: int | None = None,
+    engine_index: int | None = None,
 ) -> tuple[int, int]:
-    """该 (edge, cloud) 通信域两端端点的全局 rank (edge_rank, cloud_rank)。
+    """该 (edge, cloud, engine) 通信域两端端点的全局 rank
+    (edge_rank, cloud_rank)。
 
-    cloud_rank 已随 edge_id 轮转(见 LwdRoleRegistry.cloud_endpoint_rank),
-    供 UP 的 TP 广播选源等需要明确端点 rank 的上层使用。
+    cloud_rank 已随 edge_id 在该引擎的 C 个 rank 内轮转(见
+    LwdRoleRegistry.engine_endpoint_rank),供 UP 的 TP 广播选源等
+    需要明确端点 rank 的上层使用。
     """
-    pair = _resolve_pair(edge_id, cloud_id)
-    return _LWD_ENDPOINTS[(pair[0], pair[1])]
+    triple = _resolve_triple(edge_id, cloud_id, engine_index)
+    return _LWD_ENDPOINTS[(triple[0], triple[1], triple[2])]
 
 
 def get_lwd_channel_stream(
     channel: LwdChannelType,
     edge_id: int | None = None,
     cloud_id: int | None = None,
+    engine_index: int | None = None,
 ) -> "torch.npu.Stream":
-    pair = _resolve_pair(edge_id, cloud_id)
-    return _LWD_CHANNEL_STREAMS[(pair[0], pair[1], channel)]
+    triple = _resolve_triple(edge_id, cloud_id, engine_index)
+    return _LWD_CHANNEL_STREAMS[(triple[0], triple[1], triple[2], channel)]
 
 
 def is_lwd_channel_endpoint(
     channel: LwdChannelType,
     edge_id: int | None = None,
     cloud_id: int | None = None,
+    engine_index: int | None = None,
 ) -> bool:
-    """本进程是否为该通道通信域的端点(边入口/云 TP0)。
+    """本进程是否为该通道通信域的端点(边入口/云该引擎的端点卡)。
 
-    非端点 rank(云内其它 TP rank)peer=-1,仅参与建组/广播,不碰跨机 P2P。
+    非端点 rank(引擎内其它 TP rank、其它引擎的 rank)peer=-1,
+    仅参与建组/广播,不碰跨机 P2P。
     """
-    pair = _resolve_pair(edge_id, cloud_id)
-    _, peer = _LWD_CHANNEL_GROUPS[(pair[0], pair[1], channel)]
+    triple = _resolve_triple(edge_id, cloud_id, engine_index)
+    _, peer = _LWD_CHANNEL_GROUPS[(triple[0], triple[1], triple[2], channel)]
     return peer != -1
 
 
@@ -293,5 +350,5 @@ def destroy_lwd_duplex_channels() -> None:
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
     _LWD_ENDPOINTS.clear()
-    _LWD_PAIRS.clear()
+    _LWD_TRIPLES.clear()
     _INITIALIZED = False

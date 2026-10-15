@@ -35,13 +35,16 @@ class LwdCommService:
             return cls._instance
 
     def __init__(self) -> None:
-        # HCCL ordering is per physical (channel, direction): send and
-        # recv have INDEPENDENT seqno streams (each peer's send order must
-        # match the other side's recv-post order), so the FIFO key is
-        # (channel, op) — merging them would make a process's sends and
-        # recvs on one channel collide on a shared seqno counter.
+        # HCCL ordering is per physical (edge, cloud, engine, channel,
+        # direction): send and recv have INDEPENDENT seqno streams (each
+        # peer's send order must match the other side's recv-post order),
+        # and multi-DP gives each cloud engine its own channel pair — so
+        # the FIFO key is (edge_id, cloud_id, engine_index, channel, op);
+        # merging any of them would make seqno streams collide across
+        # engines/directions.
         self._channels: dict[
-            tuple[int | None, int | None, LwdChannelType, str], LwdChannel
+            tuple[int | None, int | None, int | None, LwdChannelType, str],
+            LwdChannel,
         ] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
@@ -82,13 +85,15 @@ class LwdCommService:
         op: str = "recv",
         edge_id: int | None = None,
         cloud_id: int | None = None,
+        engine_index: int | None = None,
     ) -> None:
         """Mark a seqno as never-to-arrive (aborted request) on the given
-        channel+direction FIFO.  Recv managers' drop path passes
+        triple+channel+direction FIFO.  Recv managers' drop path passes
         op="recv"; the sender-side abort glue passes op="send".  Both
         peers must skip the same seqnos."""
         with self._lock:
-            channel = self._channels.get((edge_id, cloud_id, channel_type, op))
+            channel = self._channels.get(
+                (edge_id, cloud_id, engine_index, channel_type, op))
         if channel is not None:
             channel.skip_seqno(seqno)
 
@@ -119,7 +124,13 @@ class LwdCommService:
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("lwd-comm service is shutting down")
-            key = (request.edge_id, request.cloud_id, request.channel, request.op)
+            key = (
+                request.edge_id,
+                request.cloud_id,
+                request.engine_index,
+                request.channel,
+                request.op,
+            )
             channel = self._channels.get(key)
             if channel is None:
                 channel = LwdChannel(
@@ -127,6 +138,7 @@ class LwdCommService:
                     request.op,
                     edge_id=request.edge_id,
                     cloud_id=request.cloud_id,
+                    engine_index=request.engine_index,
                 )
                 self._channels[key] = channel
         return channel.submit(request)

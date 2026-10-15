@@ -35,14 +35,15 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         return
     assert torch.distributed.is_initialized()
     lwd = parallel_config.lwd_config
-    data_parallel_size = parallel_config.data_parallel_size
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
     # 云侧复用(registry):world 校验与 MC2 分组直接按声明的实例布局
-    # (每边实例一组 + 每云实例一组),与 vllm 侧 parallel_state 的
-    # registry 分支(TP 按实例条目建组)分组语义对齐;layout 为空走
-    # 1E1C 连续 edge-first 公式,老路径不变。
+    # (每边实例一组 + 每云实例一组,云组 = 该云全部引擎的 rank,对齐
+    # EP=dp×tp 分片域——EP 开启时专家按 ep_size=dp×tp 跨引擎分片,
+    # all2all 组必须罩住本云全部 rank,否则 token 只能路由到部分专家,
+    # MoE 输出乱码),与 vllm 侧 parallel_state 的 registry 分支分组
+    # 语义对齐;layout 为空走 1E1C 连续 edge-first 公式,老路径不变。
     edge_layout = getattr(lwd, "edge_ranks_layout", None) or {}
     cloud_layout = getattr(lwd, "cloud_ranks_layout", None) or {}
     if edge_layout or cloud_layout:
@@ -58,17 +59,25 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
     else:
         edge_count = lwd.edge_npu_count
         cloud_count = lwd.cloud_npu_count
-        world_per_dp = edge_count + cloud_count
-        assert world_size == data_parallel_size * world_per_dp, (
+        # legacy 公式分支(共享边布局):world = E + dp*C,engine i 占
+        # [E+i*C, E+(i+1)*C)。cloud_dp_size/cloud_engine_rank_base 由
+        # vllm 侧 glm 版公式提供;老版本 vllm 无此属性时退化 dp=1。
+        cloud_dp = getattr(lwd, "cloud_dp_size", 1) or 1
+        engine_base = getattr(lwd, "cloud_engine_rank_base", None)
+        if not callable(engine_base):
+            engine_base = lambda i: edge_count + i * cloud_count  # noqa: E731
+        assert world_size == edge_count + cloud_count * cloud_dp, (
             f"Lwd world size mismatch: got {world_size}, expected "
-            f"{data_parallel_size} * ({edge_count} + {cloud_count})")
-        # MC2 组:按 pp 段划分——段 0 为边 rank,段 1 为该实例的云 rank,
-        # 与 vllm 侧 PP 分组([边0, 云0] 两段链 + 其余单例)的链路语义对齐。
-        mc2_groups = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            mc2_groups.append([base + r for r in range(edge_count)])
-            mc2_groups.append([base + edge_count + r for r in range(cloud_count)])
+            f"{edge_count} + {cloud_count} * {cloud_dp}")
+        # MC2 组(EP/MoE all2all 的载体,fused_moe 经 get_mc2_group()
+        # 取):边 rank 一组(不跑 MoE);全部云 rank 一组(跨引擎,
+        # 对齐 EP=dp×tp 分片域;锁步由 DPEngineCoreProc wave 保证)。
+        mc2_groups = [[r for r in range(edge_count)]]
+        cloud_ranks_all: list[int] = []
+        for dp_idx in range(cloud_dp):
+            base = engine_base(dp_idx)
+            cloud_ranks_all.extend(base + r for r in range(cloud_count))
+        mc2_groups.append(cloud_ranks_all)
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
         get_world_group().local_rank,
