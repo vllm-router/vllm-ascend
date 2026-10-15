@@ -84,6 +84,26 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         backend,
         group_name="mc2",
     )
+    # 就地强制初始化 MC2 的 HCCL comm(init_device 的锁步窗口内做
+    # 一次小组集合通信):懒初始化会把 comm init 推迟到模型加载期
+    # (16 个 rank 在两个引擎进程里各自撞进 FusedMoE 第一层),跨进程
+    # 时机错开时 rootInfo 协商可能失败(HCCL_E_UNAVAIL);提前到全 rank
+    # 对齐的初始化窗口内完成,失败也能当场报出真实原因
+    try:
+        _probe = torch.zeros(1, device="npu")
+        torch.distributed.all_reduce(
+            _probe, group=ascend_parallel_state._MC2.device_group
+        )
+        logger.info(
+            "Lwd ascend MC2 comm eagerly initialized (world_size=%s)",
+            world_size,
+        )
+    except Exception:
+        logger.exception(
+            "Lwd ascend MC2 comm eager init failed (world_size=%s, "
+            "mc2_groups=%s)", world_size, mc2_groups,
+        )
+        raise
 
     ascend_config = get_ascend_config()
     if ascend_config.eplb_config.dynamic_eplb:
