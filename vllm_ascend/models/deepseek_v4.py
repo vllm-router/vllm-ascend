@@ -60,6 +60,7 @@ from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsEagl
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
+    lwd_skips_module,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -1047,9 +1048,13 @@ class DeepseekV4Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not lwd_skips_module(
+            vllm_config, maybe_prefix(prefix, "norm")
+        ):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
+            # Not on the last PP rank, or an LWD edge that only unembeds the
+            # cloud's already-normed hidden states.
             self.norm = PPMissingLayer()
 
         def make_empty_intermediate_tensors(
