@@ -782,14 +782,16 @@ class LwdCloudModelRunner(NPUModelRunner):
 
         混在多边 batch 里的结果按 ``wrapped_req_id`` 解析出 ``edge_id``,
         同一条边的 hidden/秩/counts/seg_lens 归到一起,返回 per-edge
-        载荷列表 ``[(edge_id, hidden_packet, pinned_view, None, req_ids,
-        None)]``;单边场景自然退化为单元素列表,与原实现行为一致。
+        载荷列表 ``[(edge_id, hidden_packet, meta_dev, seg_lens_host,
+        ready_event, req_ids)]``;单边场景自然退化为单元素列表,与原
+        实现行为一致。
 
         廉价计算:bf16 直比(logits 原生 bf16,与 cast 后逐位等价)、
-        批全覆盖时整行直接算(不做高级索引取材)、ranks/counts/seg_lens
-        拼单个设备张量;meta 经 pinned 在主流末尾异步拷贝,worker 属性上
-        紧随记录就绪事件,由响应入队处 synchronize 后引擎侧解码。
-        批序/掩码取捕获时刻快照(防 batch queue 重叠重排)。
+        批全覆盖时整行直接算(不做高级索引取材)、ranks/counts
+        拼单个设备张量;meta 不落 pinned——设备张量本体随 payload
+        传递,由 executor 输出线程在就绪事件同步后收割拼装,计算
+        关键路径零新增同步。批序/掩码取捕获时刻快照(防 batch queue
+        重叠重排)。
         """
         _t0 = time.monotonic()
         sampled = sampler_output.sampled_token_ids
@@ -893,8 +895,8 @@ class LwdCloudModelRunner(NPUModelRunner):
                     np.concatenate(
                         [req_idx_np, pos_idx_np, row_sel_np, vidx_e, vlen_e]
                     ),
-                    # 每条边占一槽,深度随单步边数放大(与 meta ring
-                    # 同式),防同步内环槽复用覆写尚在飞行的一步
+                    # 每条边占一槽,深度随单步边数放大,
+                    # 防同步内环槽复用覆写尚在飞行的一步
                     min_depth=len(edge_ids_sorted) * 4,
                 )
                 n_valid = vidx_e.size
@@ -916,7 +918,8 @@ class LwdCloudModelRunner(NPUModelRunner):
                 b["req_ids"].extend(batch_req_ids[i] for i in vidx_e)
                 b["counts"].append(count)
                 # seg_lens 不上设备(torch.tensor(list, device=...) 是
-                # 同步 H2D):host 直写 pinned 尾段(见打包段)。
+                # 同步 H2D):host 侧列表随 payload 携带,输出线程收割
+                # 时拼装到 meta 尾部(见打包段)。
                 b["seg_lens_host"].extend(vlen_e.tolist())
 
         if not buckets:
@@ -936,33 +939,36 @@ class LwdCloudModelRunner(NPUModelRunner):
                 )
             meta_dev = torch.cat(b["ranks"] + [counts_dev])
             if is_spec:
-                # host seg_lens 直写 pinned 尾段:与 D2H 前缀区域不相交,
-                # 且引擎读 pinned 发生在 ready_event 同步(更晚)之后,
-                # 无竞态。
+                # seg_lens 不上设备:host 侧列表随 payload 携带,输出线程
+                # 收割时拼装到 meta 尾部;非 spec 路径 seg_lens 在
+                # meta_dev 内。线布局:[ranks|counts|seg_lens]
                 seg_lens_host = b["seg_lens_host"]
-                n_extra = len(seg_lens_host)
             else:
                 meta_dev = torch.cat([meta_dev, counts_dev])  # seg_lens≡counts=1
                 seg_lens_host = None
-                n_extra = 0
-            # pinned 拷贝排主流末尾(异步),紧随记录就绪事件;
-            # 由 worker 响应入队处在发送前 synchronize——
-            # "响应发出 ⟹ pinned 就绪"成为硬保证(同步在输出线程,
-            # 不在计算关键路径)。
-            n_dev = meta_dev.numel()
-            n_meta = n_dev + n_extra
-            pinned = self._lwd_meta_pinned(n_meta, min_depth=len(buckets) * 4)
-            pinned[:n_dev].copy_(meta_dev, non_blocking=True)
-            if seg_lens_host is not None:
-                pinned.numpy()[n_dev:n_meta] = seg_lens_host
             payloads.append(
-                (edge_id, hidden_packet, pinned[:n_meta], None,
-                 list(b["req_ids"]), None)
+                (edge_id, hidden_packet, meta_dev, seg_lens_host, None,
+                 list(b["req_ids"]))
             )
-
-        self.worker._lwd_meta_ready_event = torch.npu.Event()
-        self.worker._lwd_meta_ready_event.record()
-        # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 拼包+拷贝
+        # meta 不随 collect 落 pinned:异步 D2H 在本平台走边流,主流
+        # 就绪事件围栏不住(真机实锤:引擎读到上一代 meta 影像)。
+        # payload 改携带设备张量本体,由 executor 输出线程收割拼装
+        # (拷贝流 wait_event 就绪事件 + 完成事件与拷贝同流),计算
+        # 关键路径零新增同步。就绪事件随 payload 传递(每步独立对象,
+        # record 完成才离手;本步所有边共享同一事件,record 在全部
+        # meta_dev 组装完成之后):不能写 worker 共享属性由输出线程
+        # 现读——属性每步被覆写,存在"已赋值未 record"的窗口(record
+        # 在流满载时阻塞可达毫秒级),sync 未 record 的事件会立即放行。
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        payloads = [
+            (edge_id, hidden_packet, meta_dev, seg_lens_host,
+             ready_event, req_ids)
+            for edge_id, hidden_packet, meta_dev, seg_lens_host, _, req_ids
+            in payloads
+        ]
+        # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 组装(拷贝
+        # 在输出线程收割,本段应≈0)
         logger.info(
             "[Lwd][perf] collect edges=%d rows=%d rank=%.2f pinned=%.2f "
             "total=%.2fms",
@@ -974,30 +980,14 @@ class LwdCloudModelRunner(NPUModelRunner):
         )
         return payloads
 
-    def _lwd_meta_pinned(self, n: int, min_depth: int = 4):
-        """轮换 pinned 缓冲;深度随单步边数放大,避免多边拆分后覆盖
-        引擎尚未读完的上一步 meta。"""
-        depth = max(4, min_depth)
-        ring = getattr(self, "_lwd_pinned_ring", None)
-        if ring is None or ring[0].numel() < n or len(ring) < depth:
-            ring = [
-                torch.empty(max(n, 4096), dtype=torch.int32, pin_memory=True)
-                for _ in range(depth)
-            ]
-            self._lwd_pinned_ring = ring
-            self._lwd_pinned_ring_idx = 0
-        idx = self._lwd_pinned_ring_idx
-        self._lwd_pinned_ring_idx = (idx + 1) % len(ring)
-        return ring[idx]
-
     def _lwd_h2d_stage_i64(self, arr: "np.ndarray", min_depth: int = 4) -> torch.Tensor:
         """int64 host 索引数组的异步 H2D 暂存(pinned 轮换 +
         non_blocking):替代 torch.tensor(arr, device=...) 的 pageable
         同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
-        尾巴)。环深随单步边数放大(min_depth,与 meta ring 同式):
-        每条边一步占一槽,防同槽被下一条边/下一步覆写时异步拷贝
-        尚未执行。槽复用安全:主机覆写 stage 前等该槽上一次 H2D
-        的完成事件(同 lwd_edge_worker._lwd_embed_ids_h2d 的教训:
+        尾巴)。环深随单步边数放大(min_depth):每条边一步占一槽,
+        防同槽被下一条边/下一步覆写时异步拷贝尚未执行。槽复用安全:
+        主机覆写 stage 前等该槽上一次 H2D 的完成事件(同
+        lwd_edge_worker._lwd_embed_ids_h2d 的教训:
         CachingHostAllocator 管不到持有张量的显式主机覆写)。"""
         n = arr.size
         depth = max(4, min_depth)
