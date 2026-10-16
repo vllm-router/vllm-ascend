@@ -98,11 +98,25 @@ class LwdReqEmbed:
     # Arrival (data plane)                                                #
     # ------------------------------------------------------------------ #
     def note_arrival(self, offset: int, rows: int) -> None:
-        """Record that ``rows`` rows starting at prompt ``offset`` arrived.
+        """Mark that rows up to ``offset + rows`` are now usable.
 
-        ``recv_rows`` is the high-water mark, so repeats are idempotent -
-        the edge retries a full publish queue, and the same range can be
-        announced twice.
+        Two separate things are tracked, and they must not be conflated:
+
+        * ``recv_rows`` - the **arrival high-water mark**: how far into the
+          prompt the cloud can dispatch.  It must account for *every* row that
+          has landed, not just the rows of the most recently committed chunk:
+          a prompt delivered as several chunks can have its earlier chunks
+          arrive while the buffer is still small (they take the grow path), and
+          a later chunk's own extent would then hide them.  Live failure: a
+          request delivered as 1152 + 2358 rows was reported as having received
+          2358 only, so the scheduler's W2 bound rejected a legitimate window.
+
+        * ``_written_hi`` - how far *this call path* has written into the
+          buffer; kept for gap detection.
+
+        So the high-water mark is the maximum of the previous mark and the
+        highest row this request has been written to at all.  Repeats are
+        idempotent, which the edge's publish retries rely on.
 
         Raises:
             LwdHostStageGeometryError: if the announced range runs past the
@@ -120,9 +134,11 @@ class LwdReqEmbed:
                 f"req={self.req_id}: announced rows [{offset}, {end}) exceed "
                 f"prompt_rows={self.prompt_rows}"
             )
-        self.recv_rows = max(self.recv_rows, end)
         if end > self._written_hi:
             self._written_hi = end
+        # The high-water mark is the furthest row this request has reached by
+        # any route - not merely the end of the range announced just now.
+        self.recv_rows = max(self.recv_rows, self._written_hi)
 
     def available(self) -> int:
         """Rows that may be dispatched now: ``recv_rows - consumed``."""
@@ -600,16 +616,29 @@ class LwdHostStager:
                 else:
                     batch.src_tail_offsets.append(-1)
                 embeds_base += n * hidden_size
-                # ``recv_rows`` 是"该请求**从自己 prompt 起点**已写入到哪"的
-                # 高水位(调度器台账直接采用这个值,设计 §5.2)。所以这里传的是
-                # **prompt 坐标**的终点 ``dest_row + n``。
-                #
-                # 不能传批内坐标 ``row_offsets[i] + n``:批里第二个请求的批内
-                # 偏移(如 3)并不是它的 prompt 偏移(0),会算出越界。
-                # 也不能只传 ``dest_row``(起点):续传块的起点小于已收高水位时,
-                # ``max`` 会把它当"没进展"而**丢掉这一块的行数**(真机实录:
-                # 一个 offset=1164/已收 2346 的续传请求被报成只到 2346,调度器
-                # 据此 W2 误判越界并把引擎打崩)。
+                # ---- 已收行数的高水位由 note_arrival 内部维护 ----
+                # 传"本段在 prompt 里的起点 + 行数"即可,它会与本次实际写到的
+                # 上界(含扩容后的 ``need_rows``)取大 —— 调用方不再需要自己算,
+                # 两个量也就不会再分叉。
+                if need_rows > dest_row + n:
+                    logger.warning(
+                        "[Lwd][host-stage] req=%s arrival gap: chunk covers "
+                        "[%d, %d) but %d rows were already written; marking "
+                        "up to %d as arrived",
+                        rid, dest_row, dest_row + n, host._written_hi,
+                        need_rows,
+                    )
+                # ---- 落盘坐标自证(每条 chunk 一行,便于现场一次定位)----
+                # 这一行把"这次到底写到哪、之前写到哪、buffer 多大"全摊开,
+                # 免得再从外部日志反推内部状态(那已经错过三次)。
+                logger.info(
+                    "[Lwd][host-stage] CHUNK seqno=%d req=%s prompt=[%d,%d) "
+                    "of %d | base=%d dest_row=%d buffer_rows=%d "
+                    "written_hi=%d recv_rows=%d",
+                    seqno, rid, row_base[i], row_base[i] + n,
+                    host.prompt_rows, host._row_base, dest_row,
+                    host.prompt_rows, host._written_hi, host.recv_rows,
+                )
                 host.note_arrival(dest_row, n)
             self._batches[seqno] = batch
             self._batch_reqs[seqno] = list(req_ids)
