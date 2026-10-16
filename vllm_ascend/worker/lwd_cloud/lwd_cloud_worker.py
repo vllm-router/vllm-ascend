@@ -924,13 +924,14 @@ class LwdCloudWorker(NPUWorker):
         _t0 = time.monotonic()
         output = self.model_runner.sample_tokens(grammar_output)
         _t_sample = time.monotonic()
-        # rank-replay DOWN:发送 hidden 包(通道异步、流内有序);pinned 视图
-        # 挂输出内层(就绪由 get_output 的 wait_stream(主流) 保证),
+        # rank-replay DOWN:发送 hidden 包(通道异步、流内有序);meta 设备
+        # 张量随输出内层传递(收割拼装在响应入队处、就绪事件同步之后),
         # 引擎侧解码发布 meta。
         if self.enable_lwd:
             payload = self.model_runner.take_lwd_pending_down_payload()
             if payload is not None and output is not None:
-                hidden, pinned, _event, req_ids, _accepted = payload
+                (hidden, meta_dev, seg_lens_host, ready_event,
+                 req_ids) = payload
                 seqno = self._lwd_next_down_seqno()
                 logger.info(
                     "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
@@ -947,9 +948,15 @@ class LwdCloudWorker(NPUWorker):
                 )
                 # async 包装器下挂到内层,否则 get_output() 解包丢失
                 target = getattr(output, "_model_runner_output", output)
+                # 未收割形态(meta_dev 仍在设备上);executor 输出线程
+                # 收割拼装后重写为成品 4 元组(cpu_tensor, req_ids,
+                # numel, seqno)——线布局不变,引擎零改动
                 target.lwd_down_carrier = (
-                    pinned, req_ids, hidden.numel(), seqno
+                    meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno,
                 )
+                # 就绪事件随输出对象传递(同进程输出线程消费);
+                # Event 不可序列化,enqueue 前由 executor 同步并摘除
+                target.lwd_meta_ready_event = ready_event
                 # [Lwd][perf] 云侧每步计时:sample=采样+采集(含秩计算);
                 # send=DOWN 提交(快照clone+isend+bridge wait);total=全步
                 logger.info(

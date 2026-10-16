@@ -1106,12 +1106,12 @@ class LwdCloudModelRunner(NPUModelRunner):
         """生产级 DOWN 采集(rank-replay):hidden 组包 + 全局秩 + num_accepted。
 
         廉价计算:bf16 直比(logits 原生 bf16,与 cast 后逐位等价)、
-        批全覆盖时整行直接算(不做高级索引取材)、ranks/counts/seg_lens
-        拼单个设备张量;meta 经 pinned(4 轮换)在主流末尾异步拷贝,
-        worker 属性上紧随记录就绪事件,由响应入队处 synchronize 后
-        引擎侧解码——计算关键路径零新增同步。批序/掩码取捕获时刻
-        快照(防 batch queue 重叠重排)。返回:
-          (hidden_packet, pinned_view, None, req_ids, None)
+        批全覆盖时整行直接算(不做高级索引取材)、ranks/counts
+        拼单个设备张量;meta 不落 pinned——设备张量本体随 payload
+        传递,由 executor 输出线程在就绪事件同步后收割拼装,计算
+        关键路径零新增同步。批序/掩码取捕获时刻快照(防 batch queue
+        重叠重排)。返回:
+          (hidden_packet, meta_dev, seg_lens_host, ready_event, req_ids)
         或 None(本步无在途请求)。
         """
         _t0 = time.monotonic()
@@ -1214,29 +1214,28 @@ class LwdCloudModelRunner(NPUModelRunner):
         seg_lens_host: list[int] | None = None
         if is_spec:
             meta_dev = torch.cat(ranks_list + [counts_dev])
-            # seg_lens 不上设备(host 直写 pinned 尾段):与 D2H 前缀
-            # 区域不相交,且引擎读 pinned 发生在 ready_event 同步
-            # (更晚)之后,无竞态。
+            # seg_lens 不上设备(host 侧列表随 payload 携带,输出线程
+            # 收割时拼装到 meta 尾部;非 spec 路径 seg_lens 在
+            # meta_dev 内)。线布局:[ranks|counts|seg_lens]
             seg_lens_host = seg_lens_list
         else:
             counts_dev = torch.ones(n_req, dtype=torch.int32,
                                     device=logits.device)
             seg_lens_dev = counts_dev
             meta_dev = torch.cat(ranks_list + [counts_dev, seg_lens_dev])
-        # pinned 拷贝排主流末尾(异步),紧随记录就绪事件;
-        # 由 worker 响应入队处在发送前 synchronize——
-        # "响应发出 ⟹ pinned 就绪"成为硬保证(同步在输出线程,
-        # 不在计算关键路径)。
+        # meta 不随 collect 落 pinned:异步 D2H 在本平台走边流,主流
+        # 就绪事件围栏不住(真机实锤:引擎读到上一代 meta 影像)。
+        # payload 改携带设备张量本体,由 executor 输出线程收割拼装
+        # (拷贝流 wait_event 就绪事件 + 完成事件与拷贝同流),计算
+        # 关键路径零新增同步。就绪事件随 payload 传递(每步独立对象,
+        # record 完成才离手):不能写 worker 共享属性由输出线程现读
+        # ——属性每步被覆写,存在"已赋值未 record"的窗口(record
+        # 在流满载时阻塞可达毫秒级),sync 未 record 的事件会立即放行。
         _t_pack = time.monotonic()
-        n_dev = meta_dev.numel()
-        n_meta = n_dev + (len(seg_lens_host) if seg_lens_host is not None else 0)
-        pinned = self._lwd_meta_pinned(n_meta)
-        pinned[:n_dev].copy_(meta_dev, non_blocking=True)
-        if seg_lens_host is not None:
-            pinned.numpy()[n_dev:n_meta] = seg_lens_host
-        self.worker._lwd_meta_ready_event = torch.npu.Event()
-        self.worker._lwd_meta_ready_event.record()
-        # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 拼包+拷贝
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 组装(拷贝
+        # 在输出线程收割,本段应≈0)
         logger.info(
             "[Lwd][perf] collect rows=%d rank=%.2f pinned=%.2f total=%.2fms",
             hidden_packet.shape[0],
@@ -1246,33 +1245,18 @@ class LwdCloudModelRunner(NPUModelRunner):
         )
         return (
             hidden_packet,
-            pinned[:n_meta],
-            None,
+            meta_dev,
+            seg_lens_host,
+            ready_event,
             [r for i, r in enumerate(batch_req_ids) if valid[i]],
-            None,
         )
-
-    def _lwd_meta_pinned(self, n: int):
-        """轮换 pinned 缓冲(深度 4 > batch_queue 深度 2 + 引擎滞后 1):
-        避免下一/N+2 步的边流拷贝覆盖引擎尚未读完的上一步 meta。"""
-        ring = getattr(self, "_lwd_pinned_ring", None)
-        if ring is None or ring[0].numel() < n:
-            ring = [
-                torch.empty(max(n, 4096), dtype=torch.int32, pin_memory=True)
-                for _ in range(4)
-            ]
-            self._lwd_pinned_ring = ring
-            self._lwd_pinned_ring_idx = 0
-        idx = self._lwd_pinned_ring_idx
-        self._lwd_pinned_ring_idx = (idx + 1) % len(ring)
-        return ring[idx]
 
     def _lwd_h2d_stage_i64(self, arr: "np.ndarray") -> torch.Tensor:
         """int64 host 索引数组的异步 H2D 暂存(pinned 4 槽轮换 +
         non_blocking):替代 torch.tensor(arr, device=...) 的 pageable
         同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
-        尾巴)。环深与 meta ring 同理:覆盖 batch_queue 深度 + 引擎滞后,
-        防止下步 host 覆写时上步拷贝尚未执行。"""
+        尾巴)。环深覆盖 batch_queue 深度 + 引擎滞后,防止下步 host
+        覆写时上步拷贝尚未执行。"""
         n = arr.size
         ring = getattr(self, "_lwd_h2d_ring", None)
         if ring is None or ring[0][0].numel() < n:
