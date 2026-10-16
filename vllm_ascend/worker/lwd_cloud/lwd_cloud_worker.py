@@ -865,21 +865,36 @@ class LwdCloudWorker(NPUWorker):
             return
         req_ids: list[str] = []
         rows: list[int] = []
-        offsets: list[int] = []
+        prompt_offsets: list[int] = []
         if hint is not None:
             from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
 
             fields = hint_fields(hint)
             if fields is not None:
                 req_ids, rows = fields[3], fields[4]
-                offsets = list(fields[5]) if len(fields) > 5 else []
+                # ``fields[6]`` = prompt 坐标(该请求这段行在**自己 prompt** 里的
+                # 起点)。别再退回用 fields[5](批内坐标)当 prompt 起点:一个
+                # 请求跨多个批到达时,批内坐标恒从 0 起算,会把续传块的位置算成
+                # 0 —— 写入看着对(扩容仍会触发),但"已收行数"被算成块内偏移,
+                # 于是一个 3510 行的请求被报成只收到 2342,调度器据此误判越界
+                # (真机实录,云侧 EngineDeadError)。
+                prompt_offsets = list(fields[6]) if len(fields) > 6 else []
         if req_ids and rows:
-            if len(offsets) != len(rows):
-                # 提示里没带 offset(老边侧):按"每请求从自己的 0 行开始"
-                # 处理 —— 单批单请求时与真实语义一致;多请求时后续请求的
-                # offset 会由各自的首批确定,不影响本批切分正确性。
-                offsets = [0] * len(rows)
-            self._lwd_batch_rows[seqno] = list(zip(req_ids, rows, offsets))
+            if len(prompt_offsets) != len(rows):
+                # 提示没带 prompt 坐标(老边侧/老引擎):只能按"每个请求都从
+                # 自己的 0 行开始"处理 —— 单块到达时与真实语义一致;多块时
+                # 会算错续传位置,所以打一条告警留痕。
+                logger.warning(
+                    "[Lwd][host-stage] seqno=%d: hint carries no "
+                    "prompt_offsets; assuming every request starts at row 0 "
+                    "(multi-chunk delivery will be misplaced)",
+                    seqno,
+                )
+                prompt_offsets = [0] * len(rows)
+            self._lwd_batch_rows[seqno] = [
+                (rid, n, po)
+                for rid, n, po in zip(req_ids, rows, prompt_offsets)
+            ]
         else:
             self._lwd_batch_rows[seqno] = [(f"seqno{seqno}", num_tokens, 0)]
 

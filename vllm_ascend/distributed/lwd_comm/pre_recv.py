@@ -89,18 +89,24 @@ def make_recv_hint(
     req_ids: list[str] | None = None,
     rows: list[int] | None = None,
     offsets: list[int] | None = None,
+    prompt_offsets: list[int] | None = None,
 ) -> dict:
     """构造一条 UP 提前收提示。
 
     * ``num_tokens``:本批 flat token 数(主帧尺寸由 worker 按 hash 载荷公式推)
     * ``aux_rows``:本批带 mrope 的 token 行数(0 = 纯文本批,零 aux 流量)
-    * ``req_ids``/``rows``/``offsets``:本批**逐请求**的 id、token 行数、以及
-      这段行在各自 prompt 里的起点(与 notify.items 同序)。
+    * ``req_ids``/``rows``:本批**逐请求**的 id 与 token 行数(与 notify.items 同序)
+    * ``offsets``:该请求这段行在**本批载荷内**的起点(批内坐标)
+    * ``prompt_offsets``:该请求这段行在**它自己 prompt 内**的起点
 
-    后三项是 host 暂存方案(design v7 §4.3)新增的:暂存提交要在**挂 recv 的
-    时刻**就把整块接收载荷按请求拆到各自 buffer 里,而那个时刻早于
-    SchedulerOutput、拿不到 batch_meta。``offsets`` 让"一个请求跨多个批到达"
-    也能落到正确的位置(否则第 2 段会覆盖第 1 段)。
+    ★ **两套坐标必须都带,绝不能合成一个**(真机踩过两次):
+    批内坐标只说明"这段字节在本次载荷里从哪开始",而"一个请求跨多个批到达"
+    时,第 2 段要落进该请求 buffer 的**第几行**、以及"已收行数"该累计到哪,
+    都取决于 **prompt 坐标**。只带批内坐标时续传块的 prompt 起点恒为 0,
+    于是:写入位置看着对(能触发扩容),但上报的"已收行数"被算成"块内相对
+    偏移",把一个 3510 行的请求报成只收到 2342 —— 调度器的 W2 判据据此
+    误判越界并把引擎打崩。
+
     提示仍然只带"事实",尺寸公式仍只在 worker 侧算一次。
     """
     return {
@@ -111,11 +117,13 @@ def make_recv_hint(
         "req_ids": [str(r) for r in (req_ids or ())],
         "rows": [int(r) for r in (rows or ())],
         "offsets": [int(o) for o in (offsets or ())],
+        "prompt_offsets": [int(o) for o in (prompt_offsets or ())],
     }
 
 
 def hint_fields(hint: dict) -> tuple | None:
-    """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows, offsets)``。
+    """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows,
+    offsets, prompt_offsets)``。
 
     坏提示返回 None(调用方丢弃 + 告警)。行表与总数不符 = 边云版本或组批发散;
     若放行,暂存池会按错的行表切窗口、把 embedding 写到别的请求的位置
@@ -128,6 +136,7 @@ def hint_fields(hint: dict) -> tuple | None:
         req_ids = [str(r) for r in hint.get("req_ids", ())]
         rows = [int(r) for r in hint.get("rows", ())]
         offsets = [int(o) for o in hint.get("offsets", ())]
+        prompt_offsets = [int(o) for o in hint.get("prompt_offsets", ())]
     except (KeyError, TypeError, ValueError):
         return None
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
@@ -139,7 +148,14 @@ def hint_fields(hint: dict) -> tuple | None:
             return None
         if offsets and (len(offsets) != len(rows) or any(o < 0 for o in offsets)):
             return None
-    return seqno, num_tokens, aux_rows, req_ids, rows, offsets
+        if prompt_offsets and (
+            len(prompt_offsets) != len(rows)
+            or any(o < 0 for o in prompt_offsets)
+        ):
+            return None
+    return (
+        seqno, num_tokens, aux_rows, req_ids, rows, offsets, prompt_offsets,
+    )
 
 
 # ---------------------------------------------------------------------- #
