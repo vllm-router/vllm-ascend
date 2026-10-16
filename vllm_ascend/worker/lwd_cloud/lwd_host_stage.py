@@ -138,7 +138,18 @@ class LwdReqEmbed:
             self._written_hi = end
         # The high-water mark is the furthest row this request has reached by
         # any route - not merely the end of the range announced just now.
+        prev = self.recv_rows
         self.recv_rows = max(self.recv_rows, self._written_hi)
+        # 逐调用自证:现场把**实参**与**结果**一起打出来。"调用前打日志"已经
+        # 让我连续几轮看错因果(日志里 dest_row 是对的,上报值却是本块行数),
+        # 所以这一行必须紧贴赋值、并带上实例身份 —— 同名请求若各持一份 buffer,
+        # 外部日志完全看不出来。
+        logger.info(
+            "[Lwd][host-stage] ARRIVE req=%s id=%s in=(%d,%d) end=%d "
+            "written_hi=%d recv_rows %d->%d prompt_rows=%d",
+            self.req_id, id(self), offset, rows, end,
+            self._written_hi, prev, self.recv_rows, self.prompt_rows,
+        )
 
     def available(self) -> int:
         """Rows that may be dispatched now: ``recv_rows - consumed``."""
@@ -640,6 +651,16 @@ class LwdHostStager:
                     host.prompt_rows, host._written_hi, host.recv_rows,
                 )
                 host.note_arrival(dest_row, n)
+                # 调用后的状态:上面那行打的是**调用前**,而"已收行数"的争议
+                # 全在调用之后。把 (offset, rows) 与结果一起打出来,否则又要从
+                # 外部日志反推内部状态 —— 那已经错过多次。
+                logger.info(
+                    "[Lwd][host-stage] ARRIVE-CALL seqno=%d req=%s "
+                    "offset=%d rows=%d -> recv_rows=%d written_hi=%d "
+                    "prompt_rows=%d",
+                    seqno, rid, dest_row, n, host.recv_rows,
+                    host._written_hi, host.prompt_rows,
+                )
             self._batches[seqno] = batch
             self._batch_reqs[seqno] = list(req_ids)
             slot = self._seqno_slot.pop(seqno, -1)
