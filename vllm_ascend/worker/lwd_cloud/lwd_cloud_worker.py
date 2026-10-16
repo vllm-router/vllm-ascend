@@ -334,8 +334,10 @@ class LwdCloudWorker(NPUWorker):
         # **按请求存**(不再按 seqno):一个请求可能跨多个批到达,元数据只有
         # 一份,按请求挂才对得上。
         self._lwd_req_meta: dict[str, tuple[int, int, int]] = {}
-        # req_id -> 已经上报给 engine 的已收行数(只报增量,避免 done MQ 被刷)。
-        self._lwd_reported_rows: dict[str, int] = {}
+        # req_id -> 上次上报的**累计**已收行数(只用于跳过"没前进"的请求)。
+        # 注意:上报的是累计值而不是增量 —— 引擎侧台账用 max() 合并,那是为
+        # 累计值设计的口径;报增量会让台账停在"本块行数"上(真机踩过)。
+        self._lwd_last_total: dict[str, int] = {}
         # 开关默认关:关着时下面所有暂存分支都是 no-op,行为与改造前逐字一致。
         self._lwd_host_stage_enabled = bool(envs.VLLM_ASCEND_LWD_HOST_STAGE)
         self._lwd_stager = None
@@ -708,21 +710,34 @@ class LwdCloudWorker(NPUWorker):
         # 设备槽与接收缓冲此刻都已归还;丢掉 future 对设备帧的引用,让池能
         # 立刻复用那块内存(不丢的话引用计数还在,而 future 不会马上回收)。
         future.release_device_tensor()
-        # 逐请求:算出新到的行数(增量),供上报;并登记元数据
+        # ---- 逐请求上报**累计已收行数**(不是增量)----
+        #
+        # 引擎侧 `_lwd_note_arrived` 用的是 ``ledger[req] = max(旧值, 上报值)``,
+        # 那套写法**专门为"上报累计值"设计**:幂等、抗重放、不会被重复上报推过
+        # 头。这里曾经改报"增量"(``total - already``),两边语义就对不上:引擎
+        # 拿增量去 max,台账便停在"本块行数"上 ——
+        # 真机实录:一个分 1168 + 2342 两块到达的请求,worker 内部 recv_rows
+        # 已是 3510(日志可证),上报的增量 2342 却让引擎台账停在 2342,调度器
+        # W2 据此误判越界并把引擎打崩。
+        #
+        # 报累计值同时省掉一本 `_lwd_reported_rows` 账(少一个可能分叉的量):
+        # 未前进的请求直接跳过,不产生消息。
         arrived: list[tuple[str, int]] = []
+        last_total: dict[str, int] = getattr(self, "_lwd_last_total", None) or {}
+        self._lwd_last_total = last_total
         for rid, n, offset in rows:
             total = stager.recv_rows(rid)
-            already = self._lwd_reported_rows.get(rid, 0)
-            if total > already:
-                arrived.append((rid, total - already))
-                self._lwd_reported_rows[rid] = total
+            if total <= last_total.get(rid, 0):
+                continue
+            last_total[rid] = total
+            arrived.append((rid, total))
             self._lwd_req_meta.setdefault(
                 rid, (offset + n, hash_layer_count(hf),
                       getattr(hf, "num_experts_per_tok", 0)),
             )
         if arrived:
             logger.info(
-                "[Lwd][host-stage] ARRIVED seqno=%d %s host_MB=%.1f",
+                "[Lwd][host-stage] ARRIVED seqno=%d cumulative=%s host_MB=%.1f",
                 seqno, arrived, stager.host_bytes / 2 ** 20,
             )
         return arrived
@@ -836,7 +851,7 @@ class LwdCloudWorker(NPUWorker):
             if got:
                 freed += got
                 self._lwd_req_meta.pop(req_id, None)
-                self._lwd_reported_rows.pop(req_id, None)
+                self._lwd_last_total.pop(req_id, None)
                 logger.info(
                     "[Lwd][host-stage] RELEASED req=%s bytes=%.1fKiB "
                     "host_MB=%.1f held_reqs=%d",
