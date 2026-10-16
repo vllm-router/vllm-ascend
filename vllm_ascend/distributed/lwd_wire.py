@@ -218,7 +218,6 @@ def warmup_lwd_duplex_channels() -> None:
             logger.info(
                 "[lwd-warmup] DONE pair=(%d,%d) channel=%s my_rank=%d",
                 edge_id, cloud_id, channel, my_rank)
-    get_world_group().barrier()
     logger.info("[lwd-wire] duplex channels warmed up")
 
 
