@@ -825,24 +825,19 @@ class LwdCloudModelRunner(NPUModelRunner):
                     c = self._lwd_window_start(
                         int(num_computed[idx]), start,
                     )
-                    # ---- W2(design v7 §7,本方案唯一"静默错算"型风险) ----
-                    # 下发的行数绝不能超过已到达的行数:超了就会读 host 上还
-                    # 没被写入的零值区,算出一批零 embedding 而**不报任何错**。
-                    # 这里在注入前用 stager 的真实计数器核验一遍 —— 即便调度
-                    # 器侧的核验被绕过(配置/版本错配),也不会静默算脏数据。
-                    if stager is not None:
-                        staged_req = stager.take_req(req_id)
-                        if staged_req is not None:
-                            avail = staged_req.recv_rows - staged_req.consumed
-                            if w > avail:
-                                raise RuntimeError(
-                                    f"[Lwd][cloud-runner] W2 VIOLATION req="
-                                    f"{req_id} seqno={batch_seqno}: scheduled "
-                                    f"{w} rows but only {avail} have arrived "
-                                    f"(recv_rows={staged_req.recv_rows} "
-                                    f"consumed={staged_req.consumed} "
-                                    f"prompt_rows={staged_req.prompt_rows})"
-                                )
+                    # ---- W2 的落点不在这里 ----
+                    # 曾经在这里用 `recv_rows - consumed` 再核验一遍,结果第一批
+                    # 就被误判越界(真机实录:recv_rows=15 consumed=15 却报
+                    # "only 0 have arrived")。原因与调度器侧那处完全相同:
+                    # ``consumed`` 是 host 侧的**读指针**,而携带它的那次取数
+                    # (`_lwd_stage_requests_to_device` → `stager.segment_for`)
+                    # 已经在本步 harvest 阶段**先行推进过**它,所以注入侧看到的
+                    # 必然是"已经搬完"的值,减法恒为 0。
+                    #
+                    # W2(下发量 ≤ 已写入量)由 stager 在做取数时用**推进前**的
+                    # 指针权威判定:`LwdReqEmbed.read_range` 读到未写入区间即抛
+                    # `LwdHostStageGeometryError`,所以这里不再重复。
+                    # 调度器侧另有一道"下发量 ≤ 已到达量"的核验(数据面事实)。
                     if self.lwd_hash_state is not None:
                         if expert_tail is None:
                             raise ValueError(f"Missing LWD V4 expert payload for {req_id}")

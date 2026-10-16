@@ -150,9 +150,15 @@ class LwdReqEmbed:
                 f"req={self.req_id}: read_range needs n_rows >= 1, got {n_rows}"
             )
         if self.consumed + n_rows > self.recv_rows:
+            # **这里是 W2 的权威落点**(design v7 §7):用**推进前**的
+            # ``consumed`` 判断"这一步要读的区间是否已经写入"。别再在别处用
+            # `recv_rows - consumed` 复核 —— 那个减法只有在指针还没被推进时
+            # 才有意义,而携带它的取数路径本身就会推进它(真机踩过两次:
+            # 调度器侧一次、runner 注入侧一次,都是"第一批就被误判越界")。
             raise LwdHostStageGeometryError(
-                f"req={self.req_id}: read {n_rows} rows at consumed="
-                f"{self.consumed} exceeds received rows {self.recv_rows}"
+                f"W2 VIOLATION req={self.req_id}: read {n_rows} rows at "
+                f"consumed={self.consumed} exceeds received rows "
+                f"{self.recv_rows} (rows not yet written would be read)"
             )
         if self.consumed + n_rows > self.prompt_rows:
             raise LwdHostStageGeometryError(
