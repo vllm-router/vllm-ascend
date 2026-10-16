@@ -468,7 +468,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             if _is_endpoint and stager is not None:
                 up_flat = self._lwd_stage_requests_to_device(
                     stager, meta, batch_seqno, num_scheduled_tokens,
-                    hidden_size, num_computed,
+                    hidden_size,
                 )
             elif _is_endpoint:
                 # 端点但暂存关着:先过 host 就绪门(demo 的 wait gate)。
@@ -564,18 +564,20 @@ class LwdCloudModelRunner(NPUModelRunner):
                             )
                         chunk_positions = torch.frombuffer(
                             bytearray(
-                                self._lwd_slice_mrope_window(payload, n, c, w)
+                                self._lwd_slice_mrope_window(
+                                    payload, n, c, scheduled
+                                )
                             ),
                             dtype=torch.int64,
-                        ).view(3, w)
+                        ).view(3, scheduled)
                         cpu_ms, delta_ms = self._lwd_inject_mrope_positions(
-                            req_id, start + c, w,
+                            req_id, start + c, scheduled,
                             chunk_positions,
                             int(num_prompt[idx]),
                         )
                         _mrope_cpu_ms += cpu_ms
                         _mrope_delta_ms += delta_ms
-                        mrope_rows += w
+                        mrope_rows += scheduled
             if mrope_rows > 0:
                 # [Lwd][perf] mrope 注入探针:cpu=positions 字节 frombuffer
                 # +CPU 直写 req_state(控制面送达,无设备往返);delta=末
@@ -676,7 +678,6 @@ class LwdCloudModelRunner(NPUModelRunner):
 
     def _lwd_stage_requests_to_device(
         self, stager, meta, seqno, num_scheduled_tokens, hidden_size,
-        num_computed,
     ) -> torch.Tensor:
         """把本步每个请求要算的那几行从 host 搬回设备(design v7 §5.7)。
 
