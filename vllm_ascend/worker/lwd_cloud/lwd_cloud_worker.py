@@ -697,7 +697,13 @@ class LwdCloudWorker(NPUWorker):
             num_tokens_per_req=[r[1] for r in rows],
             num_hash_layers=hash_layer_count(hf),
             num_experts_per_tok=getattr(hf, "num_experts_per_tok", 0),
-            row_offsets=[r[2] for r in rows],
+            # ``rows`` 里带的是**prompt 坐标**的 offset(提示直接透传 notify
+            # item 的 offset,引擎用它做 num_computed 对账),而批内布局由
+            # stager 自己按行数累加得出 —— 两者坐标系不同,所以这里传
+            # ``row_base``、**不传** ``row_offsets``。
+            # 把 prompt 坐标当批内布局用过一次,后果是"批里第二个请求"的
+            # 写入偏移算成 0,数据写到自己 buffer 之外(真机串过数据)。
+            row_base=[r[2] for r in rows],
         )
         # 设备槽与接收缓冲此刻都已归还;丢掉 future 对设备帧的引用,让池能
         # 立刻复用那块内存(不丢的话引用计数还在,而 future 不会马上回收)。

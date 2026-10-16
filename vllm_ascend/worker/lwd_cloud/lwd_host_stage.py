@@ -418,6 +418,7 @@ class LwdHostStager:
         num_hash_layers: int = 0,
         num_experts_per_tok: int = 0,
         row_offsets: list[int] | None = None,
+        row_base: list[int] | None = None,
     ) -> LwdStagedBatch:
         """Split the received payload into per-request buffers.
 
@@ -427,9 +428,18 @@ class LwdHostStager:
         the payload now lives in the per-request buffers.
 
         Args:
-            row_offsets: prompt offset of each request's rows within the
-                batch (the edge announces these); defaults to the running
-                sum, i.e. a fresh, contiguous chunk per request in item order.
+            row_offsets: where each request's rows start **inside this batch
+                payload** (batch coordinates).  Defaults to the running sum,
+                i.e. a fresh, contiguous chunk per request in item order.
+                Callers that only know the *prompt* offsets must leave this
+                None -- see ``row_base``; the two coordinate systems are not
+                interchangeable.
+            row_base: where the same segment sits **inside that request's own
+                prompt** (prompt coordinates, i.e. ``LwdRangeItem.offset``).
+                Defaults to all zeros, which is correct when every request
+                arrives as a single chunk.  A request delivered over several
+                batches keeps the base recorded when its buffer was created,
+                and later chunks are written at ``row_base[i] - base``.
 
         Raises:
             LwdHostStageGeometryError: if the announced row layout does not
@@ -457,7 +467,14 @@ class LwdHostStager:
                 f"seqno={seqno}: {len(row_offsets)} row offsets vs {len(rows)} "
                 f"requests"
             )
-
+        # prompt 坐标起点:单块到达时全部为 0(每个请求从自己的 row 0 开始)。
+        if row_base is None:
+            row_base = [0] * len(rows)
+        elif len(row_base) != len(rows):
+            raise LwdHostStageGeometryError(
+                f"seqno={seqno}: {len(row_base)} row bases vs {len(rows)} "
+                f"requests"
+            )
         batch = LwdStagedBatch(
             seqno=seqno,
             req_ids=list(req_ids),
@@ -471,6 +488,15 @@ class LwdHostStager:
         # 每个请求按**它自己声明的 prompt offset**落进自己的 buffer —— 记录
         # 必须能装下多批增量(边侧把长 prompt 切成多段发时,一个请求会跨多个
         # seqno 到达),所以这里用 note_arrival + 累积推进,而不是"新建覆盖"。
+        #
+        # ★ 两套坐标必须分清(真机踩过):
+        #   * ``row_offsets[i]``   = 该请求这段行在**本批载荷**里的起点
+        #     (批内坐标,提示里的原始值;在一个批里各请求依次排列);
+        #   * 该请求 buffer 的起点 = 它在**自己 prompt** 里的起点
+        #     (``row_base``,通常是 0;续传时由首次创建那个 buffer 的块决定)。
+        #   写入偏移 = 批内坐标 − prompt 起点。混淆两者会让"批里第二个请求"
+        #   的 dest_row 算成 0 而不是它真实的 prompt 偏移,数据写到自己 buffer
+        #   之外;而"已收行数"上报的又是另一个量(见下),三个量用途各不相同。
         embeds_base = 0
         tail_base = total_rows * hidden_size
         with self._lock:
@@ -491,68 +517,64 @@ class LwdHostStager:
                     )
                     self._reqs[rid] = host
                     self._host_bytes += (n * hidden_size + n * tail_per_row) * 2
-                    # 该 buffer 的第 0 行对应 prompt 的哪一行 —— 批次里每个
-                    # 请求都从自己的 row 0 开始,所以写入偏移必须减去这个基准
-                    # （用 prompt 绝对行号会写到别人的范围里去）。
-                    host._row_base = row_offsets[i]
-                else:
-                    # 续传增量:prompt 长度/几何必须与首批一致,否则后面的
-                    # 切片全会错位(静默串数据),直接 fail-fast。
-                    if host.hidden_size != hidden_size:
-                        raise LwdHostStageGeometryError(
-                            f"req={rid}: hidden_size {host.hidden_size} != "
-                            f"{hidden_size} on a later chunk"
-                        )
-                    dest_row = row_offsets[i] - host._row_base
-                    if dest_row < 0:
-                        raise LwdHostStageGeometryError(
-                            f"req={rid}: chunk starts at prompt row "
-                            f"{row_offsets[i]} which is before this buffer's "
-                            f"base row {host._row_base} (delivery reordering)"
-                        )
-                    # 首批按"那一批的行数"分配,所以后续 chunk 可能落在已分配
-                    # 范围之外 —— 这时**扩容并保留已写内容**,而不是假定
-                    # "首批就是整个 prompt"。扩容是显式且带告警的:它只在多
-                    # chunk 交付时发生,是几何假设被打破的可观测信号。
-                    need_rows = dest_row + n
-                    if need_rows > host.prompt_rows:
-                        old_rows = host.prompt_rows
-                        grown = self._make_host_buffer(
-                            need_rows * hidden_size + need_rows * tail_per_row
-                        )
-                        grew = old_rows * hidden_size
-                        if grew:
-                            grown[:grew].copy_(host.host[:grew])
-                        if tail_per_row:
-                            old_tail = old_rows * tail_per_row
-                            grown[need_rows * hidden_size:
-                                  need_rows * hidden_size + old_tail].copy_(
-                                host.host[host.tail_off: host.tail_off + old_tail]
-                            )
-                        self._host_bytes += (
-                            (need_rows - old_rows) * (hidden_size + tail_per_row) * 2
-                        )
-                        logger.warning(
-                            "[Lwd][host-stage] req=%s buffer grown %d -> %d rows "
-                            "on a later chunk (multi-chunk delivery)",
-                            rid, old_rows, need_rows,
-                        )
-                        host.host = grown
-                        host.prompt_rows = need_rows
-                        # Keep the byte accounting fields in step with the
-                        # grown allocation, otherwise release_request would
-                        # reclaim (and report) less than was actually held.
-                        host.numel = need_rows * hidden_size
-                        host.tail_numel = need_rows * tail_per_row
-                        host.tail_off = (
-                            need_rows * hidden_size if tail_per_row else -1
-                        )
-                dest_row = row_offsets[i] - host._row_base
+                    # 该 buffer 的第 0 行对应 prompt 的哪一行 = 它在提示里声明
+                    # 的 prompt 起点(首次到达的那一段的起点)。
+                    host._row_base = row_base[i]
+                elif host.hidden_size != hidden_size:
+                    # 续传增量:几何必须与首批一致,否则后面的切片全会错位
+                    # (静默串数据),直接 fail-fast。
+                    raise LwdHostStageGeometryError(
+                        f"req={rid}: hidden_size {host.hidden_size} != "
+                        f"{hidden_size} on a later chunk"
+                    )
+                # ---- 写入位置:两条路统一用一个公式 ----
+                # 本段在该请求 prompt 里的起点(``row_base[i]``)减去该 buffer
+                # 的基准行(首次创建它的那一段的 prompt 起点)。新 buffer 的
+                # 基准就是本段起点 ⇒ 结果必然是 0,但仍然走同一个公式,避免
+                # "新建"与"续传"各算一遍而算歪(这正是真机串过数据的地方)。
+                dest_row = row_base[i] - host._row_base
                 if dest_row < 0:
                     raise LwdHostStageGeometryError(
                         f"req={rid}: chunk starts at prompt row "
-                        f"{row_offsets[i]} which is before this buffer's base "
-                        f"row {host._row_base} (delivery reordering)"
+                        f"{row_base[i]} which is before this buffer's "
+                        f"base row {host._row_base} (delivery reordering)"
+                    )
+                # 首批按"那一段的行数"分配,所以后续 chunk 可能落在已分配范围
+                # 之外 —— 这时**扩容并保留已写内容**,而不是假定"首批就是整个
+                # prompt"。扩容显式且带告警:它只在多 chunk 交付时发生,是几何
+                # 假设被打破的可观测信号。
+                need_rows = dest_row + n
+                if need_rows > host.prompt_rows:
+                    old_rows = host.prompt_rows
+                    grown = self._make_host_buffer(
+                        need_rows * hidden_size + need_rows * tail_per_row
+                    )
+                    grew = old_rows * hidden_size
+                    if grew:
+                        grown[:grew].copy_(host.host[:grew])
+                    if tail_per_row:
+                        old_tail = old_rows * tail_per_row
+                        grown[need_rows * hidden_size:
+                              need_rows * hidden_size + old_tail].copy_(
+                            host.host[host.tail_off: host.tail_off + old_tail]
+                        )
+                    self._host_bytes += (
+                        (need_rows - old_rows) * (hidden_size + tail_per_row) * 2
+                    )
+                    logger.warning(
+                        "[Lwd][host-stage] req=%s buffer grown %d -> %d rows "
+                        "on a later chunk (multi-chunk delivery)",
+                        rid, old_rows, need_rows,
+                    )
+                    host.host = grown
+                    host.prompt_rows = need_rows
+                    # Keep the byte accounting fields in step with the
+                    # grown allocation, otherwise release_request would
+                    # reclaim (and report) less than was actually held.
+                    host.numel = need_rows * hidden_size
+                    host.tail_numel = need_rows * tail_per_row
+                    host.tail_off = (
+                        need_rows * hidden_size if tail_per_row else -1
                     )
                 dest = dest_row * hidden_size
                 host.host[dest: dest + n * hidden_size].copy_(
@@ -569,6 +591,16 @@ class LwdHostStager:
                 else:
                     batch.src_tail_offsets.append(-1)
                 embeds_base += n * hidden_size
+                # ``recv_rows`` 是"该请求**从自己 prompt 起点**已写入到哪"的
+                # 高水位(调度器台账直接采用这个值,设计 §5.2)。所以这里传的是
+                # **prompt 坐标**的终点 ``dest_row + n``。
+                #
+                # 不能传批内坐标 ``row_offsets[i] + n``:批里第二个请求的批内
+                # 偏移(如 3)并不是它的 prompt 偏移(0),会算出越界。
+                # 也不能只传 ``dest_row``(起点):续传块的起点小于已收高水位时,
+                # ``max`` 会把它当"没进展"而**丢掉这一块的行数**(真机实录:
+                # 一个 offset=1164/已收 2346 的续传请求被报成只到 2346,调度器
+                # 据此 W2 误判越界并把引擎打崩)。
                 host.note_arrival(dest_row, n)
             self._batches[seqno] = batch
             self._batch_reqs[seqno] = list(req_ids)
