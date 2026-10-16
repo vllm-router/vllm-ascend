@@ -520,6 +520,15 @@ class LwdHostStager:
                     # 该 buffer 的第 0 行对应 prompt 的哪一行 = 它在提示里声明
                     # 的 prompt 起点(首次到达的那一段的起点)。
                     host._row_base = row_base[i]
+                    # 自证一行(仅在非零时打):续传块**首次**到达就直接建成
+                    # 完整长度时,说明提示带的是 prompt 坐标、且这一块不是从 0
+                    # 开始 —— 这正是坐标模型正确工作的样子。值为 0 则不占日志。
+                    if row_base[i]:
+                        logger.info(
+                            "[Lwd][host-stage] req=%s new buffer based at prompt "
+                            "row %d (chunk starts mid-prompt; rows=%d)",
+                            rid, row_base[i], n,
+                        )
                 elif host.hidden_size != hidden_size:
                     # 续传增量:几何必须与首批一致,否则后面的切片全会错位
                     # (静默串数据),直接 fail-fast。
