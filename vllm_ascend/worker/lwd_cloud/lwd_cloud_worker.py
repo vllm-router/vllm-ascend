@@ -385,6 +385,10 @@ class LwdCloudWorker(NPUWorker):
                 getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
             ),
             seqno=int(seqno),
+            # 云侧实例戳:UP 通道对按实例选(§4.3/§4.4),边侧发数据也用
+            # LwdBatch.instance_id 同戳。漏了会恒落 0 号实例的通道——非 0
+            # 实例的 recv 与边侧的 send 配不上,收不完、水位不前进、闸门死锁。
+            instance_id=self._lwd_own_instance,
             # aux 第二载荷与主帧同 seqno;mrope 退役后恒 0(零 aux 流量),
             # 未来载荷(如 deepstack)显式传行数即可
             aux_num_elements=int(aux_rows) * 3,
