@@ -703,6 +703,8 @@ class LwdCloudModelRunner(NPUModelRunner):
             ) * hidden_size
         )
         offset = 0
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        num_prompt = self.input_batch.num_prompt_tokens
         for rid in meta.req_ids:
             idx = self.input_batch.req_id_to_index.get(rid)
             if idx is None:
@@ -710,7 +712,35 @@ class LwdCloudModelRunner(NPUModelRunner):
             n_rows = int(num_scheduled_tokens[idx])
             if n_rows <= 0:
                 continue
+            # ---- 内容与位置必须对齐(此前从未校验,踩过静默精度事故)----
+            #
+            # 注入侧把本批行写到 prompt 位置 ``start + c``,其中
+            # ``c = num_computed − start``,所以落点**恒等于** ``num_computed``;
+            # 而这里从 ``consumed`` 顺序取数。两者只有相等时,"读到的内容"
+            # 才正是"要写到的位置"要的内容。一旦错开(例如同一批被搬了两次、
+            # 或某个 chunk 的窗口起点算错),模型会拿到错位的 embedding ——
+            # 表现是输出**被截断/空白**,不报错、不乱码,极难定位。
+            # 所以在这里把恒等式变成硬校验,宁可当场炸。
+            consumed_before = stager.consumed_rows(rid)
+            expect = int(num_computed[idx]) if idx < len(num_computed) else 0
+            if consumed_before != expect:
+                raise RuntimeError(
+                    f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={rid} "
+                    f"seqno={seqno}: host read pointer consumed="
+                    f"{consumed_before} != computed={expect} "
+                    f"(rows={n_rows}); the embeddings would be injected at a "
+                    f"position that does not match the data that was read"
+                )
             host_start, numel, _tail = stager.segment_for(rid, n_rows)
+            if idx < len(num_prompt):
+                room = int(num_prompt[idx]) - consumed_before
+                if room > 0 and n_rows > room:
+                    raise RuntimeError(
+                        f"[Lwd][cloud-runner] STAGE OVERRUN req={rid} "
+                        f"seqno={seqno}: staging {n_rows} rows at "
+                        f"consumed={consumed_before} but the prompt is only "
+                        f"{int(num_prompt[idx])} rows"
+                    )
             dev[offset: offset + numel].copy_(
                 stager.take_req(rid).host[host_start: host_start + numel],
                 non_blocking=False,
@@ -801,10 +831,27 @@ class LwdCloudModelRunner(NPUModelRunner):
                 up_flat = embeds_dev.reshape(-1)
                 expert_tail = expert_ids_all
             embeds = up_flat.view(-1, hidden_size)
+            # 这两个字典合起来就是"每个请求写到哪、写了多少":
+            #   rows    = 本步行数(w)
+            #   at      = 注入的 prompt 起点(start + c,恒等于 num_computed)
+            # 精度问题(截断/空白)只能来自这两者与实际数据不一致,所以把它们
+            # 并列打出来,不必再从别的日志反推。
             logger.info(
                 "[Lwd][cloud-runner] UP embeds injected seqno=%s moved_rows=%s "
-                "reqs=%s rows=%s",
+                "reqs=%s rows=%s at=%s",
                 batch_seqno, embeds.shape[0], meta.req_ids, rows_for_req,
+                {
+                    rid: (
+                        int(meta.prompt_offsets[k])
+                        + self._lwd_window_start(
+                            int(num_computed[self.input_batch.req_id_to_index[rid]]),
+                            int(meta.prompt_offsets[k]),
+                        )
+                        if rid in self.input_batch.req_id_to_index
+                        else -1
+                    )
+                    for k, rid in enumerate(meta.req_ids)
+                },
             )
             row = 0
             for meta_idx, (req_id, token_ids) in enumerate(zip(meta.req_ids, meta.token_ids)):

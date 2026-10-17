@@ -361,6 +361,20 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req.recv_rows if req is not None else 0
 
+    def consumed_rows(self, req_id: str) -> int:
+        """该请求的存储读指针(下一个要搬去设备的 prompt 行号)。
+
+        数据面与计算面靠一个恒等式对齐:设备上这批行被注入到 prompt 位置
+        ``num_computed``(注入侧 ``start + c``,而 ``c = num_computed − start``
+        把它化简掉了),而取数是从 ``consumed`` 顺序读的。两者**必须相等**,
+        否则"读到的内容"和"写入的位置"就是错开的 —— 模型会拿到错位的
+        embedding,表现为输出被截断/空白,且**不会有任何报错或乱码**。
+        调度侧 ``_lwd_stage_requests_to_device`` 用它做这道核验。
+        """
+        with self._lock:
+            req = self._reqs.get(req_id)
+            return req.consumed if req is not None else 0
+
     # ------------------------------------------------------------------ #
     # Admission (comm thread): bind slot + receive buffer to a recv        #
     # ------------------------------------------------------------------ #

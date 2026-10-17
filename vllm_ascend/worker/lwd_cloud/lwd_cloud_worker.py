@@ -338,6 +338,11 @@ class LwdCloudWorker(NPUWorker):
         # 注意:上报的是累计值而不是增量 —— 引擎侧台账用 max() 合并,那是为
         # 累计值设计的口径;报增量会让台账停在"本块行数"上(真机踩过)。
         self._lwd_last_total: dict[str, int] = {}
+        # 已交付(收完 + 被某个 SO 消费)的最高 seqno。通道完成序 == seqno 序,
+        # 所以"已交付集合"恒为前缀,一个高水位即可精确表示。
+        # 用途:同一 seqno 因"窗口跨多步"被二次下发时,**不得再挂 recv**
+        # (边上只发一帧,多挂一条会让整条通道错位一帧,且不报错)。
+        self._early_recv_last_delivered: int = -1
         # 开关默认关:关着时下面所有暂存分支都是 no-op,行为与改造前逐字一致。
         self._lwd_host_stage_enabled = bool(envs.VLLM_ASCEND_LWD_HOST_STAGE)
         self._lwd_stager = None
@@ -764,6 +769,25 @@ class LwdCloudWorker(NPUWorker):
             return None
 
         key = (LwdChannelType.UP, seqno)
+        # ---- 同一个 seqno 可能被下发多步(部分消费),但边侧只发一帧 ----
+        #
+        # 一个 chunk 的窗口小于 chunk 行数时,这条预告会被连续多步下发,
+        # 每次都会走到这里。第一次真收过之后 future 已被消费并移除,若不
+        # 拦截,下面会**再挂一条 recv** —— 而边上并不会再发:通道 FIFO 从此
+        # 整体错位一帧(seqno 14 收到 15 的数据、15 收到 16 的……),所有后续
+        # 批的 embedding 都安到别的请求上。numel 相近时**一个错都不报**,
+        # 只表现为输出变差/截断。
+        #
+        # 通道完成序 == seqno 序(FIFO),所以"已交付到哪"用一个高水位即可
+        # 精确表示,不需要无界集合。
+        if seqno <= self._early_recv_last_delivered:
+            self._early_recv_consumed.add(key)
+            logger.info(
+                "[Lwd][pre-recv] reuse seqno=%d (frame already delivered; "
+                "no second recv posted)", seqno,
+            )
+            return None
+
         with self._early_recv_lock:
             self._early_recv_consumed.add(key)
             future = self._early_recv_futures.get(key)
@@ -784,6 +808,10 @@ class LwdCloudWorker(NPUWorker):
                     self._early_recv_futures.pop(key, None)
                     self._early_recv_reported.discard(key)
                     self._early_recv_consumed.discard(key)
+                    # 这一帧的交付到此为止。记下水位:同一 seqno 若因"窗口
+                    # 跨多步"被再次下发,不得再挂第二条 recv(见上面的拦截)。
+                    if seqno > self._early_recv_last_delivered:
+                        self._early_recv_last_delivered = seqno
             else:
                 # 提示彻底没到(或到得比本 SO 还晚):用同一份信息现场补挂,
                 # 保证上报链不缺号,水位能继续前进。行切分此时已知(SO 的
@@ -877,6 +905,11 @@ class LwdCloudWorker(NPUWorker):
         一整块接收载荷按请求切到各自的 buffer 里。
         """
         if self._lwd_stager is None:
+            return
+        # 已登记过的行表**不许被覆盖**。补挂路径(hint=None)只能给"从没登记
+        # 过的 seqno"兜底;若拿它覆盖一条真实的多请求行表,后面按批切分就会
+        # 把整块载荷当成一个伪请求,所有真实请求都收不到数据(静默)。
+        if seqno in self._lwd_batch_rows and hint is None:
             return
         req_ids: list[str] = []
         rows: list[int] = []
