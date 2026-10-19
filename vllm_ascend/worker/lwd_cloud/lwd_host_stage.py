@@ -213,6 +213,16 @@ class LwdReqEmbed:
         start = self.tail_off + self.consumed * per_row
         return start, start + n_rows * per_row
 
+    def tail_range_at(self, consumed_base: int, n_rows: int) -> tuple[int, int]:
+        """同上,但起点显式给(推进前读指针)——注入侧在 harvest 推进
+        consumed 之后才切尾段,直接读 self.consumed 会拿到下一个窗口的
+        起点(真机踩过)。"""
+        if self.tail_numel <= 0:
+            return 0, 0
+        per_row = 4 * self.num_hash_layers * self.num_experts_per_tok
+        start = self.tail_off + consumed_base * per_row
+        return start, start + n_rows * per_row
+
     def note_consumed(self, n_rows: int) -> None:
         """Advance the computed pointer (called after the dispatch is real)."""
         self.consumed += n_rows
