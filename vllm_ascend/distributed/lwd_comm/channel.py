@@ -337,18 +337,21 @@ class LwdChannel:
                 # Host staging(design v7 §4.3 改版):提交期已按行表把本批
                 # 载荷切成逐请求段,这里把各段异步 D2H 直接落进各请求自己
                 # 的 pinned buffer —— 通信线程零 CPU 拷贝(H2H 拆分退役)。
-                # 必须在这条流上,两个理由:
-                #   1. 通道 FIFO 已保证"数据收完"——无需 host 侧等待,
-                #      通信线程用纯 CPU event 轮询即可;
-                #   2. D2H 也按 seqno 有序,分段完成序 = seqno 序,就绪
-                #      水位保持前缀(不变量 4)。
-                # event 记在最后一段之后:query()==true 即本批全部分段
-                # 已完整落 host。
-                for dst, src_off, n in req.stage_segments:
-                    dst.copy_(tensor[src_off:src_off + n],
-                              non_blocking=True)
-                staged_event = torch.npu.Event()
-                staged_event.record()
+                # 分段 D2H 上**独立拷贝流**,与下一条 recv 真并行(同流串行
+                # 时线路在 D2H 期间空转,满批 ~5-16ms 全白等)。顺序保证:
+                #   1. 拷贝流先 wait 主帧完成事件(含解扰)—— 数据完整才开拷;
+                #   2. 全部 D2H 在同一拷贝流 → FIFO,分段完成序 = seqno 序,
+                #      就绪水位保持前缀(不变量 4);
+                #   3. staged_event 记在拷贝流末段之后:query()==true 即
+                #      本批全部分段已完整落 host,设备槽此刻才可归还。
+                copy_stream = self._copy_stream()
+                copy_stream.wait_event(done_event)
+                with torch.npu.stream(copy_stream):
+                    for dst, src_off, n in req.stage_segments:
+                        dst.copy_(tensor[src_off:src_off + n],
+                                  non_blocking=True)
+                    staged_event = torch.npu.Event()
+                    staged_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
             return LwdCommFuture(
@@ -376,6 +379,15 @@ class LwdChannel:
 
     def _stream(self):
         return lwd_wire.get_lwd_channel_stream(self.channel_type)
+
+    def _copy_stream(self):
+        """分段 D2H 的专用拷贝流(懒建,每通道一条):与通道流并行,把
+        D2H 从"两次 recv 之间"挪走 —— 线路不再在 D2H 期间空转。"""
+        stream = getattr(self, "_d2h_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._d2h_copy_stream = stream
+        return stream
 
     def _order_after(self, predecessor: LwdCommFuture | None) -> None:
         if predecessor is None:

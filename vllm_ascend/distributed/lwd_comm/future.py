@@ -50,9 +50,12 @@ class LwdCommFuture:
         self._aux_tensor = aux_tensor
         self._keepalive = keepalive
         # Host-staging (see docs/design/lwd_host_staging.md §4.3):
-        #   staged_event  - recorded on the channel stream AFTER the D2H,
-        #                   so ``query()`` true means the pinned host copy
-        #                   is complete. Strictly later than ``done_event``.
+        #   staged_event  - recorded on the dedicated D2H copy stream AFTER
+        #                   the segmented copies, so ``query()`` true means
+        #                   the per-request pinned copies are complete.
+        #                   Strictly later than ``done_event`` (the copy
+        #                   stream waits on it first).  The copy stream is
+        #                   FIFO, so staged completions stay in seqno order.
         #   staged_tensor - the pinned host destination (owned by the
         #                   caller's stager, not by this future).
         #   slot          - device ping-pong slot the recv landed in;
