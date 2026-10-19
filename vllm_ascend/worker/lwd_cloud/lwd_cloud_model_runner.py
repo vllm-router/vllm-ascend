@@ -466,7 +466,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 非端点 rank 没有 host 池:它们只按同样的**行数**分配接收缓冲,
             # 等端点广播过来(行数必须一致,W4)。
             if _is_endpoint and stager is not None:
-                up_flat = self._lwd_stage_requests_to_device(
+                up_flat, win_idx = self._lwd_stage_requests_to_device(
                     stager, meta, batch_seqno, num_scheduled_tokens,
                     hidden_size,
                 )
@@ -476,6 +476,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                 # 报错而非静默乱码。门通过后再广播,广播读到的必然是完整数据。
                 res = future.wait(timeout=60.0)
                 up_flat = res.tensor
+                win_idx = None
                 if up_flat is None:
                     continue
             else:
@@ -489,6 +490,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                 up_flat = torch.empty(
                     rows * hidden_size, dtype=torch.bfloat16, device="npu"
                 )
+                win_idx = None
             if _tp.world_size > 1:
                 # demo 同款:直接用框架 TP 通信域(建组顺序由框架保证,
                 # PD 分离路径已验证),不再使用自建 _LWD_EMBED_BCAST_GROUP。
@@ -588,7 +590,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                     batch_seqno, mrope_rows,
                     _mrope_cpu_ms, _mrope_delta_ms,
                 )
-            harvested.append((batch_seqno, meta, up_flat))
+            harvested.append((batch_seqno, meta, up_flat, win_idx))
         return harvested
 
     # ------------------------------------------------------------------ #
@@ -646,14 +648,24 @@ class LwdCloudModelRunner(NPUModelRunner):
             for r in range(3)
         )
 
-    def _lwd_window_device(self, numel: int) -> torch.Tensor:
-        """窗口暂存设备缓冲(§4.5):``budget × H`` 大小,终身复用。
+    def _lwd_h2d_stream(self):
+        """H2D 专用拷贝流:与计算流并行,把窗口拷贝藏进上一步 forward。"""
+        stream = getattr(self, "_lwd_h2d_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._lwd_h2d_copy_stream = stream
+        return stream
 
-        一次性按调度上限分配,避免每步 torch.empty;跨批复用必须
-        record_stream(否则分配器会把块交给下一批,表现为跨 seqno 串数据)。
+    def _lwd_window_device(self, numel: int) -> tuple[torch.Tensor, int]:
+        """窗口暂存设备缓冲(§4.5):``budget × H`` 大小,**双缓冲轮换**。
+
+        双缓冲是旁流 H2D 的前提:拷贝在独立拷贝流上发射(与上一步
+        forward 并行),计算流消费前只等一个 ready event;隔批轮换 +
+        消费事件(``_lwd_win_used_ev``)保证旁流不会在计算流还没读完时
+        覆写同一块(WAR)。
         """
-        buf = getattr(self, "_lwd_win_dev", None)
-        if buf is None or buf.numel() < numel:
+        bufs = getattr(self, "_lwd_win_dev", None)
+        if bufs is None or bufs[0].numel() < numel:
             cap = max(
                 numel,
                 int(getattr(self.worker, "_lwd_up_hidden_size", 0) or 0)
@@ -664,17 +676,24 @@ class LwdCloudModelRunner(NPUModelRunner):
                     ) or 0
                 ),
             )
-            buf = torch.empty(
-                max(cap, numel), dtype=torch.bfloat16, device=self.device
-            )
-            self._lwd_win_dev = buf
+            bufs = [
+                torch.empty(
+                    max(cap, numel), dtype=torch.bfloat16, device=self.device
+                )
+                for _ in range(2)
+            ]
+            self._lwd_win_dev = bufs
+            self._lwd_win_flip = 0
+            self._lwd_win_used_ev = [None, None]
             logger.info(
                 "[Lwd][host-stage] win_dev allocated rows_capacity=%d "
-                "(%.1fMiB)",
-                buf.numel() // max(self.model_config.get_hidden_size(), 1),
-                buf.numel() * 2 / 2 ** 20,
+                "(%.1fMiB) x2 (double-buffered)",
+                bufs[0].numel() // max(self.model_config.get_hidden_size(), 1),
+                bufs[0].numel() * 2 / 2 ** 20,
             )
-        return buf[:numel]
+        idx = self._lwd_win_flip
+        self._lwd_win_flip ^= 1
+        return bufs[idx][:numel], idx
 
     def _lwd_stage_requests_to_device(
         self, stager, meta, seqno, num_scheduled_tokens, hidden_size,
@@ -697,66 +716,81 @@ class LwdCloudModelRunner(NPUModelRunner):
         launch 序保证广播读到的是搬完的数据,不引入跨流排序。
 
         源 buffer 的存活由 stager 保证:per-request buffer 活到请求结束
-        (§6.1),扩容 realloc 的旧块也延迟到那时才释放(见
-        ``LwdReqEmbed._retired``),异步拷贝飞行期间不会碰到已释放内存。
+        (§6.1),且一次按 prompt 全长分好、无扩容 realloc,异步拷贝飞行
+        期间不会碰到已释放内存。
 
         搬完即推进 ``consumed``(§4.2):"搬回设备"就是"本步要算",两者同步
         推进(指针推进只是 CPU 侧记账,已入流的拷贝不受影响);真正的释放
         仍然等到请求结束(§6.1)。
         """
         _t0 = time.monotonic()
-        dev = self._lwd_window_device(
+        dev, win_idx = self._lwd_window_device(
             sum(
                 int(num_scheduled_tokens[self.input_batch.req_id_to_index[rid]])
                 for rid in meta.req_ids
                 if rid in self.input_batch.req_id_to_index
             ) * hidden_size
         )
+        # 旁流拷贝:H2D 发射到独立拷贝流,与本步之前的计算流工作真并行
+        # (异步流水下 CPU 跑在设备前面,拷贝与上一步 forward 的尾巴重叠),
+        # 拷贝不再占用"两次 forward 之间"的关键路径。
+        stream = self._lwd_h2d_stream()
+        # WAR 门:旁流开写这块 buffer 前,等它上一次被计算流消费(inject +
+        # broadcast)完;隔批轮换下该事件正常早已就绪,wait 只是顺序记号,
+        # 不阻 CPU。
+        used_ev = self._lwd_win_used_ev[win_idx]
         offset = 0
         num_computed = self.input_batch.num_computed_tokens_cpu
         num_prompt = self.input_batch.num_prompt_tokens
-        for rid in meta.req_ids:
-            idx = self.input_batch.req_id_to_index.get(rid)
-            if idx is None:
-                continue
-            n_rows = int(num_scheduled_tokens[idx])
-            if n_rows <= 0:
-                continue
-            # ---- 内容与位置必须对齐(此前从未校验,踩过静默精度事故)----
-            #
-            # 注入侧把本批行写到 prompt 位置 ``start + c``,其中
-            # ``c = num_computed − start``,所以落点**恒等于** ``num_computed``;
-            # 而这里从 ``consumed`` 顺序取数。两者只有相等时,"读到的内容"
-            # 才正是"要写到的位置"要的内容。一旦错开(例如同一批被搬了两次、
-            # 或某个 chunk 的窗口起点算错),模型会拿到错位的 embedding ——
-            # 表现是输出**被截断/空白**,不报错、不乱码,极难定位。
-            # 所以在这里把恒等式变成硬校验,宁可当场炸。
-            consumed_before = stager.consumed_rows(rid)
-            expect = int(num_computed[idx]) if idx < len(num_computed) else 0
-            if consumed_before != expect:
-                raise RuntimeError(
-                    f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={rid} "
-                    f"seqno={seqno}: host read pointer consumed="
-                    f"{consumed_before} != computed={expect} "
-                    f"(rows={n_rows}); the embeddings would be injected at a "
-                    f"position that does not match the data that was read"
-                )
-            host_start, numel, _tail = stager.segment_for(rid, n_rows)
-            if idx < len(num_prompt):
-                room = int(num_prompt[idx]) - consumed_before
-                if room > 0 and n_rows > room:
+        with torch.npu.stream(stream):
+            if used_ev is not None:
+                stream.wait_event(used_ev)
+            for rid in meta.req_ids:
+                idx = self.input_batch.req_id_to_index.get(rid)
+                if idx is None:
+                    continue
+                n_rows = int(num_scheduled_tokens[idx])
+                if n_rows <= 0:
+                    continue
+                # ---- 内容与位置必须对齐(此前从未校验,踩过静默精度事故)----
+                #
+                # 注入侧把本批行写到 prompt 位置 ``start + c``,其中
+                # ``c = num_computed − start``,所以落点**恒等于** ``num_computed``;
+                # 而这里从 ``consumed`` 顺序取数。两者只有相等时,"读到的内容"
+                # 才正是"要写到的位置"要的内容。一旦错开(例如同一批被搬了两次、
+                # 或某个 chunk 的窗口起点算错),模型会拿到错位的 embedding ——
+                # 表现是输出**被截断/空白**,不报错、不乱码,极难定位。
+                # 所以在这里把恒等式变成硬校验,宁可当场炸。
+                consumed_before = stager.consumed_rows(rid)
+                expect = int(num_computed[idx]) if idx < len(num_computed) else 0
+                if consumed_before != expect:
                     raise RuntimeError(
-                        f"[Lwd][cloud-runner] STAGE OVERRUN req={rid} "
-                        f"seqno={seqno}: staging {n_rows} rows at "
-                        f"consumed={consumed_before} but the prompt is only "
-                        f"{int(num_prompt[idx])} rows"
+                        f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={rid} "
+                        f"seqno={seqno}: host read pointer consumed="
+                        f"{consumed_before} != computed={expect} "
+                        f"(rows={n_rows}); the embeddings would be injected at a "
+                        f"position that does not match the data that was read"
                     )
-            dev[offset: offset + numel].copy_(
-                stager.take_req(rid).host[host_start: host_start + numel],
-                non_blocking=True,
-            )
-            offset += numel
-        dev.record_stream(torch.npu.current_stream())
+                host_start, numel, _tail = stager.segment_for(rid, n_rows)
+                if idx < len(num_prompt):
+                    room = int(num_prompt[idx]) - consumed_before
+                    if room > 0 and n_rows > room:
+                        raise RuntimeError(
+                            f"[Lwd][cloud-runner] STAGE OVERRUN req={rid} "
+                            f"seqno={seqno}: staging {n_rows} rows at "
+                            f"consumed={consumed_before} but the prompt is only "
+                            f"{int(num_prompt[idx])} rows"
+                        )
+                dev[offset: offset + numel].copy_(
+                    stager.take_req(rid).host[host_start: host_start + numel],
+                    non_blocking=True,
+                )
+                offset += numel
+            ready_ev = torch.npu.Event()
+            ready_ev.record(stream)
+        # 事件门:计算流在随后的 broadcast/inject 前等拷贝完成 —— 只是流间
+        # 顺序记号,CPU 不停;拷贝已在旁流与上一步 forward 并行执行。
+        torch.npu.current_stream().wait_event(ready_ev)
         for rid in meta.req_ids:
             idx = self.input_batch.req_id_to_index.get(rid)
             if idx is None:
@@ -764,8 +798,8 @@ class LwdCloudModelRunner(NPUModelRunner):
             n_rows = int(num_scheduled_tokens[idx])
             if n_rows > 0:
                 stager.consume(rid, n_rows)
-        # [Lwd][perf] stage=锁等待 + H2D 发射总耗时(异步拷贝,CPU 不等
-        # 数据;该值大 = 锁竞争或发射开销,不是带宽)
+        # [Lwd][perf] stage=锁等待 + H2D 发射总耗时(旁流异步拷贝,CPU 不等
+        # 数据、也不占计算流;该值大 = 锁竞争或发射开销,不是带宽)
         logger.info(
             "[Lwd][cloud-runner] CONSUME seqno=%s rows=%d segs=%d "
             "host_MB=%.1f held=%d stage=%.2fms",
@@ -773,7 +807,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             stager.host_bytes / 2 ** 20, stager.request_count,
             (time.monotonic() - _t0) * 1000,
         )
-        return dev
+        return dev, win_idx
 
     def _lwd_inject_remote_embeds(self, harvested, num_scheduled_tokens) -> None:
         """Device-side inject(super() 之后):把收割到的 UP embeds 直写
@@ -815,7 +849,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
         stager = self.worker._lwd_stager if self.worker is not None else None
-        for batch_seqno, meta, up_flat in harvested:
+        for batch_seqno, meta, up_flat, win_idx in harvested:
             num_tokens = sum(len(t) for t in meta.token_ids)
             # 本步逐请求行数 = 该请求本步被调度的行数(design v7 §5.3)。
             # 非暂存路径(开关关着)整批一次搬,行数就是它自己的 chunk 行数。
@@ -942,10 +976,18 @@ class LwdCloudModelRunner(NPUModelRunner):
                     # 消除每 chunk 84MB 的 D2H 同步长尾
                     self.input_batch.is_token_ids[idx, start + c : start + c + w] = False
                 row += w
-            # 跨流生命周期登记:窗口缓冲由计算流写、下一批复用,必须登记
-            # (不登记 = 跨 seqno 串数据,与端点 buffer 同款事故);
-            # 端点整批 buffer 那处登记在收割期完成。
-            up_flat.record_stream(torch.npu.current_stream())
+            # 生命周期收尾:
+            # * 暂存路径(win_idx 非 None):登记"计算流已消费完这块
+            #   win_dev"——旁流双缓冲的 WAR 门,下一次旁流写入它之前等
+            #   这个事件;
+            # * 非暂存路径:整批 buffer 由通道流分配、计算流消费,登记
+            #   record_stream 防分配器提前复用(跨 seqno 串数据事故)。
+            if win_idx is not None:
+                ev = torch.npu.Event()
+                ev.record()
+                self._lwd_win_used_ev[win_idx] = ev
+            else:
+                up_flat.record_stream(torch.npu.current_stream())
 
     @staticmethod
     def _lwd_decode_expert_ids(seg, w: int, num_layers: int, top_k: int):

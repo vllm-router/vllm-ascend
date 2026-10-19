@@ -94,13 +94,6 @@ class LwdReqEmbed:
     aborted: bool = False
     #: highest prompt row written so far, to detect gaps on arrival
     _written_hi: int = 0
-    #: buffers replaced by a growth realloc.  They must NOT be freed at
-    #: grow time: the forward thread's H2D copies are async
-    #: (non_blocking=True), so a copy issued from the old buffer may still
-    #: be in flight.  Retire them until release_request (request end),
-    #: when every copy issued from them has long completed.
-    _retired: list = field(default_factory=list)
-    _retired_bytes: int = 0
 
     # ------------------------------------------------------------------ #
     # Arrival (data plane)                                                #
@@ -143,6 +136,15 @@ class LwdReqEmbed:
                 f"prompt_rows={self.prompt_rows}"
             )
         if end > self._written_hi:
+            if offset > self._written_hi:
+                # 到达出现空洞:[_written_hi, offset) 从未写入,而高水位会
+                # 越过它 —— 调度器可能据此下发零值行。通道 FIFO 下不该发生,
+                # 一旦发生必须留痕(此前这道检测因判据写错恒不触发)。
+                logger.warning(
+                    "[Lwd][host-stage] req=%s arrival gap: chunk covers "
+                    "[%d, %d) but only %d rows were written before",
+                    self.req_id, offset, end, self._written_hi,
+                )
             self._written_hi = end
         # The high-water mark is the furthest row this request has reached by
         # any route - not merely the end of the range announced just now.
@@ -239,8 +241,8 @@ class LwdStagedBatch:
     The payload does **not** live here any more: each request owns its own
     pinned buffer (``LwdReqEmbed``).  What stays is the mapping from the
     batch's seqno to the requests it delivered, so the abort path can find
-    "which requests came in this batch" and the row layout of the receive can
-    be validated at split time.
+    "which requests came in this batch" and the row layout of the receive is
+    validated at plan time.
     """
 
     seqno: int
@@ -265,13 +267,15 @@ class LwdStagedBatch:
 # The pool                                                                #
 # ---------------------------------------------------------------------- #
 class LwdHostStager:
-    """Device ping-pong slots, rotating receive buffers, per-request storage.
+    """Device ping-pong slots + per-request pinned storage.
 
-    Threading: ``allocate``/``commit_received`` run on the comm thread (they
-    are part of posting/monitoring a receive), while ``adopt``/``consume``/
-    ``release_request`` run on the worker's forward thread.  One lock guards
-    the tables; buffers are handed over exactly once and only touched by their
-    owner afterwards.
+    Threading: ``allocate``/``plan_recv_segments``/``publish_received`` run
+    on the comm thread (they are part of posting/monitoring a receive), while
+    ``adopt``/``consume``/``release_request`` run on the worker's forward
+    thread.  One lock guards the tables; per-request buffers are created once
+    at prompt length and only grow their *written* region afterwards, so the
+    segmented D2H views handed to the channel stay valid for the whole
+    receive.
 
     Args:
         device: NPU device string for slot allocation.
@@ -302,14 +306,16 @@ class LwdHostStager:
         self._lock = threading.Lock()
         self._slot_buffers: dict[int, Any] = {}
         self._slot_owner: dict[int, int] = {i: -1 for i in range(slots)}
-        self._recv_buffers: dict[int, Any] = {}
-        self._recv_owner: dict[int, int] = {}
         self._seqno_slot: dict[int, int] = {}
         self._batches: dict[int, LwdStagedBatch] = {}
         #: req_id -> per-request storage (kept until the request ends)
         self._reqs: dict[str, LwdReqEmbed] = {}
         #: seqno -> req_ids it delivered (so a drain can drop the descriptor)
         self._batch_reqs: dict[int, list[str]] = {}
+        #: seqno -> [(LwdReqEmbed, dest_row, rows)] arrival plan, registered
+        #: at submit time (plan_recv_segments) and published by
+        #: ``publish_received`` once the segmented D2H completes
+        self._arrival_plan: dict[int, list] = {}
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -346,10 +352,6 @@ class LwdHostStager:
         with self._lock:
             return [s for s, owner in self._slot_owner.items() if owner >= 0]
 
-    def busy_recv_buffers(self) -> list[int]:
-        with self._lock:
-            return sorted(self._recv_owner)
-
     def staged_seqnos(self) -> list[int]:
         """Seqnos currently holding a batch descriptor (abort path)."""
         with self._lock:
@@ -384,19 +386,17 @@ class LwdHostStager:
             return req.consumed if req is not None else 0
 
     # ------------------------------------------------------------------ #
-    # Admission (comm thread): bind slot + receive buffer to a recv        #
+    # Admission (comm thread): bind a device slot to a recv                #
     # ------------------------------------------------------------------ #
-    def allocate(self, seqno: int, numel: int) -> tuple[Any, Any, int]:
-        """Reserve a device slot and a rotating receive buffer.
+    def allocate(self, seqno: int, numel: int) -> tuple[Any, int]:
+        """Reserve a device ping-pong slot for one receive.
 
-        Returns ``(slot_view, recv_buffer, slot_index)`` for the recv request.
-        The receive buffer is a **rotating pool**: it lives only for the D2H
-        (plus the split), because the per-request buffers have their own,
-        much longer lifetime.
+        Returns ``(slot_view, slot_index)``.  The slot is released by
+        ``publish_received`` once the segmented D2H has completed.
 
         Raises:
-            LwdHostStageSlotBusy: every slot (or every receive buffer) is in
-                use.  The caller queues the hint - it is never dropped.
+            LwdHostStageSlotBusy: every slot is in use.  The caller queues
+                the hint - it is never dropped.
         """
         with self._lock:
             if self.max_numel and numel > self.max_numel:
@@ -417,87 +417,42 @@ class LwdHostStager:
                 self._slot_buffers[slot] = buf
             self._slot_owner[slot] = seqno
             self._seqno_slot[seqno] = slot
-        return buf[:numel], self._take_recv_buffer(numel), slot
+        return buf[:numel], slot
 
-    def _take_recv_buffer(self, numel: int) -> Any:
-        """Grab (or allocate) a rotating receive buffer, tracked by ``id()``.
-
-        Returns the **root** buffer, never a view: the pool keys on ``id()`` so
-        the same object must come back at release time.  Cached buffers are
-        only reused when they are already exactly ``numel``; a larger one is
-        left for a bigger batch rather than handed out as an oversized slice,
-        which keeps the received payload byte-exact (its length is checked
-        against the row table at split time).
-        """
-        key = None
-        for k, buf in self._recv_buffers.items():
-            if k not in self._recv_owner and buf.numel() == numel:
-                key = k
-                break
-        if key is None:
-            buf = self._make_host_buffer(numel)
-            key = id(buf)
-            self._recv_buffers[key] = buf
-        self._recv_owner[key] = numel
-        return self._recv_buffers[key]
-
-    def _release_recv_buffer(self, recv_buffer) -> None:
-        self._recv_owner.pop(id(recv_buffer), None)
-
-    def abandon(self, seqno: int, recv_buffer: Any | None = None) -> None:
+    def abandon(self, seqno: int) -> None:
         """Roll back an ``allocate`` whose receive was never posted."""
         with self._lock:
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
-        if recv_buffer is not None:
-            self._release_recv_buffer(recv_buffer)
 
     # ------------------------------------------------------------------ #
-    # Commit (comm thread): D2H done, split into per-request buffers       #
+    # Plan (comm thread, submit time): per-request buffers + D2H segments  #
     # ------------------------------------------------------------------ #
-    def commit_received(
+    def plan_recv_segments(
         self,
         seqno: int,
-        recv_buffer: Any,
         numel: int,
         hidden_size: int,
         req_ids: list[str],
         num_tokens_per_req: list[int],
+        prompt_lens: list[int],
+        row_base: list[int] | None = None,
         num_hash_layers: int = 0,
         num_experts_per_tok: int = 0,
-        row_offsets: list[int] | None = None,
-        row_base: list[int] | None = None,
-    ) -> LwdStagedBatch:
-        """Split the received payload into per-request buffers.
+    ) -> list[tuple[Any, int, int]]:
+        """提交期建行表:per-request buffer 按 prompt 全长一次分好,返回
+        本批的 D2H 分段 ``[(dst_pinned_view, src_elem_offset, numel)]``,
+        由通道层在接收完成后逐段异步拷入。
 
-        Called by the comm thread the moment ``staged_event.query()`` turns
-        true (the pinned receive buffer now holds the whole batch).  Returns
-        the device slot and the receive buffer to their pools immediately -
-        the payload now lives in the per-request buffers.
+        buffer 一次按全长分够、**没有扩容路径** —— 这是分段方案的安全前提:
+        交给通道层的视图在后续 chunk 到达时不会被 realloc(否则在飞 D2H
+        会写进已退役的旧 buffer)。``prompt_lens`` 因此是硬需求,缺失即
+        几何错误 fail-fast(部署必须两仓同版本)。
 
-        Args:
-            row_offsets: where each request's rows start **inside this batch
-                payload** (batch coordinates).  Defaults to the running sum,
-                i.e. a fresh, contiguous chunk per request in item order.
-                Callers that only know the *prompt* offsets must leave this
-                None -- see ``row_base``; the two coordinate systems are not
-                interchangeable.
-            row_base: where the same segment sits **inside that request's own
-                prompt** (prompt coordinates, i.e. ``LwdRangeItem.offset``).
-                Defaults to all zeros, which is correct when every request
-                arrives as a single chunk.  A request delivered over several
-                batches keeps the base recorded when its buffer was created,
-                and later chunks are written at ``row_base[i] - base``.
-
-        Raises:
-            LwdHostStageGeometryError: if the announced row layout does not
-                account for exactly ``numel`` elements.  Slicing on a wrong
-                layout would silently pair embeddings with the wrong request.
+        commit 期不再搬数据,``publish_received`` 只做高水位发布。
         """
         rows = list(num_tokens_per_req)
-        _t0 = time.monotonic()
-        _alloc_ms = 0.0
         total_rows = sum(rows)
         tail_per_row = 4 * num_hash_layers * num_experts_per_tok
         expect = total_rows * hidden_size + (total_rows * tail_per_row)
@@ -507,18 +462,12 @@ class LwdHostStager:
                 f"{total_rows}*{hidden_size} + {total_rows}*{tail_per_row} = "
                 f"{expect} (row table vs received size mismatch)"
             )
-        if row_offsets is None:
-            row_offsets = []
-            acc = 0
-            for n in rows:
-                row_offsets.append(acc)
-                acc += n
-        elif len(row_offsets) != len(rows):
+        if len(prompt_lens) != len(rows):
             raise LwdHostStageGeometryError(
-                f"seqno={seqno}: {len(row_offsets)} row offsets vs {len(rows)} "
-                f"requests"
+                f"seqno={seqno}: {len(prompt_lens)} prompt_lens vs "
+                f"{len(rows)} requests (分段 D2H 需要逐请求 prompt 全长,"
+                f"两仓必须同版本部署)"
             )
-        # prompt 坐标起点:单块到达时全部为 0(每个请求从自己的 row 0 开始)。
         if row_base is None:
             row_base = [0] * len(rows)
         elif len(row_base) != len(rows):
@@ -535,53 +484,42 @@ class LwdHostStager:
             num_experts_per_tok=num_experts_per_tok,
             recv_bytes=int(numel) * 2,
         )
-        # 载荷布局:embeds 区在前、专家 ID 区在后(与线上载荷一致)。
-        # 每个请求按**它自己声明的 prompt offset**落进自己的 buffer —— 记录
-        # 必须能装下多批增量(边侧把长 prompt 切成多段发时,一个请求会跨多个
-        # seqno 到达),所以这里用 note_arrival + 累积推进,而不是"新建覆盖"。
-        #
-        # ★ 两套坐标必须分清(真机踩过):
-        #   * ``row_offsets[i]``   = 该请求这段行在**本批载荷**里的起点
-        #     (批内坐标,提示里的原始值;在一个批里各请求依次排列);
-        #   * 该请求 buffer 的起点 = 它在**自己 prompt** 里的起点
-        #     (``row_base``,通常是 0;续传时由首次创建那个 buffer 的块决定)。
-        #   写入偏移 = 批内坐标 − prompt 起点。混淆两者会让"批里第二个请求"
-        #   的 dest_row 算成 0 而不是它真实的 prompt 偏移,数据写到自己 buffer
-        #   之外;而"已收行数"上报的又是另一个量(见下),三个量用途各不相同。
-        embeds_base = 0
-        tail_base = total_rows * hidden_size
+        segments: list[tuple[Any, int, int]] = []
+        plan: list[tuple[Any, int, int]] = []
         with self._lock:
+            acc = 0
             for i, rid in enumerate(req_ids):
                 n = rows[i]
                 host = self._reqs.get(rid)
                 if host is None:
-                    _ta = time.monotonic()
+                    # 一次按 prompt 全长分够:后续 chunk 直接落进预留区间,
+                    # 没有扩容、没有 realloc、没有在飞拷贝的视图失效问题。
+                    plen = int(prompt_lens[i])
+                    if row_base[i] + n > plen:
+                        raise LwdHostStageGeometryError(
+                            f"seqno={seqno} req={rid}: chunk end "
+                            f"{row_base[i] + n} exceeds prompt_len={plen}"
+                        )
                     host = LwdReqEmbed(
                         req_id=rid,
-                        host=self._make_host_buffer(n * hidden_size + n * tail_per_row),
-                        numel=n * hidden_size,
-                        prompt_rows=n,
+                        host=self._make_host_buffer(
+                            plen * hidden_size + plen * tail_per_row
+                        ),
+                        numel=plen * hidden_size,
+                        prompt_rows=plen,
                         hidden_size=hidden_size,
-                        tail_off=(n * hidden_size) if tail_per_row else -1,
-                        tail_numel=n * tail_per_row,
+                        tail_off=(plen * hidden_size) if tail_per_row else -1,
+                        tail_numel=plen * tail_per_row,
                         num_hash_layers=num_hash_layers,
                         num_experts_per_tok=num_experts_per_tok,
                     )
-                    _alloc_ms += (time.monotonic() - _ta) * 1000
                     self._reqs[rid] = host
-                    self._host_bytes += (n * hidden_size + n * tail_per_row) * 2
+                    self._host_bytes += (
+                        plen * (hidden_size + tail_per_row) * 2
+                    )
                     # 该 buffer 的第 0 行对应 prompt 的哪一行 = 它在提示里声明
-                    # 的 prompt 起点(首次到达的那一段的起点)。
+                    # 的 prompt 起点(首次到达的那一段的起点;正常为 0)。
                     host._row_base = row_base[i]
-                    # 自证一行(仅在非零时打):续传块**首次**到达就直接建成
-                    # 完整长度时,说明提示带的是 prompt 坐标、且这一块不是从 0
-                    # 开始 —— 这正是坐标模型正确工作的样子。值为 0 则不占日志。
-                    if row_base[i]:
-                        logger.info(
-                            "[Lwd][host-stage] req=%s new buffer based at prompt "
-                            "row %d (chunk starts mid-prompt; rows=%d)",
-                            rid, row_base[i], n,
-                        )
                 elif host.hidden_size != hidden_size:
                     # 续传增量:几何必须与首批一致,否则后面的切片全会错位
                     # (静默串数据),直接 fail-fast。
@@ -589,130 +527,77 @@ class LwdHostStager:
                         f"req={rid}: hidden_size {host.hidden_size} != "
                         f"{hidden_size} on a later chunk"
                     )
-                # ---- 写入位置:两条路统一用一个公式 ----
-                # 本段在该请求 prompt 里的起点(``row_base[i]``)减去该 buffer
-                # 的基准行(首次创建它的那一段的 prompt 起点)。新 buffer 的
-                # 基准就是本段起点 ⇒ 结果必然是 0,但仍然走同一个公式,避免
-                # "新建"与"续传"各算一遍而算歪(这正是真机串过数据的地方)。
+                # ---- 写入位置:prompt 坐标 − buffer 基准行 ----
+                # ``row_base[i]`` 是本段在**该请求 prompt 内**的起点(prompt
+                # 坐标);buffer 基准行是它首段的起点。两者相减得 buffer 内
+                # 行号。批内布局(载荷内偏移)由行数累加得出,两套坐标不混用。
                 dest_row = row_base[i] - host._row_base
-                if dest_row < 0:
+                if dest_row < 0 or dest_row + n > host.prompt_rows:
                     raise LwdHostStageGeometryError(
-                        f"req={rid}: chunk starts at prompt row "
-                        f"{row_base[i]} which is before this buffer's "
-                        f"base row {host._row_base} (delivery reordering)"
+                        f"req={rid}: chunk rows [{dest_row}, {dest_row + n}) "
+                        f"out of buffer rows {host.prompt_rows} "
+                        f"(delivery reordering or prompt_len mismatch)"
                     )
-                # 首批按"那一段的行数"分配,所以后续 chunk 可能落在已分配范围
-                # 之外 —— 这时**扩容并保留已写内容**,而不是假定"首批就是整个
-                # prompt"。扩容显式且带告警:它只在多 chunk 交付时发生,是几何
-                # 假设被打破的可观测信号。
-                need_rows = dest_row + n
-                if need_rows > host.prompt_rows:
-                    old_rows = host.prompt_rows
-                    _ta = time.monotonic()
-                    grown = self._make_host_buffer(
-                        need_rows * hidden_size + need_rows * tail_per_row
+                segments.append(
+                    (
+                        host.host[
+                            dest_row * hidden_size:
+                            (dest_row + n) * hidden_size
+                        ],
+                        acc * hidden_size,
+                        n * hidden_size,
                     )
-                    _alloc_ms += (time.monotonic() - _ta) * 1000
-                    grew = old_rows * hidden_size
-                    if grew:
-                        grown[:grew].copy_(host.host[:grew])
-                    if tail_per_row:
-                        old_tail = old_rows * tail_per_row
-                        grown[need_rows * hidden_size:
-                              need_rows * hidden_size + old_tail].copy_(
-                            host.host[host.tail_off: host.tail_off + old_tail]
-                        )
-                    # 旧 buffer 不能就地放手:forward 线程的异步 H2D
-                    # (non_blocking=True)可能还在从它读。延迟到请求结束
-                    # 随 release_request 一并释放;字节账按"新块全量 +
-                    # 旧块仍持有"记,release 时两处一起减。
-                    host._retired.append(host.host)
-                    host._retired_bytes += (
-                        old_rows * (hidden_size + tail_per_row) * 2
-                    )
-                    self._host_bytes += (
-                        need_rows * (hidden_size + tail_per_row) * 2
-                    )
-                    logger.warning(
-                        "[Lwd][host-stage] req=%s buffer grown %d -> %d rows "
-                        "on a later chunk (multi-chunk delivery)",
-                        rid, old_rows, need_rows,
-                    )
-                    host.host = grown
-                    host.prompt_rows = need_rows
-                    # Keep the byte accounting fields in step with the
-                    # grown allocation, otherwise release_request would
-                    # reclaim (and report) less than was actually held.
-                    host.numel = need_rows * hidden_size
-                    host.tail_numel = need_rows * tail_per_row
-                    host.tail_off = (
-                        need_rows * hidden_size if tail_per_row else -1
-                    )
-                dest = dest_row * hidden_size
-                host.host[dest: dest + n * hidden_size].copy_(
-                    recv_buffer[embeds_base: embeds_base + n * hidden_size]
                 )
-                batch.src_offsets.append(embeds_base)
+                batch.src_offsets.append(acc * hidden_size)
                 if tail_per_row:
-                    t_off = tail_base + row_offsets[i] * tail_per_row
-                    host.host[
-                        host.tail_off + dest_row * tail_per_row:
-                        host.tail_off + (dest_row + n) * tail_per_row
-                    ].copy_(recv_buffer[t_off: t_off + n * tail_per_row])
-                    batch.src_tail_offsets.append(t_off)
+                    t_src = total_rows * hidden_size + acc * tail_per_row
+                    segments.append(
+                        (
+                            host.host[
+                                host.tail_off + dest_row * tail_per_row:
+                                host.tail_off + (dest_row + n) * tail_per_row
+                            ],
+                            t_src,
+                            n * tail_per_row,
+                        )
+                    )
+                    batch.src_tail_offsets.append(t_src)
                 else:
                     batch.src_tail_offsets.append(-1)
-                embeds_base += n * hidden_size
-                # ---- 已收行数的高水位由 note_arrival 内部维护 ----
-                # 传"本段在 prompt 里的起点 + 行数"即可,它会与本次实际写到的
-                # 上界(含扩容后的 ``need_rows``)取大 —— 调用方不再需要自己算,
-                # 两个量也就不会再分叉。
-                if need_rows > dest_row + n:
-                    logger.warning(
-                        "[Lwd][host-stage] req=%s arrival gap: chunk covers "
-                        "[%d, %d) but %d rows were already written; marking "
-                        "up to %d as arrived",
-                        rid, dest_row, dest_row + n, host._written_hi,
-                        need_rows,
-                    )
-                # ---- 落盘坐标自证(每条 chunk 一行,便于现场一次定位)----
-                # 这一行把"这次到底写到哪、之前写到哪、buffer 多大"全摊开,
-                # 免得再从外部日志反推内部状态(那已经错过三次)。
-                logger.debug(
-                    "[Lwd][host-stage] CHUNK seqno=%d req=%s prompt=[%d,%d) "
-                    "of %d | base=%d dest_row=%d buffer_rows=%d "
-                    "written_hi=%d recv_rows=%d",
-                    seqno, rid, row_base[i], row_base[i] + n,
-                    host.prompt_rows, host._row_base, dest_row,
-                    host.prompt_rows, host._written_hi, host.recv_rows,
-                )
-                host.note_arrival(dest_row, n)
-                # 调用后的状态:上面那行打的是**调用前**,而"已收行数"的争议
-                # 全在调用之后。把 (offset, rows) 与结果一起打出来,否则又要从
-                # 外部日志反推内部状态 —— 那已经错过多次。
-                logger.debug(
-                    "[Lwd][host-stage] ARRIVE-CALL seqno=%d req=%s "
-                    "offset=%d rows=%d -> recv_rows=%d written_hi=%d "
-                    "prompt_rows=%d",
-                    seqno, rid, dest_row, n, host.recv_rows,
-                    host._written_hi, host.prompt_rows,
-                )
+                plan.append((host, dest_row, n))
+                acc += n
             self._batches[seqno] = batch
             self._batch_reqs[seqno] = list(req_ids)
+            self._arrival_plan[seqno] = plan
+        return segments
+
+    # ------------------------------------------------------------------ #
+    # Publish (comm thread): D2H done, advance the high-water marks        #
+    # ------------------------------------------------------------------ #
+    def publish_received(self, seqno: int) -> list[tuple[str, int, int]]:
+        """分段 D2H 完成后的发布:逐请求推进已收高水位 + 归还设备槽。
+
+        返回 ``[(req_id, rows, prompt_offset)]`` 供 worker 上报。不再搬
+        数据 —— 数据由通道层的分段 D2H 直接落进 per-request buffer。
+        """
+        with self._lock:
+            plan = self._arrival_plan.pop(seqno, None)
+            if plan is None:
+                raise LwdHostStageGeometryError(
+                    f"seqno={seqno}: no arrival plan (publish without plan; "
+                    f"submit-time planning is mandatory in staged mode)"
+                )
+            rows = [
+                (host.req_id, n, host._row_base + dest_row)
+                for host, dest_row, n in plan
+            ]
+            for host, dest_row, n in plan:
+                host.note_arrival(dest_row, n)
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
-        self._release_recv_buffer(recv_buffer)
-        # [Lwd][perf] commit 总耗时与其中 pinned 分配的占比(通信线程,
-        # 持锁):dur 大且 alloc 占比高 = pinned 分配慢;dur 大 alloc 小
-        # = H2H 拆分拷贝慢。该段直接推迟水位上报,是 TTFT 到达段的瓶颈点。
-        logger.info(
-            "[Lwd][perf] COMMIT seqno=%d dur=%.2fms alloc=%.2fms reqs=%d "
-            "rows=%d host_MB=%.1f",
-            seqno, (time.monotonic() - _t0) * 1000, _alloc_ms,
-            len(req_ids), total_rows, self._host_bytes / 2 ** 20,
-        )
-        return batch
+        return rows
+
 
     # ------------------------------------------------------------------ #
     # Consumption (forward thread)                                        #
@@ -767,8 +652,7 @@ class LwdHostStager:
             req = self._reqs.pop(req_id, None)
             if req is None:
                 return 0
-            freed = (req.numel + req.tail_numel) * 2 + req._retired_bytes
-            req._retired.clear()
+            freed = (req.numel + req.tail_numel) * 2
             self._host_bytes -= freed
             self._released_requests += 1
         return freed

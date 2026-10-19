@@ -255,7 +255,7 @@ class LwdCloudWorker(NPUWorker):
         # aux 帧机制保留在通道层供 deepstack 等扩展。
         if self._lwd_early_recv_endpoint:
             future = self.get_or_post_early_recv(
-                batch.seqno, num_tokens, 0
+                batch.seqno, num_tokens, 0, meta
             )
         else:
             # 非端点:不碰跨机通道;广播接收推迟到注入时刻现场发起,
@@ -327,9 +327,9 @@ class LwdCloudWorker(NPUWorker):
         # ------------------------------------------------------------------ #
         # host 暂存(design v7:按请求拆分存储 / 双指针 / 请求结束才释放)        #
         # ------------------------------------------------------------------ #
-        # seqno -> 该批交付的逐请求 (req_id, rows, offset)。
-        # 提示随批带来(与 notify.items 同序),暂存提交时用它建行表。
-        self._lwd_batch_rows: dict[int, list[tuple[str, int, int]]] = {}
+        # 行表不再单独登记:提交期由 ``plan_recv_segments`` 一次建成
+        # (分段 + 到达计划 + 批描述符),prompt 全长由 hint / SO meta 的
+        # ``prompt_lens`` 提供。
         # req_id -> (prompt_rows, num_hash_layers, num_experts_per_tok)。
         # **按请求存**(不再按 seqno):一个请求可能跨多个批到达,元数据只有
         # 一份,按请求挂才对得上。
@@ -382,7 +382,8 @@ class LwdCloudWorker(NPUWorker):
         )
 
     def _lwd_build_up_recv_request(
-        self, seqno: int, num_tokens: int, aux_rows: int
+        self, seqno: int, num_tokens: int, aux_rows: int,
+        fields: tuple | None = None,
     ) -> LwdCommRequest:
         """UP recv 请求的唯一构造点(提示路径与消费点补挂共用同一形状)。
 
@@ -391,11 +392,18 @@ class LwdCloudWorker(NPUWorker):
         positions 自 wire_version 2 起改走控制面,调用方恒传 aux_rows=0)。
         尺寸公式只在本处算一次,两侧路径不会各算一遍算歪。
 
-        host 暂存打开时,本处同时向暂存池申请**设备乒乓槽 + 轮换接收缓冲**,
-        并把两者交给通道层(design v7 §4.3:接收落进池拥有的内存,D2H 一完成
-        即可归还复用;随后再按请求 H2H 拆分到各自的 pinned)。池满(无空闲槽/
-        缓冲)时抛 ``LwdHostStageSlotBusy``,由调用方排队重试 —— 提示只排队、
-        不丢弃。
+        host 暂存打开时,本处同时完成两件事(design v7 §4.3 改版):
+          1. 按行表向暂存池**建行表 + 分段**(``plan_recv_segments``):
+             per-request pinned buffer 按 prompt 全长一次分好,返回逐段
+             D2H 落点;
+          2. 申请设备乒乓槽(``allocate``)。
+        通道层随后把接收载荷**逐段异步 D2H** 直接落进各请求的 buffer,
+        通信线程零 CPU 拷贝(H2H 拆分退役)。槽满抛 ``LwdHostStageSlotBusy``
+        (调用方排队重试,提示不丢弃);行表/几何缺失抛
+        ``LwdHostStageGeometryError``(协议级错误,不可重试)。
+
+        ``fields`` = ``hint_fields()`` 的 8 元组;消费点补挂路径用 SO 的
+        batch_meta 重建同形状元组。
         """
         num_elements = hash_payload_numel(
             num_tokens, self._lwd_up_hidden_size,
@@ -414,14 +422,35 @@ class LwdCloudWorker(NPUWorker):
         stager = self._lwd_stager
         if stager is None:
             return request
-        slot_view, recv_buffer, slot = stager.allocate(
-            seqno=int(seqno), numel=num_elements,
+        from vllm_ascend.worker.lwd_cloud.lwd_host_stage import (
+            LwdHostStageGeometryError,
         )
+
+        if fields is None or not fields[3] or not fields[7]:
+            raise LwdHostStageGeometryError(
+                f"seqno={seqno}: staged recv needs the per-request row "
+                f"table with prompt_lens (req_ids/rows/prompt_offsets/"
+                f"prompt_lens); got fields={None if fields is None else 'incomplete'}"
+            )
+        (_seqno, _nt, _aux, req_ids, rows, _offsets, prompt_offsets,
+         prompt_lens) = fields
+        hf = self.model_config.hf_config
+        segments = stager.plan_recv_segments(
+            seqno=int(seqno),
+            numel=num_elements,
+            hidden_size=self._lwd_up_hidden_size,
+            req_ids=req_ids,
+            num_tokens_per_req=rows,
+            prompt_lens=prompt_lens,
+            row_base=list(prompt_offsets) if prompt_offsets else None,
+            num_hash_layers=hash_layer_count(hf),
+            num_experts_per_tok=getattr(hf, "num_experts_per_tok", 0),
+        )
+        slot_view, slot = stager.allocate(seqno=int(seqno), numel=num_elements)
         return replace(
             request,
             recv_buffer=slot_view,
-            stage_buffer=recv_buffer,
-            stage_to_host=True,
+            stage_segments=segments,
             recv_slot=slot,
         )
 
@@ -574,24 +603,31 @@ class LwdCloudWorker(NPUWorker):
                     del self._early_recv_pending[key]
                     continue
                 seqno, num_tokens, aux_rows = fields[0], fields[1], fields[2]
+                from vllm_ascend.worker.lwd_cloud.lwd_host_stage import (
+                    LwdHostStageError,
+                    LwdHostStageSlotBusy,
+                )
+
                 try:
                     request = self._lwd_build_up_recv_request(
-                        seqno, num_tokens, aux_rows
+                        seqno, num_tokens, aux_rows, fields
                     )
-                except Exception as exc:  # noqa: BLE001 - 池满 = 排队,不是错误
-                    from vllm_ascend.worker.lwd_cloud.lwd_host_stage import (
-                        LwdHostStageError,
+                except LwdHostStageSlotBusy:
+                    # 池里没有空闲槽:提示**留在队列原地**,下一轮再试
+                    # (与"名额满只排队"同款纪律,绝不丢弃)。
+                    return
+                except LwdHostStageError:
+                    # 几何/行表错误是协议级问题,不可重试(S4:曾被当成
+                    # 池满无限排队,水位停摆)。丢弃该提示并告警 —— 同版本
+                    # 部署下不应出现;出现时该批数据永不到达,涉及的请求随
+                    # 客户端超时终结,至少不再堵死后续提示。
+                    logger.exception(
+                        "[Lwd][pre-recv] seqno=%s: build recv request "
+                        "failed (geometry/protocol), hint dropped", seqno,
                     )
-
-                    if isinstance(exc, LwdHostStageError):
-                        # 池里没有空闲槽/接收缓冲:提示**留在队列原地**,
-                        # 下一轮再试(与"名额满只排队"同款纪律,绝不丢弃)。
-                        return
-                    raise
+                    del self._early_recv_pending[key]
+                    continue
                 del self._early_recv_pending[key]
-                # 行表登记:暂存提交时要按它把整批载荷拆到各请求自己的
-                # buffer 里(design v7 §4.3)。
-                self._lwd_register_batch_rows(seqno, hint, num_tokens)
                 future = get_lwd_comm_service().submit_recv(request)
                 self._early_recv_futures[key] = future
                 inflight = len(self._early_recv_futures)
@@ -612,9 +648,10 @@ class LwdCloudWorker(NPUWorker):
 
         **三段式**(host 暂存打开时,design v7 §5.2):
           ① ``future.done()``          —— HCCL 收完(主帧 + aux 帧)
-          ② ``future.staged_done()``   —— D2H 完成,接收 pinned 上有一份完整载荷
-          ③ 拆分 + 上报 —— 按请求 H2H 拆到各自 buffer、**归还设备槽与接收缓冲**、
-             写 done MQ(**捎带本批逐请求已收行数**)
+          ② ``future.staged_done()``   —— 分段 D2H 完成,逐请求的 pinned
+             buffer 里已各有一份完整段(通道层逐段异步拷入,零 CPU 拆分)
+          ③ 发布 + 上报 —— ``publish_received`` 推进逐请求高水位、
+             **归还设备槽**、写 done MQ(**捎带本批逐请求已收行数**)
 
         DONE 的语义因此从"数据落在云 NPU"升级为"数据落在云 host 且资源已归还"。
         这一步**只做 query(),从不 wait()** —— 纯 CPU 轮询是本线程与 busy_loop
@@ -664,56 +701,22 @@ class LwdCloudWorker(NPUWorker):
                 self._early_recv_pump()
 
     def _lwd_commit_received(self, future: LwdCommFuture) -> list:
-        """D2H 完成后的收尾:按请求拆分、归还资源、算出待上报的行数增量。
+        """分段 D2H 完成后的收尾:发布高水位、归还设备槽、算待上报行数。
 
         只在 host 暂存打开时做实事;关着时立即返回空(消费点仍走"取 future
-        的 tensor"老路径)。
+        的 tensor"老路径)。**不再搬数据**:分段 D2H 由通道层在接收流上
+        直接落进 per-request buffer(§4.3 改版,H2H 拆分退役)。
 
         Returns:
-            ``[(req_id, rows), ...]`` —— **自上次上报以来**新增的已收行数。
-            只报增量:一次 recv 只让一个请求前进一次,但同一个请求可能跨多个批
-            到达,如果每次都把累计值报一遍,done MQ 会被重复内容刷满,而引擎侧
-            还得靠 max() 去重。
+            ``[(req_id, rows), ...]`` —— 逐请求**累计**已收行数。
         """
         stager = self._lwd_stager
         if stager is None:
             return []
-        request = future.request
-        seqno = int(request.seqno)
-        recv_buffer = future.staged_tensor
-        if recv_buffer is None:
-            return []
-        numel = int(request.num_elements)
-        rows = self._lwd_batch_rows.pop(seqno, None)
-        if not rows:
-            # 提示缺失且消费点才补挂的极端情形:行表没有,退化为"整批一个
-            # 请求"。正确性不变(该请求就是整批),但调度粒度变粗,留痕告警。
-            num_tokens = numel // max(self._lwd_up_hidden_size, 1)
-            rows = [(f"seqno{seqno}", num_tokens, 0)]
-            logger.warning(
-                "[Lwd][host-stage] seqno=%d: no row table (hint missing); "
-                "treating the whole batch as one request", seqno,
-            )
-        hf = self.model_config.hf_config
-        stager.commit_received(
-            seqno=seqno,
-            recv_buffer=recv_buffer,
-            numel=numel,
-            hidden_size=self._lwd_up_hidden_size,
-            req_ids=[r[0] for r in rows],
-            num_tokens_per_req=[r[1] for r in rows],
-            num_hash_layers=hash_layer_count(hf),
-            num_experts_per_tok=getattr(hf, "num_experts_per_tok", 0),
-            # ``rows`` 里带的是**prompt 坐标**的 offset(提示直接透传 notify
-            # item 的 offset,引擎用它做 num_computed 对账),而批内布局由
-            # stager 自己按行数累加得出 —— 两者坐标系不同,所以这里传
-            # ``row_base``、**不传** ``row_offsets``。
-            # 把 prompt 坐标当批内布局用过一次,后果是"批里第二个请求"的
-            # 写入偏移算成 0,数据写到自己 buffer 之外(真机串过数据)。
-            row_base=[r[2] for r in rows],
-        )
-        # 设备槽与接收缓冲此刻都已归还;丢掉 future 对设备帧的引用,让池能
-        # 立刻复用那块内存(不丢的话引用计数还在,而 future 不会马上回收)。
+        seqno = int(future.request.seqno)
+        rows = stager.publish_received(seqno)
+        # 设备槽已归还;丢掉 future 对设备帧的引用,让池能立刻复用那块内存
+        # (不丢的话引用计数还在,而 future 不会马上回收)。
         future.release_device_tensor()
         # ---- 逐请求上报**累计已收行数**(不是增量)----
         #
@@ -730,6 +733,7 @@ class LwdCloudWorker(NPUWorker):
         arrived: list[tuple[str, int]] = []
         last_total: dict[str, int] = getattr(self, "_lwd_last_total", None) or {}
         self._lwd_last_total = last_total
+        hf = self.model_config.hf_config
         for rid, n, offset in rows:
             total = stager.recv_rows(rid)
             if total <= last_total.get(rid, 0):
@@ -748,7 +752,7 @@ class LwdCloudWorker(NPUWorker):
         return arrived
 
     def get_or_post_early_recv(
-        self, seqno: int, num_tokens: int, aux_rows: int
+        self, seqno: int, num_tokens: int, aux_rows: int, meta=None
     ) -> LwdCommFuture | None:
         """取通信线程提前挂好的 UP recv future;没有就现场补挂一条并登记。
 
@@ -795,10 +799,13 @@ class LwdCloudWorker(NPUWorker):
                 # 名额满时该提示还在排队:本批已下发,现在必须挂上
                 hint = self._early_recv_pending.pop(key, None)
                 if hint is not None:
-                    self._lwd_register_batch_rows(seqno, hint, num_tokens)
+                    from vllm_ascend.distributed.lwd_comm.pre_recv import (
+                        hint_fields,
+                    )
+
                     future = get_lwd_comm_service().submit_recv(
                         self._lwd_build_up_recv_request(
-                            seqno, num_tokens, aux_rows
+                            seqno, num_tokens, aux_rows, hint_fields(hint)
                         )
                     )
                     self._early_recv_futures[key] = future
@@ -814,12 +821,25 @@ class LwdCloudWorker(NPUWorker):
                         self._early_recv_last_delivered = seqno
             else:
                 # 提示彻底没到(或到得比本 SO 还晚):用同一份信息现场补挂,
-                # 保证上报链不缺号,水位能继续前进。行切分此时已知(SO 的
-                # batch_meta 就是权威),不必再依赖提示。
+                # 保证上报链不缺号,水位能继续前进。行表此时以 SO 的
+                # batch_meta 为权威(req_ids/token_ids/prompt_offsets/
+                # prompt_lens 全在里面),就地重建 hint_fields 同形状元组;
+                # meta 缺 prompt_lens(版本错配)时几何检查 fail-fast。
                 logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
-                self._lwd_register_batch_rows(seqno, None, num_tokens)
+                fields = None
+                if meta is not None and getattr(meta, "prompt_lens", None):
+                    fields = (
+                        seqno, num_tokens, aux_rows,
+                        list(meta.req_ids),
+                        [len(t) for t in meta.token_ids],
+                        None,  # 批内坐标:stager 按行数自行累加
+                        list(meta.prompt_offsets),
+                        list(meta.prompt_lens),
+                    )
                 future = get_lwd_comm_service().submit_recv(
-                    self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
+                    self._lwd_build_up_recv_request(
+                        seqno, num_tokens, aux_rows, fields
+                    )
                 )
                 self._early_recv_futures[key] = future
             inflight = len(self._early_recv_futures)
@@ -891,60 +911,6 @@ class LwdCloudWorker(NPUWorker):
             for seqno in list(stager.staged_seqnos()):
                 stager.release_if_drained(seqno)
         return freed
-
-    def _lwd_register_batch_rows(
-        self, seqno: int, hint: dict | None, num_tokens: int
-    ) -> None:
-        """登记该批交付的逐请求 (req_id, rows, offset)。
-
-        提示自带 ``req_ids``/``rows``(与 notify.items 同序),offset 取
-        notify item 的 ``offset``(边侧原始值)。提示缺失(消费点补挂)时退化为
-        "整批一个请求":正确性不变(那个请求就是整批),只是调度粒度变粗。
-
-        这是 design v7 §4.3 拆分所需的**唯一**输入 —— 有了它,暂存池就能把
-        一整块接收载荷按请求切到各自的 buffer 里。
-        """
-        if self._lwd_stager is None:
-            return
-        # 已登记过的行表**不许被覆盖**。补挂路径(hint=None)只能给"从没登记
-        # 过的 seqno"兜底;若拿它覆盖一条真实的多请求行表,后面按批切分就会
-        # 把整块载荷当成一个伪请求,所有真实请求都收不到数据(静默)。
-        if seqno in self._lwd_batch_rows and hint is None:
-            return
-        req_ids: list[str] = []
-        rows: list[int] = []
-        prompt_offsets: list[int] = []
-        if hint is not None:
-            from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
-
-            fields = hint_fields(hint)
-            if fields is not None:
-                req_ids, rows = fields[3], fields[4]
-                # ``fields[6]`` = prompt 坐标(该请求这段行在**自己 prompt** 里的
-                # 起点)。别再退回用 fields[5](批内坐标)当 prompt 起点:一个
-                # 请求跨多个批到达时,批内坐标恒从 0 起算,会把续传块的位置算成
-                # 0 —— 写入看着对(扩容仍会触发),但"已收行数"被算成块内偏移,
-                # 于是一个 3510 行的请求被报成只收到 2342,调度器据此误判越界
-                # (真机实录,云侧 EngineDeadError)。
-                prompt_offsets = list(fields[6]) if len(fields) > 6 else []
-        if req_ids and rows:
-            if len(prompt_offsets) != len(rows):
-                # 提示没带 prompt 坐标(老边侧/老引擎):只能按"每个请求都从
-                # 自己的 0 行开始"处理 —— 单块到达时与真实语义一致;多块时
-                # 会算错续传位置,所以打一条告警留痕。
-                logger.warning(
-                    "[Lwd][host-stage] seqno=%d: hint carries no "
-                    "prompt_offsets; assuming every request starts at row 0 "
-                    "(multi-chunk delivery will be misplaced)",
-                    seqno,
-                )
-                prompt_offsets = [0] * len(rows)
-            self._lwd_batch_rows[seqno] = [
-                (rid, n, po)
-                for rid, n, po in zip(req_ids, rows, prompt_offsets)
-            ]
-        else:
-            self._lwd_batch_rows[seqno] = [(f"seqno{seqno}", num_tokens, 0)]
 
     # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
     # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内

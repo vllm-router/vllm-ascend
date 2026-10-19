@@ -333,21 +333,20 @@ class LwdChannel:
                 get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
-            if req.op == "recv" and req.stage_buffer is not None:
-                # Host staging (docs/design/lwd_host_staging.md §4.3): copy the
-                # whole main frame into the caller's pinned buffer on THIS
-                # stream, right behind the (already bridged, already
-                # descrambled) recv.  Two reasons it must be this stream:
-                #   1. the channel FIFO already gives us "data complete" -
-                #      no host-side wait is needed, and the comm thread can
-                #      poll a pure-CPU event instead of blocking;
-                #   2. the D2H ops are then ordered by seqno too, so the
-                #      staged-completion order is the seqno order and the
-                #      readiness watermark stays a prefix (design invariant 4).
-                # The event is recorded AFTER the copy, so query()==true
-                # means the pinned host payload is complete.
-                staged_tensor = req.stage_buffer
-                staged_tensor.copy_(tensor, non_blocking=True)
+            if req.op == "recv" and req.stage_segments is not None:
+                # Host staging(design v7 §4.3 改版):提交期已按行表把本批
+                # 载荷切成逐请求段,这里把各段异步 D2H 直接落进各请求自己
+                # 的 pinned buffer —— 通信线程零 CPU 拷贝(H2H 拆分退役)。
+                # 必须在这条流上,两个理由:
+                #   1. 通道 FIFO 已保证"数据收完"——无需 host 侧等待,
+                #      通信线程用纯 CPU event 轮询即可;
+                #   2. D2H 也按 seqno 有序,分段完成序 = seqno 序,就绪
+                #      水位保持前缀(不变量 4)。
+                # event 记在最后一段之后:query()==true 即本批全部分段
+                # 已完整落 host。
+                for dst, src_off, n in req.stage_segments:
+                    dst.copy_(tensor[src_off:src_off + n],
+                              non_blocking=True)
                 staged_event = torch.npu.Event()
                 staged_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req

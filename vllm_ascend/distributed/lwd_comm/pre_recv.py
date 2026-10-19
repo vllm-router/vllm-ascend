@@ -90,6 +90,7 @@ def make_recv_hint(
     rows: list[int] | None = None,
     offsets: list[int] | None = None,
     prompt_offsets: list[int] | None = None,
+    prompt_lens: list[int] | None = None,
 ) -> dict:
     """构造一条 UP 提前收提示。
 
@@ -118,12 +119,13 @@ def make_recv_hint(
         "rows": [int(r) for r in (rows or ())],
         "offsets": [int(o) for o in (offsets or ())],
         "prompt_offsets": [int(o) for o in (prompt_offsets or ())],
+        "prompt_lens": [int(n) for n in (prompt_lens or ())],
     }
 
 
 def hint_fields(hint: dict) -> tuple | None:
     """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows,
-    offsets, prompt_offsets)``。
+    offsets, prompt_offsets, prompt_lens)``。
 
     坏提示返回 None(调用方丢弃 + 告警)。行表与总数不符 = 边云版本或组批发散;
     若放行,暂存池会按错的行表切窗口、把 embedding 写到别的请求的位置
@@ -137,6 +139,7 @@ def hint_fields(hint: dict) -> tuple | None:
         rows = [int(r) for r in hint.get("rows", ())]
         offsets = [int(o) for o in hint.get("offsets", ())]
         prompt_offsets = [int(o) for o in hint.get("prompt_offsets", ())]
+        prompt_lens = [int(n) for n in hint.get("prompt_lens", ())]
     except (KeyError, TypeError, ValueError):
         return None
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
@@ -153,8 +156,21 @@ def hint_fields(hint: dict) -> tuple | None:
             or any(o < 0 for o in prompt_offsets)
         ):
             return None
+        if prompt_lens and (
+            len(prompt_lens) != len(rows)
+            or any(n <= 0 for n in prompt_lens)
+            # 本 chunk 必须落在 prompt 范围内
+            or any(
+                o + r > n
+                for o, r, n in zip(
+                    prompt_offsets or [0] * len(rows), rows, prompt_lens
+                )
+            )
+        ):
+            return None
     return (
         seqno, num_tokens, aux_rows, req_ids, rows, offsets, prompt_offsets,
+        prompt_lens,
     )
 
 
