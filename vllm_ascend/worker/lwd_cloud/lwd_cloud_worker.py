@@ -116,8 +116,15 @@ class LwdCloudWorker(NPUWorker):
         # 端点 rank 才有跨机通道:把它的提前收通信线程起起来(hint MQ 已由
         # 执行器在建 worker 之前建好并写进环境变量;done MQ 由本处建 writer,
         # handle 随 READY 握手回传引擎)。其余 rank 只登记"非端点"。
+        # 端点判定:本 engine TP 组首卡 = 共享边布局下的
+        # E + dp_rank*C(engine_index 即本 engine 的 dp_rank,多云下
+        # 数据面组按 (engine, channel) 键索引,本进程只有本 engine 的
+        # 通道有真实对端)
+        lwd_cfg = self.parallel_config.lwd_config
+        self._lwd_engine_index = self.parallel_config.data_parallel_rank
         self._lwd_early_recv_endpoint = (
-            self.rank == self.parallel_config.lwd_config.edge_npu_count
+            self.rank
+            == lwd_cfg.cloud_engine_rank_base(self._lwd_engine_index)
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # 每个云 rank 都打一行:谁该起通信线程一目了然
@@ -332,6 +339,7 @@ class LwdCloudWorker(NPUWorker):
                 getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
             ),
             seqno=int(seqno),
+            engine_index=self._lwd_engine_index,
             # aux 第二载荷与主帧同 seqno;mrope 退役后恒 0(零 aux 流量),
             # 未来载荷(如 deepstack)显式传行数即可
             aux_num_elements=int(aux_rows) * 3,
@@ -613,6 +621,7 @@ class LwdCloudWorker(NPUWorker):
                         num_elements=hidden.numel(),
                         tensor=hidden,
                         seqno=seqno,
+                        engine_index=self._lwd_engine_index,
                     )
                 )
                 # async 包装器下挂到内层,否则 get_output() 解包丢失

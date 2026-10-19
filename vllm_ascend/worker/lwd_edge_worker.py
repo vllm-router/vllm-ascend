@@ -127,16 +127,19 @@ class LwdEdgeWorker(NPUWorker):
 
     def init_device(self):
         # The duplex channels MUST be built here, never in ``__init__``.
-        # ``init_lwd_duplex_channels`` creates the two HCCL process groups
-        # (``dist.new_group``) and then warms them up with a two-sided P2P
-        # exchange (world barrier plus the edge/cloud isend/irecv pair), so it
-        # needs the distributed environment -- world group and PP group --
-        # which ``NPUWorker._init_worker_distributed_environment`` only builds
-        # inside ``init_device``.  The executor constructs the worker first and
-        # calls ``init_device`` afterwards, so running it from ``__init__``
-        # would trip the "group is not initialized" assertions; the two-sided
-        # warmup additionally requires both peers to reach it in the same fixed
-        # order, which only holds once every rank is past its distributed init.
+        # ``init_lwd_duplex_channels`` creates the HCCL process groups
+        # (two ``dist.new_group`` per cloud engine) and then warms them up
+        # with a two-sided P2P exchange (world barrier plus per-engine
+        # edge/cloud isend/irecv pairs), so it needs the distributed
+        # environment -- world group and PP group -- which
+        # ``NPUWorker._init_worker_distributed_environment`` only builds
+        # inside ``init_device``.  The executor constructs the worker first
+        # and calls ``init_device`` afterwards, so running it from
+        # ``__init__`` would trip the "group is not initialized"
+        # assertions; the two-sided warmup additionally requires both
+        # peers to reach it in the same fixed order (engine order, UP then
+        # DOWN), which only holds once every rank is past its distributed
+        # init.
         super().init_device()
         # Payload scramble: bind the two static factors once; the per-flight
         # seed is derived by the comm layer from each request's own fields.
@@ -329,6 +332,7 @@ class LwdEdgeWorker(NPUWorker):
             num_elements=payload.numel(),
             tensor=payload,
             seqno=seqno,
+            engine_index=batch_meta.engine_index,
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -515,6 +519,7 @@ class LwdEdgeWorker(NPUWorker):
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
+                engine_index=batch_meta.engine_index,
             )
         )
         _t_post = time.monotonic()

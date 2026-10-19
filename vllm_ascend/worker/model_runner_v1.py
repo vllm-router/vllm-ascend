@@ -3683,19 +3683,40 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        self._lwd_mem_probe("profile:enter")
         self.eplb_warmup()
+        self._lwd_mem_probe("profile:after-eplb-warmup")
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            self._lwd_mem_probe("profile:after-mc2-dummy")
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
         super().profile_run()
+        self._lwd_mem_probe("profile:after-main-dummy")
         self.max_num_tokens = origin_max_num_tokens
+
+    def _lwd_mem_probe(self, tag: str) -> None:
+        """[Lwd][mem-debug] VLLM_ASCEND_LWD_MEM_DEBUG=1 时在 profile 各
+        子步骤边界打印 torch 分配量——峰值差额定位到子步骤用。"""
+        from vllm_ascend import envs as ascend_envs
+
+        if not ascend_envs.VLLM_ASCEND_LWD_MEM_DEBUG:
+            return
+        stats = torch.npu.memory_stats(self.device)
+        logger.info(
+            "[Lwd][mem-debug] %s alloc_cur=%.2fGiB alloc_peak=%.2fGiB "
+            "reserved_cur=%.2fGiB",
+            tag,
+            stats.get("allocated_bytes.all.current", 0) / (1 << 30),
+            stats.get("allocated_bytes.all.peak", 0) / (1 << 30),
+            stats.get("reserved_bytes.all.current", 0) / (1 << 30),
+        )
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
