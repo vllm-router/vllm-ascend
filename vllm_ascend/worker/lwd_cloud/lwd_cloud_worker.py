@@ -206,10 +206,13 @@ class LwdCloudWorker(NPUWorker):
         _t0 = time.monotonic()
         output = super().execute_model(scheduler_output)
         # [Lwd][perf] 云侧每步 exec_model 计时:total=前向全程
-        # (forward 主段,sample/collect 在 sample_tokens 另有分项)
+        # (forward 主段,sample/collect 在 sample_tokens 另有分项);
+        # tokens/reqs 与集中式 [Perf] exec 打点同口径,便于纯 decode 步对表
         logger.info(
-            "[Lwd][perf] cloud-exec total=%.2fms",
+            "[Lwd][perf] cloud-exec total=%.2fms tokens=%d reqs=%d",
             (time.monotonic() - _t0) * 1000,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduler_output.num_scheduled_tokens),
         )
         return output
 
