@@ -225,6 +225,20 @@ def lwd_channels_initialized() -> bool:
     return _INITIALIZED
 
 
+def lwd_pairs() -> list[tuple[int, int]]:
+    """全部 (edge_id, cloud_id) 通信域(init_lwd_duplex_channels 后有效)。
+
+    提前收 worker 据此算出"本云 rank 是哪些边的 UP 端点";只读快照,
+    不允许调用方改动返回列表。
+    """
+    return list(_LWD_PAIRS)
+
+
+def self_ids() -> tuple[str | None, int, int]:
+    """本进程 (role, edge_id, cloud_id)(init_lwd_duplex_channels 后有效)。"""
+    return _SELF_ROLE, _SELF_EDGE_ID, _SELF_CLOUD_ID
+
+
 def get_lwd_channel_device_group(
     channel: LwdChannelType,
     edge_id: int | None = None,

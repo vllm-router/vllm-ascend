@@ -14,7 +14,10 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
+import os
+import threading
 import time
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import logger
@@ -28,6 +31,7 @@ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
@@ -40,6 +44,9 @@ import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.worker.lwd_cloud.lwd_cloud_model_runner import LwdCloudModelRunner
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
 from vllm_ascend.worker.worker import NPUWorker
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
 
 class LwdCloudWorker(NPUWorker):
@@ -106,6 +113,29 @@ class LwdCloudWorker(NPUWorker):
         from vllm_ascend.distributed import lwd_wire
 
         lwd_wire.init_lwd_duplex_channels()
+        # [Lwd][pre-recv] 提前收:本 rank 对哪些边是 UP 端点(端点随边轮转,
+        # 一个云 rank 可能是边 A 的端点、边 B 的非端点)。只有端点 rank 持
+        # 跨机 P2P 通道、才提前挂真实 irecv 并上报收完水位;非端点 rank 的
+        # 数据在注入时刻由 TP 组内广播取到,既不挂 recv 也不上报。
+        # hint MQ 由执行器在建 worker 之前逐边建好并写进环境变量;done MQ
+        # 由本处逐边建 writer,handle 随 READY 握手回传引擎。
+        self._init_lwd_early_recv_state()
+        _, _, _self_cloud = lwd_wire.self_ids()
+        self._lwd_early_recv_edges: list[int] = [
+            edge_id
+            for edge_id, cloud_id in lwd_wire.lwd_pairs()
+            if cloud_id == _self_cloud
+            and lwd_wire.is_lwd_channel_endpoint(
+                LwdChannelType.UP, edge_id=edge_id, cloud_id=None)
+        ]
+        self._lwd_up_hidden_size = self.model_config.get_hidden_size()
+        # 每个云 rank 都打一行:谁该起通信线程一目了然
+        logger.info(
+            "[Lwd][pre-recv] worker rank=%d endpoint_edges=%s hidden=%d",
+            self.rank, self._lwd_early_recv_edges, self._lwd_up_hidden_size,
+        )
+        if self._lwd_early_recv_edges:
+            self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
 
     def _build_payload_scrambler(self) -> None:
@@ -187,20 +217,25 @@ class LwdCloudWorker(NPUWorker):
         return output
 
     def _lwd_up_post_recvs(self, scheduler_output) -> None:
-        """Post the UP recv for an incoming LWD_EMBED batch.
+        """Bind the UP recv for an incoming LWD_EMBED batch.
 
         UP 两段通信按 prefill_only_demo_br 范式拆到两个时刻:
-          * post 时刻(本函数):仅端点 rank 经通道 P2P posted recv
-            (尽早 posted 以匹配边侧 isend);非端点只登记 meta 占位;
-          * 消费时刻(runner 注入侧):各卡在*自己的计算流上*现场发起
-            TP 组内 broadcast 并紧随 work.wait()——torch_npu 下两个
-            HCCL op 之间的跨流排序不可依赖(实测 post 时刻发起的广播
-            抢跑 irecv、交付残缺),launch+wait 同流上下文原子对才是
-            demo 验证过的可靠形态。
+          * post 时刻(本函数):仅端点 rank 经通道 P2P 挂 recv;非端点只登记
+            meta 占位;
+          * 消费时刻(runner 注入侧):各卡在*自己的计算流上*现场发起 TP 组内
+            broadcast 并紧随 work.wait()——torch_npu 下两个 HCCL op 之间的跨流
+            排序不可依赖(实测 post 时刻发起的广播抢跑 irecv、交付残缺),
+            launch+wait 同流上下文原子对才是 demo 验证过的可靠形态。
+
+        提前收(early recv):端点那条 irecv **已由通信线程按引擎提示提前挂好**
+        (RangeNotify 到达即挂,不等本 SO),本处只是取用那条 future;闸门
+        (``_lwd_pre_recv_ready``)保证放行时它一定已挂出。提示万一没到,本处用
+        同一份信息现场补挂(见 ``get_or_post_early_recv``),不会漏挂。
 
         All control info rides the SchedulerOutput (edge -> cloud
         control plane fills it in):batch.seqno 为边侧派发号(跨机段
-        配对键),recv 尺寸包含 embedding 及可选的 Hash 专家 ID。"""
+        配对键,按 (edge_id, seqno) 分域),recv 尺寸包含 embedding 及
+        可选的 Hash 专家 ID。"""
         from vllm.v1.core.sched.output import LwdBatchType
 
         batch = getattr(scheduler_output, "lwd_batch", None)
@@ -209,47 +244,438 @@ class LwdCloudWorker(NPUWorker):
         meta = batch.batch_meta
         if meta is None or not meta.req_ids:
             return
-        hidden_size = self.model_config.get_hidden_size()
         num_tokens = sum(len(t) for t in meta.token_ids)
         if num_tokens <= 0:
             return
-        from vllm_ascend.distributed import lwd_wire
-
         edge_id = meta.edge_id
-        is_endpoint = lwd_wire.is_lwd_channel_endpoint(
-            LwdChannelType.UP, edge_id=edge_id, cloud_id=None
-        )
-        if is_endpoint:
-            future = get_lwd_comm_service().submit_recv(
-                LwdCommRequest(
-                    channel=LwdChannelType.UP,
-                    op="recv",
-                    num_elements=hash_payload_numel(
-                        num_tokens, hidden_size, hash_layer_count(self.model_config.hf_config),
-                        getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
-                    ),
-                    seqno=batch.seqno,
-                    edge_id=edge_id,
-                    # mrope positions 已改走控制面(LwdRangeItem
-                    # .mrope_positions 随 RangeNotify 到达,
-                    # wire_version>=2),UP recv 只挂 embeds 主帧,
-                    # aux 恒 0——若残留非零,预挂的 aux irecv 永远收
-                    # 不到数据,水位停摆。aux 机制保留在通道层供
-                    # deepstack 等扩展。
-                    aux_num_elements=0,
-                )
-            )
+        if edge_id in self._lwd_early_recv_edges:
+            # 端点:取通信线程提前挂好的 recv(没挂好就现场补挂)
+            future = self.get_or_post_early_recv(edge_id, batch.seqno,
+                                                 num_tokens)
         else:
             # 非端点:不碰跨机通道;广播接收推迟到注入时刻现场发起,
             # None 即"消费时现场广播"标记。
             future = None
         # per-(edge, seqno) 分桶:多边 seqno 各自独立从 0 起,不能按 seqno 合并。
         self._lwd_up_recv_futures[(edge_id, batch.seqno)] = (future, meta)
-        logger.info(
-            "[Lwd][cloud-worker] UP recv posted edge=%d seqno=%d reqs=%d "
-            "tokens=%d endpoint=%s",
-            edge_id, batch.seqno, len(meta.req_ids), num_tokens, is_endpoint,
+        logger.debug(
+            "[Lwd][pre-recv] POST edge=%d seqno=%d reqs=%d tokens=%d "
+            "endpoint=%s ts=%.3f",
+            edge_id, batch.seqno, len(meta.req_ids), num_tokens,
+            future is not None, time.monotonic(),
         )
+
+    # ------------------------------------------------------------------ #
+    # 提前收:通信线程(提示下发 -> 挂 recv -> 上报水位)                     #
+    # ------------------------------------------------------------------ #
+    #
+    # 锁纪律不变量(0826 四环死锁教训,迁移时修正源版瑕疵):
+    # ``_early_recv_lock`` 锁内**只做 dict/set 操作**;``submit_recv`` 一律
+    # 锁外。锁外 submit 与消费点补挂的竞态由 POSTING 状态解决(见
+    # ``_early_recv_pump`` / ``get_or_post_early_recv``):同键绝不允许两条
+    # irecv 同时在挂——同一通道上两条 irecv 会抢发送端那一条 isend。
+
+    def _init_lwd_early_recv_state(self) -> None:
+        """提前收收单(与引擎下发的提示、上报的水位同一套键)。
+
+        key = (edge_id, seqno)(channel 恒 UP 不进键)。条目生命周期:提示
+        到达即 submit_recv 并登记;消费点 ``get_or_post_early_recv`` 只是
+        **取用并标记已消费**(不 pop:上报线程还要继续轮询它推进水位);
+        "既已上报又已消费"才移除。
+
+        **在飞上限(本 rank 全局池 G)**:一条已挂 recv 占一块整批大小的
+        接收 buffer;与边侧 pending 闸门同源 —— ``LwdEdgeScheduler``
+        ``_LWD_MAX_PENDING_CHUNKS``(按 cloud_id 分域,默认 2)把每边
+        领先量封顶,本 rank 最坏在飞 = 本 rank 服务的边数 × cap。上限之外
+        的提示先排队(``_early_recv_pending``,按到达序,只存字段不占显存),
+        前面的批随 SO 被消费腾出名额后立刻补挂。归还点必须是"随 SO 被
+        消费"(=已下发)而不是"收完":闸门放行第 N 批的条件是水位 ≥ N,
+        放行后 execute_model 立刻要取这条 future;名额若拖到收完才还,
+        N+1 的 recv 可能还没挂上,闸门就会跑到 recv 前面。
+        """
+        self._early_recv_max_inflight = int(
+            os.environ.get("VLLM_ASCEND_LWD_EARLY_RECV_MAX_INFLIGHT", "4"))
+        self._early_recv_futures: dict[tuple[int, int], LwdCommFuture] = {}
+        # key -> Event:泵已取出提示、正在锁外 submit(POSTING 状态)
+        self._early_recv_posting: dict[tuple[int, int], threading.Event] = {}
+        # 已被消费点取走的 key:防止通信线程在提示迟到时再挂一条重复 recv
+        self._early_recv_consumed: set[tuple[int, int]] = set()
+        # 已上报完成的 key
+        self._early_recv_reported: set[tuple[int, int]] = set()
+        # 名额已满时排队的提示(key -> hint,插入序即到达序)
+        self._early_recv_pending: dict[tuple[int, int], dict] = {}
+        self._early_recv_lock = threading.Lock()
+        # 队列卡住诊断的限频时间戳
+        self._early_recv_stuck_log_at = 0.0
+        # 下行提示 MQ(edge_id -> reader)/ 上行完成上报 MQ(edge_id -> writer)
+        self._irecv_hint_mqs: dict[int, "MessageQueue"] = {}
+        self._irecv_done_mqs: dict[int, "MessageQueue"] = {}
+        # 公开别名:WorkerProc 在 worker 构造后取它,把 handle 随 READY 回传,
+        # 引擎据此挂 done reader(见 vllm/v1/executor/multiproc_executor.py)。
+        self.irecv_done_mqs: dict[int, "MessageQueue"] = {}
+        self._lwd_early_recv_thread: threading.Thread | None = None
+
+    def _lwd_build_up_recv_request(
+        self, edge_id: int, seqno: int, num_tokens: int
+    ) -> LwdCommRequest:
+        """UP recv 请求的唯一构造点(提示路径与消费点补挂共用同一形状)。
+
+        HCCL P2P 要求两端 numel 严格相等:主帧 = hash 载荷公式(embeds + 可选
+        专家 ID 字节)。尺寸公式只在本处算一次,两侧路径不会各算一遍算歪。
+        aux 恒 0:mrope positions 已走控制面(LwdRangeItem.mrope_positions,
+        wire_version>=2),数据面 aux 帧退役——若残留非零,预挂的 aux irecv
+        永远收不到数据,水位停摆。aux 机制保留在通道层供 deepstack 等扩展。
+        """
+        return LwdCommRequest(
+            channel=LwdChannelType.UP,
+            op="recv",
+            num_elements=hash_payload_numel(
+                num_tokens, self._lwd_up_hidden_size,
+                hash_layer_count(self.model_config.hf_config),
+                getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
+            ),
+            seqno=int(seqno),
+            edge_id=int(edge_id),
+            aux_num_elements=0,
+        )
+
+    def _start_lwd_early_recv_thread(self) -> None:
+        """逐边重建 hint MQ reader、建 done MQ writer,起提前收通信线程。"""
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            attach_hint_mq,
+            create_report_mq,
+        )
+
+        for edge_id in self._lwd_early_recv_edges:
+            mq = attach_hint_mq(edge_id)
+            if mq is None:
+                logger.warning(
+                    "[Lwd][pre-recv] hint MQ handle missing for edge=%d "
+                    "(executor not armed?); recv falls back to consume-point",
+                    edge_id,
+                )
+                continue
+            self._irecv_hint_mqs[edge_id] = mq
+            done_mq = create_report_mq()
+            self._irecv_done_mqs[edge_id] = done_mq
+            self.irecv_done_mqs[edge_id] = done_mq
+        logger.info(
+            "[Lwd][pre-recv] comm thread starting rank=%d hint MQs=%s",
+            self.rank, sorted(self._irecv_hint_mqs),
+        )
+        self._lwd_early_recv_thread = threading.Thread(
+            target=self._lwd_early_recv_loop,
+            name="lwd-early-recv",
+            daemon=True,
+        )
+        self._lwd_early_recv_thread.start()
+
+    def _lwd_early_recv_loop(self) -> None:
+        """通信线程主体:取提示 -> 提前挂 recv;轮询 future -> 上报收完。
+
+        只做四件极轻的事:``dequeue`` / ``submit_recv`` / ``future.done()`` /
+        ``enqueue`` —— 从不 ``wait()`` 任何 future、也不碰模型,所以不与
+        busy_loop 的 HCCL 使用冲突(同通道上一端 irecv 一端跨线程 wait 是
+        HCCL 不允许的)。
+        """
+        # 当前设备是线程级状态,通信线程要自己设一次(否则 irecv 落到 0 卡)
+        torch.npu.set_device(self.device)
+        logger.info(
+            "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQs=%s",
+            self.rank, self.device, sorted(self._irecv_hint_mqs),
+        )
+        hint_mqs = list(self._irecv_hint_mqs.items())
+        while True:
+            # 逐边轮取(每边每轮至多 1 条):防单边暴量饿死他边 reader
+            for _edge_id, mq in hint_mqs:
+                try:
+                    hint = mq.dequeue(timeout=0)
+                except TimeoutError:
+                    continue
+                except Exception:
+                    # 关停时 ring 被取消等:记一条、小睡,别热转(daemon 线程
+                    # 随进程退出)
+                    logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
+                    time.sleep(0.01)
+                    continue
+                self.start_early_irecv(hint)
+            self._report_irecv_completions()
+            self._warn_if_early_recv_stuck()
+            # 封顶 CPU:ring 读端在"刚读过"的时间窗内是自旋,光给 0 超时并不
+            # 封顶 —— 这行 sleep 才是,代价是提示/水位各约 1ms 的可见延迟。
+            time.sleep(0.001)
+
+    _LWD_EARLY_RECV_STUCK_LOG_INTERVAL_S = 5.0
+
+    def _warn_if_early_recv_stuck(self) -> None:
+        """队列挂不上时每 5s 一条告警:排队有提示、名额却全被占住。
+
+        名额被占住 = 那几条已挂 recv 既没被消费也没释放(水位因此不前进、
+        闸门不再放行 prefill)。这条日志把"谁占着名额"直接写出来,避免出现
+        "prefill 不动了但不知道为什么"。
+        """
+        with self._early_recv_lock:
+            if (
+                not self._early_recv_pending
+                or len(self._early_recv_futures) + len(self._early_recv_posting)
+                < self._early_recv_max_inflight
+            ):
+                return
+            now = time.monotonic()
+            if (
+                now - self._early_recv_stuck_log_at
+                < self._LWD_EARLY_RECV_STUCK_LOG_INTERVAL_S
+            ):
+                return
+            self._early_recv_stuck_log_at = now
+            oldest = next(iter(self._early_recv_pending))
+            holders = sorted(self._early_recv_futures)
+        logger.warning(
+            "[Lwd][pre-recv] queue stuck: oldest queued (edge,seqno)=%s, "
+            "%d slot(s) held by (edge,seqno)=%s (slots held = those batches "
+            "posted recv but were never consumed; downstream dispatch is "
+            "the pacer)",
+            oldest, len(holders), holders,
+        )
+
+    def start_early_irecv(self, hint: dict) -> None:
+        """收下一条引擎提示;名额没满就立刻挂 recv,满了先排队。
+
+        幂等:同一 (edge_id, seqno) 的重复提示、或消费点已经处理过的,都不再
+        接受 —— 同一通道上两条 irecv 会抢发送端那一条 isend。
+        """
+        from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
+
+        fields = hint_fields(hint)
+        if fields is None:
+            logger.warning("[Lwd][pre-recv] malformed hint %s, skipped", hint)
+            return
+        edge_id, seqno, _num_tokens = fields
+        key = (edge_id, seqno)
+        with self._early_recv_lock:
+            if (
+                key in self._early_recv_futures
+                or key in self._early_recv_posting
+                or key in self._early_recv_consumed
+                or key in self._early_recv_pending
+            ):
+                return
+            self._early_recv_pending[key] = hint
+        self._early_recv_pump()
+
+    def _early_recv_quota(self, edge_id: int) -> int:
+        """该边在本 rank 的软配额:ceil(G / E_live),保底 1。"""
+        e_live = max(1, len(self._lwd_early_recv_edges))
+        return max(1, -(-self._early_recv_max_inflight // e_live))
+
+    def _pick_pending_locked(self) -> tuple[tuple[int, int], dict]:
+        """在锁内按软配额挑一条排队提示(调用前须保证 pending 非空)。
+
+        工作守恒 + 保底:优先选"本边在飞数 < 配额"的队首;都超配额时允许
+        借额(选队首),但若某边有排队且在飞数 == 0,只许选该边的队首
+        (保底 1 条,防一边暴量把提前收变成单边专属)。
+        """
+        inflight_by_edge: dict[int, int] = {}
+        for e, _s in self._early_recv_futures:
+            inflight_by_edge[e] = inflight_by_edge.get(e, 0) + 1
+        for e, _s in self._early_recv_posting:
+            inflight_by_edge[e] = inflight_by_edge.get(e, 0) + 1
+        # 保底:有排队却在飞为 0 的边最优先
+        for (e, _s), hint in self._early_recv_pending.items():
+            if inflight_by_edge.get(e, 0) == 0:
+                return (e, _s), hint
+        # 配额内先到先挂
+        for (e, _s), hint in self._early_recv_pending.items():
+            if inflight_by_edge.get(e, 0) < self._early_recv_quota(e):
+                return (e, _s), hint
+        # 全部超配额:借额,选全局队首(到达序)
+        return next(iter(self._early_recv_pending.items()))
+
+    def _early_recv_pump(self) -> None:
+        """把排队的提示按到达序挂成 recv,直到用满在飞名额。
+
+        名额 = "已挂 recv(含 POSTING)、还没随 SO 被消费"的条数(每条占
+        一块整批接收 buffer),所以这里的上限就是显存上限;
+        ``get_or_post_early_recv`` 消费一条后调用本函数补挂下一条,提示
+        队列因此不会因为上限而丢。
+
+        锁纪律:锁内只做 dict 操作(取出提示、占 POSTING 位);
+        ``submit_recv`` 在锁外(它可能取通道层锁,锁内调用是 0826 死锁的
+        同款形态)。POSTING 占位使消费点不会在同一键上重复补挂。
+        """
+        from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
+
+        while True:
+            with self._early_recv_lock:
+                if (
+                    not self._early_recv_pending
+                    or len(self._early_recv_futures)
+                    + len(self._early_recv_posting)
+                    >= self._early_recv_max_inflight
+                ):
+                    return
+                key, hint = self._pick_pending_locked()
+                del self._early_recv_pending[key]
+                ev = threading.Event()
+                self._early_recv_posting[key] = ev
+            # ---- 锁外 submit ----
+            edge_id, seqno, num_tokens = hint_fields(hint)
+            future = get_lwd_comm_service().submit_recv(
+                self._lwd_build_up_recv_request(edge_id, seqno, num_tokens)
+            )
+            with self._early_recv_lock:
+                self._early_recv_posting.pop(key, None)
+                # 消费点若在 submit 期间到达,已在 POSTING 上等待,
+                # 登记 future 后由它取走;幂等集合不变
+                self._early_recv_futures[key] = future
+                ev.set()
+                inflight = len(self._early_recv_futures)
+                queued = len(self._early_recv_pending)
+            logger.debug(
+                "[Lwd][pre-recv] SUBMIT edge=%d seqno=%d num_tokens=%d "
+                "inflight=%d queued=%d ts=%.3f",
+                edge_id, seqno, num_tokens, inflight, queued,
+                time.monotonic(),
+            )
+
+    def _report_irecv_completions(self) -> None:
+        """把已收完的 recv 以 (edge_id, channel, seqno) 上报到该边 done MQ。
+
+        每 (edge, channel) 完成序 = seqno 序,所以引擎侧只维护一个最大
+        水位就能精确判就绪。已被消费点取走的条目继续轮询:消费意味着前向
+        正在用这份数据,``done()`` 很快转真,水位照样前进;条目"既上报过
+        又被消费过"才移除。
+        """
+        if not self._irecv_done_mqs:
+            return
+        with self._early_recv_lock:
+            pending = [
+                (key, future)
+                for key, future in self._early_recv_futures.items()
+                if key not in self._early_recv_reported
+            ]
+        for (edge_id, seqno), future in pending:
+            if not future.done():
+                continue
+            done_mq = self._irecv_done_mqs.get(edge_id)
+            if done_mq is None:
+                continue
+            logger.debug(
+                "[Lwd][pre-recv] DONE edge=%d seqno=%d ts=%.3f",
+                edge_id, seqno, time.monotonic(),
+            )
+            # 上报:引擎每步排空 done MQ 推进该边水位
+            done_mq.enqueue((edge_id, LwdChannelType.UP, seqno))
+            logger.debug(
+                "[Lwd][pre-recv] REPORT edge=%d seqno=%d ts=%.3f",
+                edge_id, seqno, time.monotonic(),
+            )
+            with self._early_recv_lock:
+                key = (edge_id, seqno)
+                self._early_recv_reported.add(key)
+                if key in self._early_recv_consumed:
+                    self._early_recv_futures.pop(key, None)
+                    self._early_recv_reported.discard(key)
+                    self._early_recv_consumed.discard(key)
+                    released = True
+                else:
+                    released = False
+            if released:
+                self._early_recv_pump()
+
+    def get_or_post_early_recv(
+        self, edge_id: int, seqno: int, num_tokens: int
+    ) -> LwdCommFuture | None:
+        """取通信线程提前挂好的 UP recv future;没有就现场补挂一条并登记。
+
+        非端点 rank 无跨机通道(数据在注入时刻由 TP 广播取到),返回 None。
+        条目不在本处移除:上报线程要继续轮询它推进水位,只有"既上报又消费"
+        才移除,所以水位不会因为被消费而断档。
+
+        本处是**名额归还点**:SO 一到,这一条的 buffer 马上要交给前向,名额
+        立刻转给还在排队的提示(提示还排着队时先就地挂上,闸门/前向不可能
+        跑到 recv 前面)。
+
+        POSTING 竞态协议:泵已取出提示正在锁外 submit 时,本处在该键的
+        Event 上短等(submit 是 µs~ms 级内存操作,等待实际为零);超时仍无
+        future = 泵线程异常,fail-fast 而不是再挂一条(同键两条 irecv 会抢
+        同一条 isend)。
+        """
+        if edge_id not in self._lwd_early_recv_edges:
+            return None
+
+        key = (edge_id, seqno)
+        future = None
+        posting_ev = None
+        hint = None
+        with self._early_recv_lock:
+            # 名额归还点(先于取用):SO 已下发,这条 buffer 即刻交给前向
+            self._early_recv_consumed.add(key)
+            future = self._early_recv_futures.get(key)
+            if future is None:
+                posting_ev = self._early_recv_posting.get(key)
+                if posting_ev is None:
+                    # 名额满时该提示可能还在排队:本批已下发,必须挂上
+                    hint = self._early_recv_pending.pop(key, None)
+        if future is None and posting_ev is not None:
+            posting_ev.wait(timeout=5.0)
+            with self._early_recv_lock:
+                future = self._early_recv_futures.get(key)
+            if future is None:
+                raise RuntimeError(
+                    f"[Lwd][pre-recv] posting stuck edge={edge_id} "
+                    f"seqno={seqno}: pump submitted no future within 5s"
+                )
+        if future is None:
+            # 提示彻底没到(或到得比本 SO 还晚/在排队):用同一份信息现场
+            # 补挂,保证上报链不缺号,水位能继续前进。锁外 submit,锁内登记。
+            logger.debug(
+                "[Lwd][pre-recv] submit at consume edge=%d seqno=%d "
+                "(hint %s)", edge_id, seqno,
+                "still queued" if hint is not None else "never arrived",
+            )
+            future = get_lwd_comm_service().submit_recv(
+                self._lwd_build_up_recv_request(edge_id, seqno, num_tokens)
+            )
+            with self._early_recv_lock:
+                self._early_recv_futures[key] = future
+        with self._early_recv_lock:
+            if key in self._early_recv_reported:
+                # 完成已上报:消费即条目终点(上报线程不会再碰它)
+                self._early_recv_futures.pop(key, None)
+                self._early_recv_reported.discard(key)
+                self._early_recv_consumed.discard(key)
+            inflight = len(self._early_recv_futures)
+            queued = len(self._early_recv_pending)
+        # 名额已归还:补挂排队中的提示
+        self._early_recv_pump()
+        logger.debug(
+            "[Lwd][pre-recv] stats edge=%d seqno=%d inflight=%d queued=%d",
+            edge_id, seqno, inflight, queued,
+        )
+        return future
+
+    def drop_edge_early_recv(self, edge_id: int) -> None:
+        """边失联清理挂点:清该边收单/排队提示/台账,名额回池。
+
+        已挂出的 HCCL recv 无法取消(buffer 随进程生命周期);条目摘除后
+        上报线程不再轮询它。本轮无调用方(当前线尚无 edge-loss 检测点),
+        供后续检测落地时接线。
+        """
+        with self._early_recv_lock:
+            for table in (
+                self._early_recv_futures,
+                self._early_recv_posting,
+                self._early_recv_pending,
+            ):
+                for key in [k for k in table if k[0] == edge_id]:
+                    del table[key]
+            self._early_recv_consumed = {
+                k for k in self._early_recv_consumed if k[0] != edge_id
+            }
+            self._early_recv_reported = {
+                k for k in self._early_recv_reported if k[0] != edge_id
+            }
 
     # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
     # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内
