@@ -683,8 +683,12 @@ class LwdCloudModelRunner(NPUModelRunner):
 
         每请求搬 ``consumed .. consumed + num_scheduled_tokens[req]`` 这一段
         —— 正好是它本步要算的行。**各请求独立**,因为它们的 host buffer 本来
-        就各占一块(§4.1),所以是 P 次拷贝而不是一次;每次都很短,发射开销
-        可忽略。
+        就各占一块(§4.1),所以是 P 次拷贝而不是一次。
+
+        **必须异步**(non_blocking=True):源是 pinned 内存,异步拷贝安全;
+        同步拷贝会让 CPU 阻塞到每次 PCIe 往返完成,每个窗口制造一个
+        CPU-NPU 串行气泡,并发下每步前向白白多出十几 ms(真机实录 ITL
+        抬升)。异步化后拷贝在计算流上流水线化,CPU 不停。
 
         落点 = ``prefix_sum(本步行数)``:所有 TP rank 都用同一份
         ``num_scheduled_tokens`` 算,所以段布局必然一致(W4)。
@@ -692,8 +696,13 @@ class LwdCloudModelRunner(NPUModelRunner):
         拷贝落在**当前(计算)流**上、紧接随后的 broadcast 之前 —— 同流
         launch 序保证广播读到的是搬完的数据,不引入跨流排序。
 
+        源 buffer 的存活由 stager 保证:per-request buffer 活到请求结束
+        (§6.1),扩容 realloc 的旧块也延迟到那时才释放(见
+        ``LwdReqEmbed._retired``),异步拷贝飞行期间不会碰到已释放内存。
+
         搬完即推进 ``consumed``(§4.2):"搬回设备"就是"本步要算",两者同步
-        推进;真正的释放仍然等到请求结束(§6.1)。
+        推进(指针推进只是 CPU 侧记账,已入流的拷贝不受影响);真正的释放
+        仍然等到请求结束(§6.1)。
         """
         dev = self._lwd_window_device(
             sum(
@@ -743,7 +752,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                     )
             dev[offset: offset + numel].copy_(
                 stager.take_req(rid).host[host_start: host_start + numel],
-                non_blocking=False,
+                non_blocking=True,
             )
             offset += numel
         dev.record_stream(torch.npu.current_stream())

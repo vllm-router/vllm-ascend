@@ -93,6 +93,13 @@ class LwdReqEmbed:
     aborted: bool = False
     #: highest prompt row written so far, to detect gaps on arrival
     _written_hi: int = 0
+    #: buffers replaced by a growth realloc.  They must NOT be freed at
+    #: grow time: the forward thread's H2D copies are async
+    #: (non_blocking=True), so a copy issued from the old buffer may still
+    #: be in flight.  Retire them until release_request (request end),
+    #: when every copy issued from them has long completed.
+    _retired: list = field(default_factory=list)
+    _retired_bytes: int = 0
 
     # ------------------------------------------------------------------ #
     # Arrival (data plane)                                                #
@@ -608,8 +615,16 @@ class LwdHostStager:
                               need_rows * hidden_size + old_tail].copy_(
                             host.host[host.tail_off: host.tail_off + old_tail]
                         )
+                    # 旧 buffer 不能就地放手:forward 线程的异步 H2D
+                    # (non_blocking=True)可能还在从它读。延迟到请求结束
+                    # 随 release_request 一并释放;字节账按"新块全量 +
+                    # 旧块仍持有"记,release 时两处一起减。
+                    host._retired.append(host.host)
+                    host._retired_bytes += (
+                        old_rows * (hidden_size + tail_per_row) * 2
+                    )
                     self._host_bytes += (
-                        (need_rows - old_rows) * (hidden_size + tail_per_row) * 2
+                        need_rows * (hidden_size + tail_per_row) * 2
                     )
                     logger.warning(
                         "[Lwd][host-stage] req=%s buffer grown %d -> %d rows "
@@ -736,7 +751,8 @@ class LwdHostStager:
             req = self._reqs.pop(req_id, None)
             if req is None:
                 return 0
-            freed = (req.numel + req.tail_numel) * 2
+            freed = (req.numel + req.tail_numel) * 2 + req._retired_bytes
+            req._retired.clear()
             self._host_bytes -= freed
             self._released_requests += 1
         return freed
