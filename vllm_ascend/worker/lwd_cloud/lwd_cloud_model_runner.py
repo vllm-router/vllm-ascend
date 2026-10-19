@@ -704,6 +704,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         推进(指针推进只是 CPU 侧记账,已入流的拷贝不受影响);真正的释放
         仍然等到请求结束(§6.1)。
         """
+        _t0 = time.monotonic()
         dev = self._lwd_window_device(
             sum(
                 int(num_scheduled_tokens[self.input_batch.req_id_to_index[rid]])
@@ -763,11 +764,14 @@ class LwdCloudModelRunner(NPUModelRunner):
             n_rows = int(num_scheduled_tokens[idx])
             if n_rows > 0:
                 stager.consume(rid, n_rows)
+        # [Lwd][perf] stage=锁等待 + H2D 发射总耗时(异步拷贝,CPU 不等
+        # 数据;该值大 = 锁竞争或发射开销,不是带宽)
         logger.info(
             "[Lwd][cloud-runner] CONSUME seqno=%s rows=%d segs=%d "
-            "host_MB=%.1f held=%d",
+            "host_MB=%.1f held=%d stage=%.2fms",
             seqno, offset // max(hidden_size, 1), len(meta.req_ids),
             stager.host_bytes / 2 ** 20, stager.request_count,
+            (time.monotonic() - _t0) * 1000,
         )
         return dev
 

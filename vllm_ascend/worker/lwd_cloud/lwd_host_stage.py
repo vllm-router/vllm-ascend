@@ -34,6 +34,7 @@ machine without torch_npu.  Buffers are duck-typed (``numel()``, slicing,
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -151,7 +152,7 @@ class LwdReqEmbed:
         # 让我连续几轮看错因果(日志里 dest_row 是对的,上报值却是本块行数),
         # 所以这一行必须紧贴赋值、并带上实例身份 —— 同名请求若各持一份 buffer,
         # 外部日志完全看不出来。
-        logger.info(
+        logger.debug(
             "[Lwd][host-stage] ARRIVE req=%s id=%s in=(%d,%d) end=%d "
             "written_hi=%d recv_rows %d->%d prompt_rows=%d",
             self.req_id, id(self), offset, rows, end,
@@ -495,6 +496,8 @@ class LwdHostStager:
                 layout would silently pair embeddings with the wrong request.
         """
         rows = list(num_tokens_per_req)
+        _t0 = time.monotonic()
+        _alloc_ms = 0.0
         total_rows = sum(rows)
         tail_per_row = 4 * num_hash_layers * num_experts_per_tok
         expect = total_rows * hidden_size + (total_rows * tail_per_row)
@@ -552,6 +555,7 @@ class LwdHostStager:
                 n = rows[i]
                 host = self._reqs.get(rid)
                 if host is None:
+                    _ta = time.monotonic()
                     host = LwdReqEmbed(
                         req_id=rid,
                         host=self._make_host_buffer(n * hidden_size + n * tail_per_row),
@@ -563,6 +567,7 @@ class LwdHostStager:
                         num_hash_layers=num_hash_layers,
                         num_experts_per_tok=num_experts_per_tok,
                     )
+                    _alloc_ms += (time.monotonic() - _ta) * 1000
                     self._reqs[rid] = host
                     self._host_bytes += (n * hidden_size + n * tail_per_row) * 2
                     # 该 buffer 的第 0 行对应 prompt 的哪一行 = 它在提示里声明
@@ -603,9 +608,11 @@ class LwdHostStager:
                 need_rows = dest_row + n
                 if need_rows > host.prompt_rows:
                     old_rows = host.prompt_rows
+                    _ta = time.monotonic()
                     grown = self._make_host_buffer(
                         need_rows * hidden_size + need_rows * tail_per_row
                     )
+                    _alloc_ms += (time.monotonic() - _ta) * 1000
                     grew = old_rows * hidden_size
                     if grew:
                         grown[:grew].copy_(host.host[:grew])
@@ -671,7 +678,7 @@ class LwdHostStager:
                 # ---- 落盘坐标自证(每条 chunk 一行,便于现场一次定位)----
                 # 这一行把"这次到底写到哪、之前写到哪、buffer 多大"全摊开,
                 # 免得再从外部日志反推内部状态(那已经错过三次)。
-                logger.info(
+                logger.debug(
                     "[Lwd][host-stage] CHUNK seqno=%d req=%s prompt=[%d,%d) "
                     "of %d | base=%d dest_row=%d buffer_rows=%d "
                     "written_hi=%d recv_rows=%d",
@@ -683,7 +690,7 @@ class LwdHostStager:
                 # 调用后的状态:上面那行打的是**调用前**,而"已收行数"的争议
                 # 全在调用之后。把 (offset, rows) 与结果一起打出来,否则又要从
                 # 外部日志反推内部状态 —— 那已经错过多次。
-                logger.info(
+                logger.debug(
                     "[Lwd][host-stage] ARRIVE-CALL seqno=%d req=%s "
                     "offset=%d rows=%d -> recv_rows=%d written_hi=%d "
                     "prompt_rows=%d",
@@ -696,6 +703,15 @@ class LwdHostStager:
             if slot >= 0:
                 self._slot_owner[slot] = -1
         self._release_recv_buffer(recv_buffer)
+        # [Lwd][perf] commit 总耗时与其中 pinned 分配的占比(通信线程,
+        # 持锁):dur 大且 alloc 占比高 = pinned 分配慢;dur 大 alloc 小
+        # = H2H 拆分拷贝慢。该段直接推迟水位上报,是 TTFT 到达段的瓶颈点。
+        logger.info(
+            "[Lwd][perf] COMMIT seqno=%d dur=%.2fms alloc=%.2fms reqs=%d "
+            "rows=%d host_MB=%.1f",
+            seqno, (time.monotonic() - _t0) * 1000, _alloc_ms,
+            len(req_ids), total_rows, self._host_bytes / 2 ** 20,
+        )
         return batch
 
     # ------------------------------------------------------------------ #
