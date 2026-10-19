@@ -61,6 +61,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_HOST_STAGE": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_HOST_STAGE", 0)
     ),
+    # Max posted-but-unconsumed early UP receives (cloud endpoint).  Must be
+    # >= the edge's VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS, otherwise recvs are
+    # not posted deeply enough and widening the edge gate has no effect.
+    # In host-staging mode an in-flight entry is pure pipeline bookkeeping
+    # (the device slot is released once the D2H completes), so this no longer
+    # bounds NPU memory. Default 8 (edge gate defaults to 6, plus slack for
+    # consume-point re-posts). Range: >= 1.
+    "VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV", 8)
+    ),
     # Per-step execute_model wall-time probe on the NPU worker (one INFO log
     # per step: "[Perf] exec total=...").  Off by default; enable it to
     # A/B step-time against the LWD cloud worker's `cloud-exec total`

@@ -302,14 +302,16 @@ class LwdCloudWorker(NPUWorker):
 
         **在飞上限 = 3**:一条已挂 recv 占一块整批大小的接收 buffer(含 aux 帧),
         而这个 3 与边侧的 pending 闸门同源 —— ``LwdEdgeScheduler``
-        ``_LWD_MAX_PENDING_CHUNKS = 3`` 按"未消费 chunk(seqno)"限制边侧领先量,
-        所以云侧最多也就需要这 3 条;上限之外的提示先排队(``_early_recv_pending``,
-        按到达序,只存字段不占显存),前面的批随 SO 被消费腾出名额后立刻补挂。
+        边侧 pending 闸门(``VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS``,默认 6)
+        按"未消费 chunk(seqno)"限制边侧领先量,云侧在飞上限必须不小于它,
+        否则 recv 挂不满、闸门放宽不生效;上限之外的提示先排队
+        (``_early_recv_pending``,按到达序,只存字段不占显存),前面的批随
+        SO 被消费腾出名额后立刻补挂。
         归还点必须是"随 SO 被消费"(=已下发)而不是"收完":闸门放行第 N 批的
         条件是水位 ≥ N,放行后 execute_model 立刻要取这条 future;名额若拖到
         收完才还,N+1 的 recv 可能还没挂上,闸门就会跑到 recv 前面。
         """
-        self._early_recv_max_inflight = 3
+        self._early_recv_max_inflight = envs.VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV
         self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdCommFuture] = {}
         self._early_recv_lock = threading.Lock()
         # 已被消费点取走的 key:防止通信线程在提示迟到时再挂一条重复 recv
