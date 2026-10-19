@@ -453,6 +453,8 @@ class LwdHostStager:
         commit 期不再搬数据,``publish_received`` 只做高水位发布。
         """
         rows = list(num_tokens_per_req)
+        _t0 = time.monotonic()
+        _alloc_ms = 0.0
         total_rows = sum(rows)
         tail_per_row = 4 * num_hash_layers * num_experts_per_tok
         expect = total_rows * hidden_size + (total_rows * tail_per_row)
@@ -500,6 +502,10 @@ class LwdHostStager:
                             f"seqno={seqno} req={rid}: chunk end "
                             f"{row_base[i] + n} exceeds prompt_len={plen}"
                         )
+                    # [Lwd][perf] pinned 分配耗时与 prompt 长度强相关
+                    # (长 prompt 单次可达几十~几百 ms),且在通信线程持锁
+                    # 执行 —— 长序列 TTFT 劣化的头号嫌疑,逐请求留证。
+                    _ta = time.monotonic()
                     host = LwdReqEmbed(
                         req_id=rid,
                         host=self._make_host_buffer(
@@ -513,6 +519,16 @@ class LwdHostStager:
                         num_hash_layers=num_hash_layers,
                         num_experts_per_tok=num_experts_per_tok,
                     )
+                    _a = (time.monotonic() - _ta) * 1000
+                    _alloc_ms += _a
+                    if _a > 2.0:
+                        logger.info(
+                            "[Lwd][perf] host-alloc req=%s rows=%d "
+                            "dur=%.2fms (%.1fMiB pinned)",
+                            rid, plen, _a,
+                            plen * (hidden_size + tail_per_row) * 2
+                            / 2 ** 20,
+                        )
                     self._reqs[rid] = host
                     self._host_bytes += (
                         plen * (hidden_size + tail_per_row) * 2
@@ -569,6 +585,14 @@ class LwdHostStager:
             self._batches[seqno] = batch
             self._batch_reqs[seqno] = list(req_ids)
             self._arrival_plan[seqno] = plan
+        # [Lwd][perf] 提交期建行表耗时(通信线程持锁):dur 大且 alloc 占比
+        # 高 = pinned 分配慢(长 prompt);alloc≈0 而 dur 大 = 锁/记账开销。
+        logger.info(
+            "[Lwd][perf] PLAN seqno=%d dur=%.2fms alloc=%.2fms reqs=%d "
+            "rows=%d host_MB=%.1f",
+            seqno, (time.monotonic() - _t0) * 1000, _alloc_ms,
+            len(req_ids), total_rows, self._host_bytes / 2 ** 20,
+        )
         return segments
 
     # ------------------------------------------------------------------ #
