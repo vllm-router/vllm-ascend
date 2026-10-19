@@ -61,6 +61,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_HOST_STAGE": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_HOST_STAGE", 0)
     ),
+    # Per-step execute_model wall-time probe on the NPU worker (one INFO log
+    # per step: "[Perf] exec total=...").  Off by default; enable it to
+    # A/B step-time against the LWD cloud worker's `cloud-exec total`
+    # probe (same measurement point: wall time of model_runner.execute_model,
+    # CPU-side, no device sync).
+    "VLLM_ASCEND_PERF_EXEC_TIMING": lambda: int(
+        os.getenv("VLLM_ASCEND_PERF_EXEC_TIMING", 0)
+    ),
     # Number of device ping-pong slots the host-staging pool owns. Each
     # slot is one full-size batch buffer, so this bounds NPU receive
     # occupancy independently of how many requests are held on the host.
