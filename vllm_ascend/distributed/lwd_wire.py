@@ -34,23 +34,6 @@ _LWD_ENDPOINTS: list[tuple[int, int]] = []
 _INITIALIZED = False
 
 
-def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
-    """调试:打印数据面张量摘要,供边云两端成对对比数值。
-
-    tag 形如 "[Lwd][DUMP][req=...][seqno=...] SEND/RECV ...";
-    fp32 统一精度,输出 shape/dtype/首尾各 10 个数/sum/mean。
-    """
-    import numpy as np
-
-    flat = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)
-    with np.printoptions(threshold=np.inf, linewidth=10000, precision=8):
-        logger.info(
-            "%s shape=%s dtype=%s head10=%s tail10=%s sum=%.6f mean=%.8f",
-            tag, tuple(tensor.shape), tensor.dtype,
-            flat[:10], flat[-10:], float(flat.sum()), float(flat.mean()),
-        )
-
-
 def init_lwd_duplex_channels() -> None:
     """Create the duplex channels: one UP/DOWN pair per cloud engine.
 
@@ -110,10 +93,11 @@ def init_lwd_duplex_channels() -> None:
             _LWD_CHANNEL_STREAMS[(engine_index, channel)] = torch.npu.Stream()
     _LWD_ENDPOINTS.clear()
     _LWD_ENDPOINTS.extend(endpoints)
-    # embeds 组内广播不再自建通信域(自建 new_group 在 torch_npu 下实测
-    # 零交付,疑建组顺序错位),改用框架 TP device_group(demo 同款,
-    # 建组顺序由框架保证);广播在注入时刻于计算流上发起,与前向 TP
-    # 集合同流 FIFO,天然不串台。
+    # embeds 组内广播不再自建通信域(仅指为组内 broadcast 额外自建的
+    # 同域 new_group 在 torch_npu 下实测零交付,疑建组顺序错位;
+    # UP/DOWN P2P 组不受此结论影响,已由 pg5 探针验证),改用框架
+    # TP device_group(demo 同款,建组顺序由框架保证);广播在注入时刻
+    # 于计算流上发起,与前向 TP 集合同流 FIFO,天然不串台。
     _INITIALIZED = True
     logger.info(
         "[lwd-wire] duplex channels created: engines=%d endpoints=%s "
@@ -170,10 +154,6 @@ def warmup_lwd_duplex_channels() -> None:
     )
 
 
-def lwd_channels_initialized() -> bool:
-    return _INITIALIZED
-
-
 def get_lwd_channel_device_group(
     channel: LwdChannelType, engine_index: int = 0
 ) -> dist.ProcessGroup:
@@ -191,33 +171,3 @@ def get_lwd_channel_stream(
     channel: LwdChannelType, engine_index: int = 0
 ) -> "torch.npu.Stream":
     return _LWD_CHANNEL_STREAMS[(engine_index, channel)]
-
-
-def destroy_lwd_duplex_channels() -> None:
-    global _INITIALIZED
-    for (engine, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
-        try:
-            dist.destroy_process_group(group)
-        except Exception:
-            logger.warning(
-                "[lwd-wire] failed to destroy group for engine=%d %s",
-                engine, channel.value,
-            )
-    _LWD_CHANNEL_GROUPS.clear()
-    _LWD_CHANNEL_STREAMS.clear()
-    _LWD_ENDPOINTS.clear()
-    _INITIALIZED = False
-
-
-def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
-    """调试:张量摘要打印(head10/tail10/sum/mean/shape/dtype),
-    供边云两端成对对比数值。"""
-    import numpy as np
-
-    flat = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)
-    with np.printoptions(threshold=np.inf, linewidth=10000, precision=8):
-        logger.info(
-            "%s shape=%s dtype=%s head10=%s tail10=%s sum=%.6f mean=%.8f",
-            tag, tuple(tensor.shape), tensor.dtype,
-            flat[:10], flat[-10:], float(flat.sum()), float(flat.mean()),
-        )
