@@ -613,4 +613,7 @@ class LwdEdgeWorker(NPUWorker):
             req_ids=batch_meta.req_ids,
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_token_ids,
+            # 捎带 UP send 完成水位:decode 期 embed 稀疏,unembed 是
+            # 更密的载具,封住"末批 send 完成无人报告"的尾随泄漏。
+            lwd_up_send_watermark=self._lwd_up_send_done_watermark(),
         )
