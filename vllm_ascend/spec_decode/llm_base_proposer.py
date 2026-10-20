@@ -418,7 +418,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         we share the target model's embedding layers with the draft model to save
         memory.
         """
-        if get_pp_group().world_size == 1:
+        lwd_cfg = getattr(self.vllm_config, "lwd_config", None)
+        # LWD prefill_only 的 pp=2 是拓扑推导值(边云两段拼组),不是原生
+        # 流水线——云侧 draft 与 target 同进程同设备,共享 embedding 安全;
+        # 原生 PP 守卫(pp>1 时两者不同设备)在此误伤,draft 会自载一份
+        # 词表分片(GLM5.1 实测每 TP0 卡 +~235MB)。
+        lwd_prefill_only = bool(
+            lwd_cfg is not None and lwd_cfg.enabled
+            and getattr(lwd_cfg, "mode", "") == "prefill_only"
+        )
+        if get_pp_group().world_size == 1 or lwd_prefill_only:
             if hasattr(target_language_model.model, "embed_tokens"):
                 target_embed_tokens = target_language_model.model.embed_tokens
             elif hasattr(target_language_model.model, "embedding"):

@@ -54,10 +54,16 @@ class LwdCommRequest:
     seqno: int | None = None
     # Explicit global peer rank; None -> the channel's configured peer.
     src_dst: int | None = None
-    # 多边多云数据面选路维度:指定该次通信属于哪个 (edge, cloud) 通信域。
-    # None -> 单边一云默认域(与旧行为逐位一致);上层按路由结果/来源边回填。
+    # 多边多云数据面选路维度:指定该次通信属于哪个 (edge, cloud, engine)
+    # 通信域。None -> 本进程身份回填(与旧行为逐位一致);上层按路由
+    # 结果/来源边回填。
     edge_id: int | None = None
     cloud_id: int | None = None
+    # 目标/来源云 engine(云内 DP 引擎序号,= 云进程的 dp_rank);多云 DP
+    # 下选择 per-engine 通道组与该 engine 的 seqno 流;单引擎恒 0。
+    # None -> 本进程身份回填。seqno 契约是 per-(edge, cloud, engine,
+    # channel, op) 的。
+    engine_index: int | None = None
     # Optional second payload of the SAME logical request (currently
     # UP-only: mrope positions, int64 [n,3], accompanying an embeds chunk
     # when the batch has mm data).  Physically a second P2P issued right

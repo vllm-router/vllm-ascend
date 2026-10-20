@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from types import NoneType
 
 import torch
@@ -449,6 +450,17 @@ class NPUWorker(WorkerBase):
             device = torch.device(f"npu:{self.local_rank}")
 
         torch.npu.set_device(device)
+        # [Lwd][dp-diag] rank↔设备映射(HCCL 建组失败排查的第一现场):
+        # 云内 DP 下两引擎的切片必须互不重叠(engine i 占物理卡
+        # [i*C,(i+1)*C));两引擎打到同一批卡即 MC2 comm init UNAVAIL
+        logger.info(
+            "[Lwd][dp-diag] worker device assignment: rank=%s "
+            "local_rank=%s device=%s ASCEND_RT_VISIBLE_DEVICES=%s "
+            "dp_rank=%s",
+            getattr(self, "rank", "?"), self.local_rank, device,
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "<unset>"),
+            self.parallel_config.data_parallel_rank,
+        )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -556,6 +568,23 @@ class NPUWorker(WorkerBase):
             )
             return kv_cache_memory_bytes
 
+        # [Lwd][mem-debug] 记录分配历史(含瞬态分配,profile 的 +1GB
+        # 峰值就靠它定位)——必须在 profile 之前开录
+        if envs_ascend.VLLM_ASCEND_LWD_MEM_DEBUG:
+            try:
+                # 优先录 Python 栈(C++ 栈在 libtorch_npu 无符号时全是
+                # CapturedTraceback::gather,定位不到调用点)
+                torch.npu.memory._record_memory_history(
+                    max_entries=200000, stacks="python"
+                )
+            except TypeError:
+                torch.npu.memory._record_memory_history(max_entries=200000)
+            except Exception:
+                logger.warning(
+                    "[Lwd][mem-debug] record_memory_history unsupported",
+                    exc_info=True,
+                )
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -593,7 +622,64 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
 
-        logger.debug(profile_result)
+        # [Lwd][mem-debug] VLLM_ASCEND_LWD_MEM_DEBUG=1 时把 torch 显存分解
+        # 打全(profile 结束点):all.peak=分配峰值,all.reserved=预留,
+        # 差值≈碎片/未用预留;两侧部署(LWD vs 集中式)对比该行即可定位
+        # torch_peak 差额的构成。
+        if envs_ascend.VLLM_ASCEND_LWD_MEM_DEBUG:
+            stats = torch.npu.memory_stats(self.device)
+            logger.info(
+                "[Lwd][mem-debug] rank=%s allocated_cur=%.2fGiB "
+                "allocated_peak=%.2fGiB reserved_cur=%.2fGiB "
+                "reserved_peak=%.2fGiB num_segments=%d",
+                getattr(self, "rank", "?"),
+                stats.get("allocated_bytes.all.current", 0) / GiB_bytes,
+                stats.get("allocated_bytes.all.peak", 0) / GiB_bytes,
+                stats.get("reserved_bytes.all.current", 0) / GiB_bytes,
+                stats.get("reserved_bytes.all.peak", 0) / GiB_bytes,
+                stats.get("segment.all.current", 0),
+            )
+            # 不落盘:进程内聚合分配历史,按调用栈打印 Top-10 大额分配
+            # (含瞬态),日志直接可看
+            try:
+                from torch.npu.memory import _snapshot
+
+                agg: dict[str, list] = {}
+                for dev_trace in _snapshot().get("device_traces") or []:
+                    for ev in dev_trace:
+                        if ev.get("action") != "alloc":
+                            continue
+                        size = int(ev.get("size", 0))
+                        frames = ev.get("frames") or []
+                        key = " <- ".join(
+                            f"{f.get('name', '?')}"
+                            f"({f.get('filename', '?').split('/')[-1]}"
+                            f":{f.get('line', '?')})"
+                            for f in frames[:8]
+                        ) or "<no frames>"
+                        entry = agg.setdefault(key, [0, 0, 0])
+                        entry[0] += size
+                        entry[1] += 1
+                        entry[2] = max(entry[2], size)
+                top = sorted(
+                    agg.items(), key=lambda kv: kv[1][2], reverse=True
+                )[:10]
+                for key, (total, count, peak) in top:
+                    logger.info(
+                        "[Lwd][mem-debug] top-alloc max=%.2fGiB "
+                        "total=%.2fGiB n=%d: %s",
+                        peak / GiB_bytes, total / GiB_bytes, count, key,
+                    )
+            except Exception:
+                logger.warning("[Lwd][mem-debug] history aggregation failed",
+                               exc_info=True)
+
+        # 非 mem-debug 时保持基线 debug 级(原生部署行为不变);
+        # mem-debug 的分解明细已在上方 INFO 块输出
+        if envs_ascend.VLLM_ASCEND_LWD_MEM_DEBUG:
+            logger.info(profile_result)
+        else:
+            logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )

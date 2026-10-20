@@ -87,6 +87,10 @@ class LwdCloudWorker(NPUWorker):
         # Payload scramble: bind the two static factors once; the per-flight
         # seed is derived by the comm layer from each request's own fields.
         self._build_payload_scrambler()
+        # 本进程所属云 engine(= 云实例内的 dp_rank):数据面通道组按
+        # (edge, cloud, engine, channel) 键索引,本进程只有本 engine
+        # 的通道有真实对端;端点判定也按引擎内轮转域核对。
+        self._lwd_engine_index = self.parallel_config.data_parallel_rank
         # per-edge DOWN seqno counter (worker layer, send-time alloc);
         # 多边各边独立 seqno 流。
         self._lwd_down_next_seqno: dict[int, int] = {}
@@ -249,7 +253,13 @@ class LwdCloudWorker(NPUWorker):
             return
         edge_id = meta.edge_id
         if edge_id in self._lwd_early_recv_edges:
-            # 端点:取通信线程提前挂好的 recv(没挂好就现场补挂)
+            # 端点(按本引擎的轮转域判定,None -> 本进程 engine 回填):
+            # 取通信线程提前挂好的 recv(没挂好就现场补挂)。
+            # mrope positions 已改走控制面(LwdRangeItem.mrope_positions
+            # 随 meta 到达,wire_version>=2),UP recv 只挂 embeds 主帧,
+            # _lwd_build_up_recv_request 的 aux_num_elements 恒 0——
+            # 若残留非零,预挂的 aux irecv 永远收不到数据,水位停摆。
+            # aux 帧机制保留在通道层供 deepstack 等扩展。
             future = self.get_or_post_early_recv(edge_id, batch.seqno,
                                                  num_tokens)
         else:
@@ -679,7 +689,8 @@ class LwdCloudWorker(NPUWorker):
 
     # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
     # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内
-    # 现场广播),worker 层只保留 post 侧;aux(mrope)帧同路径消费。
+    # 现场广播),worker 层只保留 post 侧;mrope positions 自
+    # wire_version 2 起走控制面,aux 帧不再用于 mrope。
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -705,9 +716,11 @@ class LwdCloudWorker(NPUWorker):
                      req_ids) in payloads:
                     # 全 rank 同序递增,保持 seqno 全局一致(与端点卡对齐)
                     seqno = self._lwd_next_down_seqno(edge_id)
-                    # 端点随 edge_id 轮转:仅本卡是该 edge 的 DOWN 端点才发送
+                    # 端点随 edge_id 在本引擎 C 卡内轮转:仅本卡是该
+                    # edge 的 DOWN 端点才发送
                     if lwd_wire.is_lwd_channel_endpoint(
-                        LwdChannelType.DOWN, edge_id=edge_id, cloud_id=None
+                        LwdChannelType.DOWN, edge_id=edge_id, cloud_id=None,
+                        engine_index=self._lwd_engine_index,
                     ):
                         logger.info(
                             "[Lwd][cloud-worker] DOWN send edge=%d seqno=%d "
@@ -722,6 +735,7 @@ class LwdCloudWorker(NPUWorker):
                                 tensor=hidden,
                                 seqno=seqno,
                                 edge_id=edge_id,
+                                engine_index=self._lwd_engine_index,
                             )
                         )
                     if is_driver:

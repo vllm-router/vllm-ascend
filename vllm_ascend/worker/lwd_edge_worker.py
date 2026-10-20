@@ -352,6 +352,7 @@ class LwdEdgeWorker(NPUWorker):
             tensor=payload,
             seqno=seqno,
             cloud_id=batch_meta.cloud_id,
+            engine_index=getattr(batch_meta, "engine_index", 0),
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -370,31 +371,43 @@ class LwdEdgeWorker(NPUWorker):
     # Multimodal (image) merge helpers                                     #
     # ------------------------------------------------------------------ #
 
-    def _lwd_mm_encoder_outputs(self, req_id: str) -> list:
-        """视觉塔输出(请求级惰性计算+缓存):[(mm_position, embeds)]。
+    def _lwd_mm_encode_missing(self, req_ids: list) -> None:
+        """批级编码:聚合本批全部请求的未编码特征,按 modality 一次组批
+        过视觉塔,结果回填 _lwd_mm_embeds_dict(按请求分桶)。
 
-        embeds 按 mm_hash 语义本应跨请求共享,这里按请求缓存(单请求
-        组批下重复图极少);输出常驻至该请求 chunk 流越过全部 mm 窗口。"""
-        cached = self._lwd_mm_embeds_dict.get(req_id)
-        if cached is not None:
-            return cached
-        features = self._lwd_mm_features_dict.get(req_id)
-        if not features:
-            return []
-        missing = [f.identifier for f in features if f.data is None]
-        if missing:
-            # data 缺失即无法计算图像 embeds——静默跳过 = 图像 token 按
-            # 文本嵌入错算,fail-fast。
+        跨请求组批与集中式 _execute_mm_encoder 同构(整批一次前向而
+        非逐请求 N 次):ViT eager 下单次调用的固定开销(逐算子
+        dispatch/H2D/同步)占比高,逐请求串行会把它支付 N 倍,且这些
+        串行调用压在 worker 的 embed 执行里、堵住后续 unembed 交付。
+        回填顺序 = 收集顺序(req_ids 序 × 请求内特征序),组批输出按
+        同序消费——错序即张冠李戴错算,总数断言兜底。"""
+        pending: list[tuple[str, object]] = []  # (req_id, feature)
+        missing_data = []
+        for req_id in req_ids:
+            if req_id in self._lwd_mm_embeds_dict:
+                continue
+            for f in self._lwd_mm_features_dict.get(req_id) or []:
+                if f.data is None:
+                    # data 缺失即无法计算图像 embeds——静默跳过 = 图像
+                    # token 按文本嵌入错算,fail-fast。
+                    missing_data.append((req_id, f.identifier))
+                else:
+                    pending.append((req_id, f))
+        if missing_data:
             raise RuntimeError(
-                f"[Lwd] mm feature data missing for req={req_id} "
-                f"(mm_hashes={missing}): cannot compute image embeddings; "
+                f"[Lwd] mm feature data missing: {missing_data}; "
+                "cannot compute image embeddings; "
                 "check mm processor/receiver cache chain"
             )
+        if not pending:
+            return
+        _t_enc = time.monotonic()
         model = self.model_runner.get_model()
         from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
-        mm_kwargs = [(f.modality, f.data) for f in features]
+        mm_kwargs = [(f.modality, f.data) for _, f in pending]
         outputs_by_modality: dict[str, list] = {}
+        num_outputs = 0
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.model_runner.device,
@@ -403,28 +416,52 @@ class LwdEdgeWorker(NPUWorker):
             batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
             assert len(batch_outputs) == num_items, (
                 f"encoder outputs {len(batch_outputs)} != items "
-                f"{num_items} (req={req_id}, modality={modality})"
+                f"{num_items} (modality={modality})"
             )
             outputs_by_modality.setdefault(modality, []).extend(batch_outputs)
-        result = []
-        for feature in features:
-            result.append(
-                (feature.mm_position, outputs_by_modality[feature.modality].pop(0))
-            )
-        self._lwd_mm_embeds_dict[req_id] = result
-        logger.info(
-            "[Lwd][edge-worker] mm encoder done: req=%s items=%d",
-            req_id, len(result),
+            num_outputs += len(batch_outputs)
+        assert num_outputs == len(pending), (
+            f"encoder outputs {num_outputs} != pending features "
+            f"{len(pending)}"
         )
-        return result
+        for req_id, feature in pending:
+            embeds = outputs_by_modality[feature.modality].pop(0)
+            self._lwd_mm_embeds_dict.setdefault(req_id, []).append(
+                (feature.mm_position, embeds)
+            )
+        # [Lwd][perf] 视觉塔耗时(批级,仅未编码请求计次)
+        logger.info(
+            "[Lwd][perf] mm-encoder reqs=%d items=%d dur=%.2fms",
+            len(req_ids), len(pending),
+            (time.monotonic() - _t_enc) * 1000,
+        )
+
+    def _lwd_mm_encoder_outputs(self, req_id: str) -> list:
+        """视觉塔输出的只读视图:[(mm_position, embeds)]。
+
+        编码已前移到批级(_lwd_mm_encode_missing,整批一次组批);本处
+        只读缓存,有特征但未编码即批级编码漏编,fail-fast。embeds 按
+        请求缓存,输出常驻至该请求 chunk 流越过全部 mm 窗口。"""
+        cached = self._lwd_mm_embeds_dict.get(req_id)
+        if cached is not None:
+            return cached
+        features = self._lwd_mm_features_dict.get(req_id)
+        if not features:
+            return []
+        raise RuntimeError(
+            f"[Lwd] mm embeds missing from batch encode: req={req_id} "
+            f"(mm_hashes={[f.identifier for f in features]})"
+        )
 
     def _lwd_gather_chunk_mm(self, batch_meta: LwdEmbedBatch):
         """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
 
-        窗口语义逐字对齐原生 _gather_mm_embeddings:feature 的占位区间
-        [offset, offset+length) 与 chunk 窗口 [p_offset, p_offset+n) 求交,
-        相交段切 embeds 行、置掩码位;图像跨 chunk 时逐段收集。同时完成
-        越过全部 mm 窗口请求的缓存摘除。"""
+        编码在切片之前批级完成(整批一次组批,见 _lwd_mm_encode_missing),
+        之后逐请求只读缓存切片。窗口语义逐字对齐原生
+        _gather_mm_embeddings:feature 的占位区间 [offset, offset+length)
+        与 chunk 窗口 [p_offset, p_offset+n) 求交,相交段切 embeds 行、
+        置掩码位;图像跨 chunk 时逐段收集。同时完成越过全部 mm 窗口
+        请求的缓存摘除。"""
         total = sum(len(t) for t in batch_meta.token_ids)
         is_mm = torch.zeros(total, dtype=torch.bool)
         mm_embeds: list = []
@@ -432,6 +469,7 @@ class LwdEdgeWorker(NPUWorker):
         # 做窗口对账)。
         if len(batch_meta.prompt_offsets) != len(batch_meta.req_ids):
             return mm_embeds, is_mm
+        self._lwd_mm_encode_missing(batch_meta.req_ids)
         req_start = 0
         for req_id, token_ids, p_offset in zip(
             batch_meta.req_ids, batch_meta.token_ids, batch_meta.prompt_offsets
@@ -485,6 +523,7 @@ class LwdEdgeWorker(NPUWorker):
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
                 cloud_id=batch_meta.cloud_id,
+                engine_index=getattr(batch_meta, "engine_index", 0),
             )
         )
         _t_post = time.monotonic()
