@@ -696,6 +696,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         else:
             dev.record_stream(torch.npu.current_stream())
 
+    @staticmethod
     def _lwd_decode_expert_ids(seg, w: int, num_layers: int, top_k: int):
         """把窗口的专家 ID 字节段解成 ``[w, L, K]`` int32。
 
