@@ -15,7 +15,7 @@ NPU驱动和固件参考：[Atlas A2 中心推理和训练硬件 26.0.RCx NPU驱
 
 （2）一体机服务器
 
-操作系统安装参考：[Atlas服务器openEuler 22.03 LTS SP4 操作系统安装](https://support.huawei.com/enterprise/zh/doc/EDOC1100469526/426cffd9?idPath=23710424|269761314|269769397|269769917|254184887)
+操作系统安装参考：[Atlas服务器openEuler 24.03 LTS SPX 操作系统安装](https://support.huawei.com/enterprise/zh/doc/EDOC1100492838/426cffd9?idPath=23710424|269761314|269769397|269769917|261457531)
 
 NPU驱动和固件安装参考：[Atlas A2 中心推理和训练硬件 26.0.RCx NPU驱动和固件](https://support.huawei.com/enterprise/zh/doc/EDOC1100568431/426cffd9?idPath=23710424|269761314|269769397|269769917|254184887)
 
