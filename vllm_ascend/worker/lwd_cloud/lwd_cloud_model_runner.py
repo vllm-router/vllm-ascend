@@ -485,7 +485,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                 plan.append((rid, w))
         if not plan:
             return None, None
-        # 本步各请求的取数起点(供注入侧切专家 ID 尾段):每步重开。
+        # 本步各请求的取数起点(供下方切专家 ID 尾段随帧广播):每步重开。
         self._lwd_step_tail_base: dict[str, int] = {}
         import torch.distributed as dist
         from vllm.distributed.parallel_state import get_tp_group
@@ -501,8 +501,17 @@ class LwdCloudModelRunner(NPUModelRunner):
                 "(host staging is mandatory in this deployment)"
             )
         total_rows = sum(w for _r, w in plan)
+        config = self.model_config.hf_config
+        num_hash_layers = hash_layer_count(config)
+        # 专家 ID 尾段每行的 bf16 元素数(Qwen 为 0):尾段与 embeds 同帧
+        # 进窗口缓冲并随 TP 广播,非端点 rank 才有专家 ID 可喂
+        # lwd_hash_state(此前尾段只留在端点 host,TP>1 必崩)。
+        per_row_tail = (
+            4 * num_hash_layers * int(getattr(config, "num_experts_per_tok", 0) or 0)
+        )
+        embed_numel = total_rows * hidden_size
         if _is_endpoint:
-            dev, win_idx = self._lwd_window_device(total_rows * hidden_size)
+            dev, win_idx = self._lwd_window_device(embed_numel + total_rows * per_row_tail)
             stream = self._lwd_h2d_stream()
             # WAR 门:旁流开写这块缓冲前,等它上一次被计算流消费(inject +
             # broadcast)完;按步轮换下该事件正常早已就绪,wait 只是顺序
@@ -513,11 +522,25 @@ class LwdCloudModelRunner(NPUModelRunner):
                 if used_ev is not None:
                     stream.wait_event(used_ev)
                 offset = 0
+                tail_offset = 0
                 for rid, w in plan:
                     self._lwd_stage_one_request(
                         stager, rid, w, dev, offset, hidden_size
                     )
                     offset += w * hidden_size
+                    if per_row_tail:
+                        # 同请求尾段紧随 embeds 区之后按行序拼接;取数起点
+                        # 用 stage 时记录的推进前读指针。
+                        req = stager.take_req(rid)
+                        t_start, _ = req.tail_range_at(
+                            self._lwd_step_tail_base[rid], w
+                        )
+                        n = w * per_row_tail
+                        dev[embed_numel + tail_offset: embed_numel + tail_offset + n].copy_(
+                            req.host[t_start: t_start + n],
+                            non_blocking=True,
+                        )
+                        tail_offset += n
                 ready_ev = torch.npu.Event()
                 ready_ev.record(stream)
             # 事件门:计算流在随后的 broadcast/inject 前等拷贝完成 ——
@@ -534,10 +557,12 @@ class LwdCloudModelRunner(NPUModelRunner):
                 (time.monotonic() - _t0) * 1000,
             )
         else:
-            # 非端点 rank 没有 host 池:只按同样的**行数**分配接收缓冲,
-            # 等端点广播过来(行数必须一致,W4)。
+            # 非端点 rank 没有 host 池:只按同样的**行数**分配接收缓冲
+            # (embeds + 尾段),等端点广播过来(行数必须一致,W4)。
             dev = torch.empty(
-                total_rows * hidden_size, dtype=torch.bfloat16, device="npu"
+                embed_numel + total_rows * per_row_tail,
+                dtype=torch.bfloat16,
+                device="npu",
             )
             win_idx = None
         if _tp.world_size > 1 and dev.numel() > 0:
@@ -558,18 +583,29 @@ class LwdCloudModelRunner(NPUModelRunner):
         return stream
 
     def _lwd_window_device(self, numel: int) -> tuple[torch.Tensor, int]:
-        """窗口暂存设备缓冲(§4.5):``budget × H`` 大小,**双缓冲轮换**。
+        """窗口暂存设备缓冲(§4.5):``budget × 每行载荷`` 大小,**双缓冲轮换**。
 
         双缓冲是旁流 H2D 的前提:拷贝在独立拷贝流上发射(与上一步
         forward 并行),计算流消费前只等一个 ready event;隔批轮换 +
         消费事件(``_lwd_win_used_ev``)保证旁流不会在计算流还没读完时
         覆写同一块(WAR)。
+
+        每行载荷 = hidden + 可选专家 ID 尾段(``4 × hash_layers × top_k``,
+        DSv4):尾段随 embeds 同帧进窗口缓冲并一起 TP 广播,非端点 rank
+        才能拿到专家 ID 喂自己的 ``lwd_hash_state``。
         """
         bufs = getattr(self, "_lwd_win_dev", None)
         if bufs is None or bufs[0].numel() < numel:
+            config = self.model_config.hf_config
+            per_row = int(getattr(self.worker, "_lwd_up_hidden_size", 0) or 0)
+            per_row += (
+                4
+                * hash_layer_count(config)
+                * int(getattr(config, "num_experts_per_tok", 0) or 0)
+            )
             cap = max(
                 numel,
-                int(getattr(self.worker, "_lwd_up_hidden_size", 0) or 0)
+                per_row
                 * int(
                     getattr(
                         getattr(self.vllm_config, "scheduler_config", None),
@@ -630,8 +666,8 @@ class LwdCloudModelRunner(NPUModelRunner):
                     f"staging {w} rows at consumed={consumed_before} but "
                     f"the prompt is only {int(num_prompt[idx])} rows"
                 )
-        # 记录本步的取数起点(供注入侧切专家 ID 尾段;consumed 指针在
-        # harvest 末尾才推进,注入侧不能直接读它)
+        # 记录本步的取数起点(供 harvest 切专家 ID 尾段随帧广播;consumed
+        # 指针在 harvest 末尾才推进,切尾段时不能直接读它)
         self._lwd_step_tail_base[rid] = consumed_before
         buf[elem_offset: elem_offset + numel].copy_(
             stager.take_req(rid).host[host_start: host_start + numel],
@@ -649,10 +685,11 @@ class LwdCloudModelRunner(NPUModelRunner):
         The base fill loop is skipped for LWD placeholder rows (see
         ``_prepare_inputs``); our device write is authoritative.
 
-        专家 ID(DSv4)不上设备,直接从**该请求自己的** host buffer 尾段
-        按同一窗口切出来记账(§4.6);窗口起点用 harvest 记录的**推进前**
-        读指针(``_lwd_step_tail_base``)——直接读 consumed 会拿到推进后
-        的值,取到下一个窗口的专家 ID(真机踩过)。
+        专家 ID(DSv4)与 embeds **同帧**进窗口缓冲并随 TP 广播(§4.6
+        改版):各 rank 从共享窗口的尾段区切同一窗口喂自己的
+        ``lwd_hash_state`` —— 非端点 rank 没有 host 暂存,广播是它唯一
+        的专家 ID 来源。取数不再依赖 stager/推进前指针,广播布局的行序
+        (与 harvest 的 plan 同序)即权威。
         """
         if dev is None:
             return
@@ -662,7 +699,9 @@ class LwdCloudModelRunner(NPUModelRunner):
         gpu_embeds = self.inputs_embeds.gpu
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
-        stager = self.worker._lwd_stager if self.worker is not None else None
+        per_row_tail = (
+            4 * num_hash_layers * int(getattr(config, "num_experts_per_tok", 0) or 0)
+        )
 
         # Flattened output offset per request (native fill loop 同款累计)
         out_offset: dict[str, int] = {}
@@ -673,7 +712,18 @@ class LwdCloudModelRunner(NPUModelRunner):
                 int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens)
                 else 0
             )
-        embeds = dev.view(-1, hidden_size)
+        # embeds 区是 dev 的前 total_rows×H 个元素,专家尾段区紧随其后;
+        # 行数推导与 harvest 的 plan 逐字同款。
+        total_rows = 0
+        for idx in range(min(len(self.input_batch.req_ids), len(num_scheduled_tokens))):
+            w = int(num_scheduled_tokens[idx])
+            ncomp = int(num_computed[idx])
+            nprog = int(num_prompt[idx])
+            if ncomp >= nprog or w <= 0:
+                continue
+            total_rows += min(w, nprog - ncomp)
+        embed_numel = total_rows * hidden_size
+        embeds = dev[:embed_numel].view(-1, hidden_size)
         row = 0
         for idx, req_id in enumerate(self.input_batch.req_ids):
             if idx >= len(num_scheduled_tokens):
@@ -686,25 +736,11 @@ class LwdCloudModelRunner(NPUModelRunner):
             w = min(w, nprog - ncomp)
             if w <= 0:
                 continue
-            if self.lwd_hash_state is not None and stager is not None:
-                # 专家 ID 按**同一窗口**推进(§4.6);暂存路径的尾段在
-                # host 上是逐请求的权威副本,起点用推进前的读指针。
+            if self.lwd_hash_state is not None:
                 top_k = config.num_experts_per_tok
-                staged_req = stager.take_req(req_id)
-                if staged_req is None:
-                    raise ValueError(
-                        f"[Lwd][cloud-runner] expert tail for {req_id} "
-                        f"unavailable: not staged"
-                    )
-                t_base = self._lwd_step_tail_base.get(req_id)
-                if t_base is None:
-                    raise ValueError(
-                        f"[Lwd][cloud-runner] expert tail base for "
-                        f"{req_id} missing (harvest did not stage it)"
-                    )
-                t_start, _t_end = staged_req.tail_range_at(t_base, w)
-                seg = staged_req.host[t_start: t_start + w * 4
-                                      * num_hash_layers * top_k]
+                seg = dev[
+                    embed_numel + row * per_row_tail: embed_numel + (row + w) * per_row_tail
+                ]
                 ids = self._lwd_decode_expert_ids(
                     seg, w, num_hash_layers, top_k,
                 )
@@ -734,14 +770,16 @@ class LwdCloudModelRunner(NPUModelRunner):
     def _lwd_decode_expert_ids(seg, w: int, num_layers: int, top_k: int):
         """把窗口的专家 ID 字节段解成 ``[w, L, K]`` int32。
 
-        与 ``unpack_hash_payload`` 逐位同款:线序是 uint8 字节流,按 int32
-        视图解释(不能按 bf16 数值解释)。窗口化后段是 host 上的切片,
-        所以这里只做视图转换,不再触发设备往返。
+        与 ``unpack_hash_payload`` 同款**数值**转换:线序是每个 bf16 元素
+        存一个字节值(0-255,bf16 精确可表示),先 ``.to(torch.uint8)``
+        数值转回字节,再按 int32 视图重组。**不能**用
+        ``.view(torch.uint8)`` —— 那是把 bf16 位模式重解释成两个字节,
+        值错且元素数翻倍,下游 reshape 必炸。
         """
         return (
             seg.contiguous()
-            .view(torch.uint8)
-            .to(torch.int32)
+            .to(torch.uint8)
+            .view(torch.int32)
             .view(w, num_layers, top_k)
         )
 

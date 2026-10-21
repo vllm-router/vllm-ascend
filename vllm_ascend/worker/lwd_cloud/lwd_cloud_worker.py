@@ -304,12 +304,20 @@ class LwdCloudWorker(NPUWorker):
         slots = envs.VLLM_ASCEND_LWD_HOST_STAGE_SLOTS or (
             self._early_recv_max_inflight
         )
-        # slot 尺寸上限:一个批的最大 token 数 × hidden。取不到调度上限时留 0
+        # slot 尺寸上限:一个批的最大 token 数 × 每行载荷。取不到调度上限时留 0
         # —— 池按首个批的实际 numel 懒建,后续更大的批自动扩容,只是少了
         # "提前按上限预留"这一层保护。
+        # 每行载荷必须用 hash 载荷公式(embeds + 可选专家 ID 尾段):DSv4
+        # 的接收 numel 按 hash_payload_numel 计(_lwd_build_up_recv_request),
+        # 这里若只算 hidden,每个批都会被 allocate 的几何校验拒掉,水位停摆。
         sched_cfg = getattr(self.vllm_config, "scheduler_config", None)
         max_tokens = getattr(sched_cfg, "max_num_batched_tokens", 0) or 0
-        max_numel = max_tokens * hidden_size
+        max_numel = hash_payload_numel(
+            max_tokens,
+            hidden_size,
+            hash_layer_count(self.model_config.hf_config),
+            getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
+        )
         self._lwd_stager = LwdHostStager(
             device=self.device,
             slots=slots,
