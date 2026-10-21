@@ -82,12 +82,46 @@ class LwdCloudModelRunner(NPUModelRunner):
     def _update_states(self, scheduler_output):
         # Called inside synchronize_input_prep(), before remove_request()
         # destroys the previous mapping and before any new graph replay.
+        self._lwd_rewind_staged_reads(scheduler_output)
         if self._lwd_draft_cache is not None:
             self._lwd_draft_cache.preserve(
                 scheduler_output, self.requests,
                 self.input_batch.prev_req_id_to_index, self._draft_token_ids,
             )
         return super()._update_states(scheduler_output)
+
+    def _lwd_rewind_staged_reads(self, scheduler_output) -> None:
+        """重算回退:调度水位退到 stager 读指针之下 = 云侧 KV 抢占重算。
+
+        原生抢占释放全部 KV 并把 ``num_computed_tokens`` 归零
+        (``Scheduler._preempt_request``);pinned host 载荷活到请求结束
+        (design v7 §6.1),整条 prompt 可本地重读,只有读指针要回退 ——
+        与 ``NPUModelRunner._update_states`` 里 KV-load-failure 的
+        rewind 守卫同型。必须在 harvest 之前完成(本方法就是):harvest
+        的恒等式校验要求 ``consumed == num_computed``(见
+        ``_lwd_stage_one_request``),抢占后不回退会在那里当场炸。
+
+        只按"回退"触发(consumed > 上报水位),不看 resumed_req_ids:
+        正常爬坡里调度水位恒 ≥ 读指针(spec 拒绝的回退发生在 decode
+        段,到不了 prompt 段),误触发面为零。非端点 rank 没有暂存池,
+        直接跳过。
+        """
+        worker = self.worker
+        stager = getattr(worker, "_lwd_stager", None) if worker is not None else None
+        if stager is None:
+            return
+        req_data = scheduler_output.scheduled_cached_reqs
+        for req_id, new_computed in zip(
+            req_data.req_ids, req_data.num_computed_tokens
+        ):
+            consumed = stager.consumed_rows(req_id)
+            if consumed > new_computed:
+                stager.rewind_consumed(req_id, new_computed)
+                logger.info(
+                    "[Lwd][cloud-runner] REWIND req=%s: host read pointer "
+                    "%d -> %d (preemption recompute; payload retained)",
+                    req_id, consumed, new_computed,
+                )
 
     def _prepare_input_ids(self, scheduler_output, num_reqs,
                            total_num_scheduled_tokens, cu_num_tokens):

@@ -232,6 +232,31 @@ class LwdReqEmbed:
                 f"prompt_rows {self.prompt_rows}"
             )
 
+    def rewind_consumed(self, to_rows: int) -> None:
+        """Roll the read pointer back to ``to_rows`` for a local recompute.
+
+        Cloud-side KV preemption frees the blocks and zeroes the request's
+        ``num_computed_tokens``; the next schedule re-dispatches the prompt
+        from row 0.  The pinned payload lives until the request ends (design
+        §6.1), and consumed rows are never overwritten by arrival writes
+        (those land at ``>= recv_rows``), so re-reading earlier rows is
+        legal - only the pointer moves.  ``recv_rows`` is untouched: the
+        arrival high-water mark stays valid, and the invariant
+        ``consumed <= recv_rows`` is preserved because the target never
+        exceeds the current pointer.
+
+        Raises:
+            LwdHostStageGeometryError: if the target is outside
+                ``[0, consumed]`` - a rewind past what was ever read would
+                desynchronise the stage/inject identity for good.
+        """
+        if to_rows < 0 or to_rows > self.consumed:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: rewind target {to_rows} outside "
+                f"[0, consumed={self.consumed}]"
+            )
+        self.consumed = to_rows
+
     def mark_aborted(self) -> None:
         """Freeze the remainder; already-computed rows are history, not undone."""
         self.aborted = True
@@ -663,6 +688,21 @@ class LwdHostStager:
         if req is None:
             raise LwdHostStageGeometryError(f"req={req_id}: not staged")
         req.note_consumed(n_rows)
+
+    def rewind_consumed(self, req_id: str, to_rows: int) -> bool:
+        """Roll a request's read pointer back for a local recompute.
+
+        Called by the runner when the scheduler's watermark regresses below
+        the staged read pointer (KV preemption zeroes num_computed_tokens).
+        Returns False when the request is unknown - e.g. it finished between
+        scheduling and execution under async scheduling; nothing to rewind.
+        """
+        with self._lock:
+            req = self._reqs.get(req_id)
+            if req is None:
+                return False
+            req.rewind_consumed(to_rows)
+        return True
 
     def abort_request(self, req_id: str) -> bool:
         """Freeze a request's remainder (design §6.3).  Frees nothing by itself."""
