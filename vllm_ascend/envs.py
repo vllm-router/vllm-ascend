@@ -59,6 +59,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_MEM_DEBUG": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_MEM_DEBUG", 0)
     ),
+    # LWD echo 校验的边侧超时(秒);云侧自动取 2 倍。
+    "VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S", 30)
+    ),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
     "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),
