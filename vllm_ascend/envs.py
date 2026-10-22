@@ -61,7 +61,49 @@ env_variables: dict[str, Callable[[], Any]] = {
     ),
     # LWD echo 校验的边侧超时(秒);云侧自动取 2 倍。
     "VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S": lambda: float(
-        os.getenv("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S", 30)
+        os.getenv("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S", 30),
+    ),
+    # LWD host staging (docs/design/lwd_host_staging.md): when set to 1, an UP
+    # batch is copied D2H into a rotating pinned receive buffer as soon as its
+    # receive completes, split into **per-request** pinned buffers (kept until
+    # the request ends), the device slot returns to a ping-pong pool right
+    # away, and the runner pulls back only the rows the cloud scheduler
+    # decided to compute this step. Default 0 = keep today's behaviour
+    # (full-size NPU receive buffer held until consumed) so the change can
+    # be A/B'd and rolled back with a single switch.
+    "VLLM_ASCEND_LWD_HOST_STAGE": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_HOST_STAGE", 0)
+    ),
+    # Max posted-but-unconsumed early UP receives (cloud endpoint).  Must be
+    # >= the edge's VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS, otherwise recvs are
+    # not posted deeply enough and widening the edge gate has no effect.
+    # In host-staging mode an in-flight entry is pure pipeline bookkeeping
+    # (the device slot is released once the D2H completes), so this no longer
+    # bounds NPU memory. Default 8 (edge gate defaults to 6, plus slack for
+    # consume-point re-posts). Range: >= 1.
+    "VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV", 8)
+    ),
+    # Per-step execute_model wall-time probe on the NPU worker (one INFO log
+    # per step: "[Perf] exec total=...").  Off by default; enable it to
+    # A/B step-time against the LWD cloud worker's `cloud-exec total`
+    # probe (same measurement point: wall time of model_runner.execute_model,
+    # CPU-side, no device sync).
+    "VLLM_ASCEND_PERF_EXEC_TIMING": lambda: int(
+        os.getenv("VLLM_ASCEND_PERF_EXEC_TIMING", 0)
+    ),
+    # Number of device ping-pong slots the host-staging pool owns. Each
+    # slot is one full-size batch buffer, so this bounds NPU receive
+    # occupancy independently of how many requests are held on the host.
+    # Unset (0) = derive it from the early-recv in-flight cap, which is the
+    # number of receives that can actually be in flight. Range: >= 1.
+    # NOTE: there is deliberately no host-memory cap. Storage lives until the
+    # request ends, so a cap would act as a concurrency admission gate and a
+    # mis-sized one would deadlock (data never staged -> never dispatched).
+    # If memory ever runs short the plan is LRU eviction plus an edge resend,
+    # which is not implemented yet.
+    "VLLM_ASCEND_LWD_HOST_STAGE_SLOTS": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_HOST_STAGE_SLOTS", 0)
     ),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.

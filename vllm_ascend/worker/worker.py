@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import time
 from types import NoneType
 
 import torch
@@ -710,7 +711,22 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if envs_ascend.VLLM_ASCEND_PERF_EXEC_TIMING:
+            # [Perf] 每步执行打点:与 LWD 云侧 cloud-exec total 同一测量点
+            # (model_runner.execute_model 的 wall time,纯 CPU 侧、不引入
+            # 设备同步),用于集中式 vs 分布式的纯 decode 步对比。
+            _t0 = time.monotonic()
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
+            logger.info(
+                "[Perf] exec total=%.2fms tokens=%d reqs=%d",
+                (time.monotonic() - _t0) * 1000,
+                scheduler_output.total_num_scheduled_tokens,
+                len(scheduler_output.num_scheduled_tokens),
+            )
+        else:
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 

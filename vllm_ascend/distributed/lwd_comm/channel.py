@@ -294,10 +294,12 @@ class LwdChannel:
         into: LwdCommFuture | None = None,
     ) -> LwdCommFuture:
         """Issue the wire op, bridge it onto the channel stream, record
-        the completion event."""
+        the completion event (and, for staged recvs, the D2H event)."""
         tensor: torch.Tensor | None = None
         aux_tensor: torch.Tensor | None = None
         keepalive: Any = None
+        staged_event: torch.npu.Event | None = None
+        staged_tensor: torch.Tensor | None = None
         stream = self._stream()
         # Capture the producer stream BEFORE entering the channel-stream
         # context: inside the `with` block torch.npu.current_stream() IS
@@ -335,6 +337,25 @@ class LwdChannel:
                 get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
+            if req.op == "recv" and req.stage_segments is not None:
+                # Host staging(design v7 §4.3 改版):提交期已按行表把本批
+                # 载荷切成逐请求段,这里把各段异步 D2H 直接落进各请求自己
+                # 的 pinned buffer —— 通信线程零 CPU 拷贝(H2H 拆分退役)。
+                # 分段 D2H 上**独立拷贝流**,与下一条 recv 真并行(同流串行
+                # 时线路在 D2H 期间空转,满批 ~5-16ms 全白等)。顺序保证:
+                #   1. 拷贝流先 wait 主帧完成事件(含解扰)—— 数据完整才开拷;
+                #   2. 全部 D2H 在同一拷贝流 → FIFO,分段完成序 = seqno 序,
+                #      就绪水位保持前缀(不变量 4);
+                #   3. staged_event 记在拷贝流末段之后:query()==true 即
+                #      本批全部分段已完整落 host,设备槽此刻才可归还。
+                copy_stream = self._copy_stream()
+                copy_stream.wait_event(done_event)
+                with torch.npu.stream(copy_stream):
+                    for dst, src_off, n in req.stage_segments:
+                        dst.copy_(tensor[src_off:src_off + n],
+                                  non_blocking=True)
+                    staged_event = torch.npu.Event()
+                    staged_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
             return LwdCommFuture(
@@ -344,6 +365,9 @@ class LwdChannel:
                 tensor=tensor,
                 keepalive=keepalive,
                 aux_tensor=aux_tensor,
+                staged_event=staged_event,
+                staged_tensor=staged_tensor,
+                slot=req.recv_slot,
             )
         into._bind(
             handles=handles,
@@ -351,6 +375,9 @@ class LwdChannel:
             tensor=tensor,
             keepalive=keepalive,
             aux_tensor=aux_tensor,
+            staged_event=staged_event,
+            staged_tensor=staged_tensor,
+            slot=req.recv_slot,
         )
         return into
 
@@ -358,6 +385,15 @@ class LwdChannel:
         return lwd_wire.get_lwd_channel_stream(
             self.channel_type, self.engine_index
         )
+
+    def _copy_stream(self):
+        """分段 D2H 的专用拷贝流(懒建,每通道一条):与通道流并行,把
+        D2H 从"两次 recv 之间"挪走 —— 线路不再在 D2H 期间空转。"""
+        stream = getattr(self, "_d2h_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._d2h_copy_stream = stream
+        return stream
 
     def _order_after(self, predecessor: LwdCommFuture | None) -> None:
         if predecessor is None:
@@ -423,9 +459,23 @@ class LwdChannel:
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
-        buffer = torch.empty(
-            req.num_elements, dtype=torch.bfloat16, device="npu"
-        )
+        # Host-staging callers (worker ping-pong pool) pass their own
+        # slot view in ``recv_buffer`` so the receive lands in memory the
+        # pool owns and can reuse the moment the D2H completes.
+        buffer = req.recv_buffer
+        if buffer is None:
+            buffer = torch.empty(
+                req.num_elements, dtype=torch.bfloat16, device="npu"
+            )
+        elif buffer.numel() != req.num_elements:
+            # HCCL P2P would fail on a mismatch, and a silent short/long
+            # buffer desynchronises the counterpart's isend; assert here
+            # so the failure names the pool slot instead of the wire.
+            raise RuntimeError(
+                f"recv_buffer numel {buffer.numel()} != requested "
+                f"num_elements {req.num_elements} on channel "
+                f"{self.channel_type.value} seqno={req.seqno}"
+            )
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
             # aux 帧尺寸 = num_tokens*3(mrope positions);dtype 取

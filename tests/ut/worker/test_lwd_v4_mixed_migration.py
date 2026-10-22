@@ -25,7 +25,7 @@ SPEC.loader.exec_module(routing)
 
 def load_methods(path, names, base=object, **globals_):
     """Compile real methods with a stub base to isolate hardware dependencies."""
-    tree = ast.parse((ROOT / path).read_text())
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -77,6 +77,41 @@ class TestHashTransport(unittest.TestCase):
         state.add_chunk("p", 4, 2, ids)
         with self.assertRaisesRegex(ValueError, "Missing LWD"):
             state.build_batch(["p"], [2], [0], [4])
+
+
+class TestStagedExpertIdDecode(unittest.TestCase):
+    """``_lwd_decode_expert_ids`` (staged window tail) must agree with the
+    authoritative pack/unpack transport — regression cover for the
+    ``.view(torch.uint8)`` -> ``.to(torch.uint8)`` fix (bit reinterpretation
+    of bf16 garbles values and doubles the element count)."""
+
+    def test_staged_decode_matches_pack_unpack(self):
+        cls = load_methods(RUNNER, {"_lwd_decode_expert_ids"})
+        decode = cls._lwd_decode_expert_ids
+        w, hidden, layers, top_k = 5, 4, 2, 3
+        embeds = torch.arange(w * hidden).reshape(w, hidden).to(torch.bfloat16)
+        # Include IDs above bf16 integer precision (the whole reason for
+        # byte encoding) and large values across the byte range.
+        ids = torch.randint(0, 65536, (w, layers, top_k), dtype=torch.int32)
+        ids[0, 0, 0] = 257
+        payload = routing.pack_hash_payload(embeds, ids)
+        tail = payload[w * hidden:]  # same layout as the staged window tail
+        actual = decode(tail, w, layers, top_k)
+        self.assertTrue(torch.equal(actual, ids))
+        _, unpack_ids = routing.unpack_hash_payload(payload, w, hidden, layers, top_k)
+        self.assertTrue(torch.equal(actual, unpack_ids))
+
+    def test_staged_decode_window_slice(self):
+        cls = load_methods(RUNNER, {"_lwd_decode_expert_ids"})
+        decode = cls._lwd_decode_expert_ids
+        rows, hidden, layers, top_k = 6, 4, 1, 2
+        embeds = torch.zeros(rows, hidden).to(torch.bfloat16)
+        ids = torch.arange(rows * layers * top_k, dtype=torch.int32).reshape(rows, layers, top_k) * 37
+        payload = routing.pack_hash_payload(embeds, ids)
+        per_row = 4 * layers * top_k
+        tail = payload[rows * hidden:]
+        seg = tail[2 * per_row: 4 * per_row]
+        self.assertTrue(torch.equal(decode(seg, 2, layers, top_k), ids[2:4]))
 
 
 class TestMixedEmbeddingMasks(unittest.TestCase):

@@ -67,42 +67,111 @@ logger = init_logger("vllm.lwd.pre_recv")
 #: ``init_device`` 里重建 reader —— 两侧只认这一处常量名。
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
-# 旁路 MQ 规格:每槽 1KB、共 64 槽。一批一条提示/上报,边侧 pending 闸门
-# (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)把未消费 chunk 数压在
+# 旁路 MQ 规格:每槽 4KB、共 64 槽。一批一条提示/上报,边侧 pending 闸门
+# (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS``)把未消费 chunk 数压在
 # 个位数,而提示是正确性依赖(丢一条 = 该 recv 不提前挂、水位不前进、闸门后的
 # 批永不下发),所以留足余量、不做流控。
-_SIDEBAND_MAX_CHUNK_BYTES = 1024
+#
+# 4KB(原 1KB)是为 host 暂存方案的 ``rows`` 逐请求行数留的:max_num_seqs
+# 上限内一批的 rows 列表实测几百字节,1KB 在 pickle 开销下余量偏薄;槽数不变
+# 时多出的只是共享内存里的空洞,不占常驻。
+_SIDEBAND_MAX_CHUNK_BYTES = 4096
 _SIDEBAND_MAX_CHUNKS = 64
 
 
 # ---------------------------------------------------------------------- #
 # 提示(hint):调度侧生产,worker 通信线程消费                              #
 # ---------------------------------------------------------------------- #
-def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
+def make_recv_hint(
+    seqno: int,
+    num_tokens: int,
+    aux_rows: int = 0,
+    req_ids: list[str] | None = None,
+    rows: list[int] | None = None,
+    offsets: list[int] | None = None,
+    prompt_offsets: list[int] | None = None,
+    prompt_lens: list[int] | None = None,
+) -> dict:
     """构造一条 UP 提前收提示。
 
     * ``num_tokens``:本批 flat token 数(主帧尺寸由 worker 按 hash 载荷公式推)
     * ``aux_rows``:本批带 mrope 的 token 行数(0 = 纯文本批,零 aux 流量)
+    * ``req_ids``/``rows``:本批**逐请求**的 id 与 token 行数(与 notify.items 同序)
+    * ``offsets``:该请求这段行在**本批载荷内**的起点(批内坐标)
+    * ``prompt_offsets``:该请求这段行在**它自己 prompt 内**的起点
+
+    ★ **两套坐标必须都带,绝不能合成一个**(真机踩过两次):
+    批内坐标只说明"这段字节在本次载荷里从哪开始",而"一个请求跨多个批到达"
+    时,第 2 段要落进该请求 buffer 的**第几行**、以及"已收行数"该累计到哪,
+    都取决于 **prompt 坐标**。只带批内坐标时续传块的 prompt 起点恒为 0,
+    于是:写入位置看着对(能触发扩容),但上报的"已收行数"被算成"块内相对
+    偏移",把一个 3510 行的请求报成只收到 2342 —— 调度器的 W2 判据据此
+    误判越界并把引擎打崩。
+
+    提示仍然只带"事实",尺寸公式仍只在 worker 侧算一次。
     """
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),
+        "req_ids": [str(r) for r in (req_ids or ())],
+        "rows": [int(r) for r in (rows or ())],
+        "offsets": [int(o) for o in (offsets or ())],
+        "prompt_offsets": [int(o) for o in (prompt_offsets or ())],
+        "prompt_lens": [int(n) for n in (prompt_lens or ())],
     }
 
 
-def hint_fields(hint: dict) -> tuple[int, int, int] | None:
-    """提示自检:返回 (seqno, num_tokens, aux_rows);坏提示返回 None。"""
+def hint_fields(hint: dict) -> tuple | None:
+    """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows,
+    offsets, prompt_offsets, prompt_lens)``。
+
+    坏提示返回 None(调用方丢弃 + 告警)。行表与总数不符 = 边云版本或组批发散;
+    若放行,暂存池会按错的行表切窗口、把 embedding 写到别的请求的位置
+    (静默错算),所以必须在入口判死。
+    """
     try:
         seqno = int(hint["seqno"])
         num_tokens = int(hint["num_tokens"])
         aux_rows = int(hint.get("aux_rows", 0))
+        req_ids = [str(r) for r in hint.get("req_ids", ())]
+        rows = [int(r) for r in hint.get("rows", ())]
+        offsets = [int(o) for o in hint.get("offsets", ())]
+        prompt_offsets = [int(o) for o in hint.get("prompt_offsets", ())]
+        prompt_lens = [int(n) for n in hint.get("prompt_lens", ())]
     except (KeyError, TypeError, ValueError):
         return None
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
         return None
-    return seqno, num_tokens, aux_rows
+    if rows or req_ids:
+        if len(rows) != len(req_ids):
+            return None
+        if any(r <= 0 for r in rows) or sum(rows) != num_tokens:
+            return None
+        if offsets and (len(offsets) != len(rows) or any(o < 0 for o in offsets)):
+            return None
+        if prompt_offsets and (
+            len(prompt_offsets) != len(rows)
+            or any(o < 0 for o in prompt_offsets)
+        ):
+            return None
+        if prompt_lens and (
+            len(prompt_lens) != len(rows)
+            or any(n <= 0 for n in prompt_lens)
+            # 本 chunk 必须落在 prompt 范围内
+            or any(
+                o + r > n
+                for o, r, n in zip(
+                    prompt_offsets or [0] * len(rows), rows, prompt_lens
+                )
+            )
+        ):
+            return None
+    return (
+        seqno, num_tokens, aux_rows, req_ids, rows, offsets, prompt_offsets,
+        prompt_lens,
+    )
 
 
 # ---------------------------------------------------------------------- #

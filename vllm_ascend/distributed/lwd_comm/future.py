@@ -39,6 +39,9 @@ class LwdCommFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: torch.npu.Event | None = None,
+        staged_tensor: torch.Tensor | None = None,
+        slot: int = -1,
     ) -> None:
         self._request = request
         self._handles = handles
@@ -46,6 +49,20 @@ class LwdCommFuture:
         self._tensor = tensor
         self._aux_tensor = aux_tensor
         self._keepalive = keepalive
+        # Host-staging (see docs/design/lwd_host_staging.md §4.3):
+        #   staged_event  - recorded on the dedicated D2H copy stream AFTER
+        #                   the segmented copies, so ``query()`` true means
+        #                   the per-request pinned copies are complete.
+        #                   Strictly later than ``done_event`` (the copy
+        #                   stream waits on it first).  The copy stream is
+        #                   FIFO, so staged completions stay in seqno order.
+        #   staged_tensor - the pinned host destination (owned by the
+        #                   caller's stager, not by this future).
+        #   slot          - device ping-pong slot the recv landed in;
+        #                   diagnostic only, the caller owns pool state.
+        self._staged_event = staged_event
+        self._staged_tensor = staged_tensor
+        self._slot = slot
         self._status = LwdCommStatus.PENDING
         self._error: BaseException | None = None
         self._lock = threading.Lock()
@@ -70,6 +87,9 @@ class LwdCommFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: "torch.npu.Event | None" = None,
+        staged_tensor: torch.Tensor | None = None,
+        slot: int = -1,
     ) -> None:
         with self._done_cond:
             self._handles = handles
@@ -77,6 +97,9 @@ class LwdCommFuture:
             self._tensor = tensor
             self._aux_tensor = aux_tensor
             self._keepalive = keepalive
+            self._staged_event = staged_event
+            self._staged_tensor = staged_tensor
+            self._slot = slot
             self._done_cond.notify_all()
 
     # ------------------------------------------------------------------ #
@@ -157,12 +180,77 @@ class LwdCommFuture:
             status, tensor, aux_tensor, error = (
                 self._status, self._tensor, self._aux_tensor, self._error,
             )
+            staged_tensor = self._staged_tensor
         if status is LwdCommStatus.ERROR:
             raise RuntimeError(
                 f"lwd-comm op failed on {self._request.channel.value} "
                 f"seqno={self._request.seqno}"
             ) from error
-        return LwdCommResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
+        return LwdCommResult(
+            status=status, tensor=tensor, aux_tensor=aux_tensor,
+            staged_tensor=staged_tensor,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Host staging (see docs/design/lwd_host_staging.md §4.3)              #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def slot(self) -> int:
+        """Device ping-pong slot this recv landed in (-1 when unused)."""
+        return self._slot
+
+    @property
+    def staged_tensor(self) -> torch.Tensor | None:
+        """Pinned host destination, or None when staging is off."""
+        return self._staged_tensor
+
+    def staging_requested(self) -> bool:
+        return self._staged_event is not None
+
+    def staged_done(self) -> bool:
+        """Pure-CPU query of the D2H completion event.
+
+        ``True`` implies the pinned host copy is complete (the event is
+        recorded behind the copy on the channel stream). Always ``True``
+        when staging was not requested, so callers can use it as a plain
+        readiness gate.
+        """
+        event = self._staged_event
+        if event is None:
+            return True
+        try:
+            return bool(event.query())
+        except Exception as exc:  # device error surfaces as ERROR
+            with self._lock:
+                if self._status is LwdCommStatus.PENDING:
+                    self._status = LwdCommStatus.ERROR
+                    self._error = exc
+                    self._done_cond.notify_all()
+            return True
+
+    def wait_staged(self, timeout: float | None = None) -> LwdCommResult:
+        """Block until the host-staged copy is complete (debug path only).
+
+        The comm thread never calls this (it must not block); it exists
+        for tests and for a caller that wants the staged payload directly.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        event = self._staged_event
+        if event is None:
+            return self.wait(timeout=timeout)
+        while not self.staged_done():
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(
+                    f"lwd-comm staging timed out on "
+                    f"{self._request.channel.value} seqno="
+                    f"{self._request.seqno}"
+                )
+            time.sleep(min(0.001, remaining or 0.001))
+        return self.result()
 
     # ------------------------------------------------------------------ #
     # Device-side ordering for consumers                                  #
@@ -174,6 +262,25 @@ class LwdCommFuture:
         event = self._done_event
         if event is not None:
             torch.npu.current_stream().wait_event(event)
+
+    def release_device_tensor(self) -> None:
+        """Drop the device-frame reference after its D2H copy completed.
+
+        With host staging the device buffer belongs to the caller's
+        ping-pong pool and is reused by the next receive; holding it from
+        a completed future would only keep the slot's device memory alive
+        (the allocator cannot reuse it while a reference exists).  The
+        comm thread calls this exactly once, right after it has committed
+        the staged copy - never while a consumer could still read the
+        device frame.
+
+        Safe no-op when staging was not requested (then the device frame
+        IS the delivered payload and ``result()`` must keep serving it).
+        """
+        if self._staged_event is None:
+            return
+        with self._done_cond:
+            self._tensor = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
