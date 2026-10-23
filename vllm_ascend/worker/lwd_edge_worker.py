@@ -274,7 +274,7 @@ class LwdEdgeWorker(NPUWorker):
         seqno: int,
         batch_meta: LwdEmbedBatch,
         scheduler_output: SchedulerOutput,
-    ) -> None:
+    ) -> ModelRunnerOutput:
         model = self.model_runner.get_model()
         if not batch_meta.token_ids:
             return
@@ -334,7 +334,15 @@ class LwdEdgeWorker(NPUWorker):
             seqno=seqno,
             engine_index=batch_meta.engine_index,
         )
-        self.comm_service.submit_send(request)
+        # UP send 完成水位(供边侧 pending 闸门摘除,语义 = 云侧已收讫):
+        # 逐 future.done() 轮询前缀;通道 FIFO ⇒ 完成序 = seqno 序,
+        # 前缀水位即精确。水位随本批 execute 返回捎带给引擎。
+        fut = self.comm_service.submit_send(request)
+        sent = getattr(self, "_lwd_up_send_futures", None)
+        if sent is None:
+            sent = self._lwd_up_send_futures = []
+        sent.append((seqno, fut))
+        watermark = self._lwd_up_send_done_watermark()
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
         # 广播提交(含 bridge 的 handle.wait)——若 UP 世界广播在等云侧
         # 入队,此段会显著变大(chunk 级锁步的直接证据)
@@ -346,6 +354,22 @@ class LwdEdgeWorker(NPUWorker):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
+        return ModelRunnerOutput(
+            req_ids=[], req_id_to_index={}, sampled_token_ids=[],
+            lwd_up_send_watermark=watermark,
+        )
+
+    def _lwd_up_send_done_watermark(self) -> int:
+        """已完成的最高 UP send seqno(通道 FIFO ⇒ 前缀水位即精确)。
+
+        顺带摘除已完成条目的引用,让快照 keepalive 归还给分配器。"""
+        sent = getattr(self, "_lwd_up_send_futures", None)
+        if not sent:
+            return -1
+        hi = -1
+        while sent and sent[0][1].done():
+            hi = sent.pop(0)[0]
+        return hi
 
     # ------------------------------------------------------------------ #
     # Multimodal (image) merge helpers                                     #
@@ -594,4 +618,7 @@ class LwdEdgeWorker(NPUWorker):
             req_ids=batch_meta.req_ids,
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_token_ids,
+            # 捎带 UP send 完成水位:decode 期 embed 稀疏,unembed 是
+            # 更密的载具,封住"末批 send 完成无人报告"的尾随泄漏。
+            lwd_up_send_watermark=self._lwd_up_send_done_watermark(),
         )
