@@ -18,6 +18,8 @@
 from collections.abc import Callable
 from typing import Any
 
+import os
+
 import torch
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
@@ -177,6 +179,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             # TODO: Try local_rank = ep_group.rank_in_group
             local_rank = torch.distributed.get_rank(group=device_group)
             backend = device_group._get_backend(torch.device("npu"))
+            # [Lwd][dp-diag] MC2 comm 建组上下文:comm init 失败
+            # (HCCL_E_UNAVAIL 等)时,这行给出本 rank 的全局身份/设备与
+            # 组全貌,对照其他 rank 的同款日志即可定位映射错配或对端缺席
+            logger.info(
+                "[Lwd][dp-diag] MC2 comm init: world_rank=%s "
+                "rank_in_mc2=%s mc2_ranks=%s device=%s visible=%s",
+                torch.distributed.get_rank(), local_rank,
+                torch.distributed.get_process_group_ranks(device_group),
+                torch.npu.current_device(),
+                os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "<unset>"),
+            )
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         except AttributeError:
             logger.warning_once(

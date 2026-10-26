@@ -432,6 +432,10 @@ class LwdCloudModelRunner(NPUModelRunner):
         from vllm.distributed.parallel_state import get_tp_group
 
         _tp = get_tp_group()
+        # 端点判定 engine 感知:本 engine TP 组内轮转出哪个卡是本通信域
+        # 的端点;多云 DP 下不能用云级固定端点——那会命中别的引擎首卡,
+        # 本引擎被误判为非端点,把空 buffer 广播给全组注入(乱码)。
+        engine_index = getattr(worker, "_lwd_engine_index", 0)
         for key in list(posted.keys()):
             edge_id, batch_seqno = key
             item = worker._lwd_up_recv_futures.pop(key, None)
@@ -443,7 +447,8 @@ class LwdCloudModelRunner(NPUModelRunner):
             from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 
             _is_endpoint = lwd_wire.is_lwd_channel_endpoint(
-                LwdChannelType.UP, edge_id=edge_id, cloud_id=None
+                LwdChannelType.UP, edge_id=edge_id, cloud_id=None,
+                engine_index=engine_index,
             )
             num_tokens = sum(len(t) for t in meta.token_ids)
             config = self.model_config.hf_config
@@ -452,10 +457,21 @@ class LwdCloudModelRunner(NPUModelRunner):
                 num_tokens, hidden_size, num_hash_layers,
                 getattr(config, "num_experts_per_tok", 0),
             )
+            mrope_positions = getattr(meta, "mrope_positions", None)
+            if not mrope_positions:
+                # None(旧批结构)与空 list(幽灵/drain 批漏填)同归回填:
+                # 空列表若直接进长度核验会必崩,而 has_mrope 全 False 时
+                # 空字节占位本就零路径变化;真带 mrope 的请求缺字节在
+                # 下方注入处 fail-fast(边云版本错配)。
+                mrope_positions = [b""] * len(meta.req_ids)
             if not (len(meta.req_ids) == len(meta.token_ids)
                     == len(meta.prompt_offsets) == len(meta.has_mrope)
-                    == len(meta.mrope_positions)):
+                    == len(mrope_positions)):
                 raise ValueError("LWD requires one prompt offset and mrope flag per request")
+            # UP 第二段(TP 组内广播)按 prefill_only_demo_br 范式在消费
+            # 时刻、本卡计算流上原子完成:launch + handle.wait() 同一流
+            # 上下文(torch_npu 的 wait 桥接到调用时当前流),不依赖两个
+            # HCCL op 之间的跨流排序——那是此前广播段交付残缺的根因。
             if _is_endpoint:
                 # 端点:先过 host 就绪门(demo 的 wait gate):done_event
                 # 轮询通过即 P2P 数据已完整落 buffer;超时显式报错而非
@@ -479,11 +495,11 @@ class LwdCloudModelRunner(NPUModelRunner):
                     numel, dtype=torch.bfloat16, device="npu"
                 )
             if _tp.world_size > 1:
-                # 端点随 edge_id 轮转:广播源 = 本通信域的云端点 rank,
-                # 而非固定 TP0(不同边对应不同端点卡,见 lwd_wire 建组)。
-                # 主帧与 aux(mrope)帧共用同一广播源,保持多边语义一致。
+                # 端点随 edge_id 在本引擎 C 卡内轮转:广播源 = 本通信域
+                # 的云端点 rank,而非固定 TP0(不同边/引擎对应不同端点
+                # 卡,见 lwd_wire 建组)。
                 _, cloud_endpoint = lwd_wire.get_lwd_channel_endpoint_rank(
-                    edge_id=edge_id, cloud_id=None
+                    edge_id=edge_id, cloud_id=None, engine_index=engine_index,
                 )
                 work = dist.broadcast(
                     up_flat,
@@ -556,7 +572,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                         # positions 字节随 meta 经控制面到达([3,n] int64),
                         # frombuffer 成 CPU 张量零转置直写 req_state;
                         # 空字节 = 边云版本错配,fail-fast
-                        payload = meta.mrope_positions[k]
+                        payload = mrope_positions[k]
                         if not payload:
                             raise RuntimeError(
                                 f"[Lwd][cloud-runner] mrope payload missing "
@@ -569,7 +585,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                             torch.frombuffer(
                                 bytearray(payload), dtype=torch.int64
                             ).view(3, n),
-                            int(num_prompt[idx]),
+                            prompt_len,
                         )
                         _mrope_cpu_ms += cpu_ms
                         _mrope_delta_ms += delta_ms
@@ -709,10 +725,12 @@ class LwdCloudModelRunner(NPUModelRunner):
         cpu_ms = (time.monotonic() - _t_cpu) * 1000
         delta_ms = 0.0
         if start + n >= prompt_len:
+            _t_delta = time.monotonic()
             positions = req_state.mrope_positions[:, :prompt_len]
             req_state.mrope_position_delta = (
                 int(positions.max().item()) + 1 - prompt_len
             )
+            delta_ms = (time.monotonic() - _t_delta) * 1000
             logger.info(
                 "[Lwd][cloud-runner] mrope complete: req=%s prompt=%d "
                 "delta=%d",

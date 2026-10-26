@@ -50,6 +50,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_DISABLE_DOWN": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_DISABLE_DOWN", 0)
     ),
+    # LWD diagnostic: when set to 1, each worker logs a torch memory
+    # breakdown (allocated/reserved peak, segments) plus top-10 largest
+    # allocations aggregated by stack (recorded history, transients
+    # included) at the end of profile-based memory sizing. Used to
+    # attribute KV-pool-size differences between deployments.
+    # Default 0. Never enable in production.
+    "VLLM_ASCEND_LWD_MEM_DEBUG": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_MEM_DEBUG", 0)
+    ),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
     "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),
