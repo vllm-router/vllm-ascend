@@ -91,6 +91,7 @@ def make_recv_hint(
     offsets: list[int] | None = None,
     prompt_offsets: list[int] | None = None,
     prompt_lens: list[int] | None = None,
+    refills: list[bool] | None = None,
 ) -> dict:
     """构造一条 UP 提前收提示。
 
@@ -99,6 +100,9 @@ def make_recv_hint(
     * ``req_ids``/``rows``:本批**逐请求**的 id 与 token 行数(与 notify.items 同序)
     * ``offsets``:该请求这段行在**本批载荷内**的起点(批内坐标)
     * ``prompt_offsets``:该请求这段行在**它自己 prompt 内**的起点
+    * ``refills``:与 ``req_ids`` 平行的逐请求 refill 标志(设计 §5.3,
+      ``LwdRangeItem.is_refill`` 透传);缺省/短表 = 全 False(兼容旧版
+      调用方),由 ``hint_fields`` 解析时归一化
 
     ★ **两套坐标必须都带,绝不能合成一个**(真机踩过两次):
     批内坐标只说明"这段字节在本次载荷里从哪开始",而"一个请求跨多个批到达"
@@ -120,16 +124,20 @@ def make_recv_hint(
         "offsets": [int(o) for o in (offsets or ())],
         "prompt_offsets": [int(o) for o in (prompt_offsets or ())],
         "prompt_lens": [int(n) for n in (prompt_lens or ())],
+        "refills": [bool(r) for r in (refills or ())],
     }
 
 
 def hint_fields(hint: dict) -> tuple | None:
     """提示自检:返回 ``(seqno, num_tokens, aux_rows, req_ids, rows,
-    offsets, prompt_offsets, prompt_lens)``。
+    offsets, prompt_offsets, prompt_lens, refills)``。
 
     坏提示返回 None(调用方丢弃 + 告警)。行表与总数不符 = 边云版本或组批发散;
     若放行,暂存池会按错的行表切窗口、把 embedding 写到别的请求的位置
     (静默错算),所以必须在入口判死。
+
+    ``refills``(设计 §5.3,逐请求 refill 标志)容忍缺省:缺键/短表一律
+    补齐为全 False(旧版引擎没有这个字段);长表 = 版本错配,判死。
     """
     try:
         seqno = int(hint["seqno"])
@@ -140,6 +148,7 @@ def hint_fields(hint: dict) -> tuple | None:
         offsets = [int(o) for o in hint.get("offsets", ())]
         prompt_offsets = [int(o) for o in hint.get("prompt_offsets", ())]
         prompt_lens = [int(n) for n in hint.get("prompt_lens", ())]
+        refills = [bool(r) for r in hint.get("refills", ())]
     except (KeyError, TypeError, ValueError):
         return None
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
@@ -168,9 +177,13 @@ def hint_fields(hint: dict) -> tuple | None:
             )
         ):
             return None
+        # refill 标志归一化到与行表平行(缺省/短表 = 全 False)
+        if len(refills) > len(rows):
+            return None
+        refills = refills + [False] * (len(rows) - len(refills))
     return (
         seqno, num_tokens, aux_rows, req_ids, rows, offsets, prompt_offsets,
-        prompt_lens,
+        prompt_lens, refills,
     )
 
 

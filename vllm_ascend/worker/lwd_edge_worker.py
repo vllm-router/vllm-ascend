@@ -283,6 +283,13 @@ class LwdEdgeWorker(NPUWorker):
         # data;后续 chunk 走缓存)。注意登记不过滤 data:None 的项留到
         # encoder 执行点 fail-fast(见 _lwd_mm_encoder_outputs)——静默
         # 跳过会让图像 embeds 缺失、占位 token 按文本嵌入,即错算。
+        registered_req_ids = []
+        previous_features = {}
+        if getattr(batch_meta, "is_refill", False):
+            previous_features = {
+                req_data.req_id: self._lwd_mm_features_dict.get(req_data.req_id)
+                for req_data in scheduler_output.scheduled_new_reqs
+            }
         for req_data in scheduler_output.scheduled_new_reqs:
             feats = [
                 f
@@ -291,6 +298,7 @@ class LwdEdgeWorker(NPUWorker):
             ]
             if feats:
                 self._lwd_mm_features_dict[req_data.req_id] = feats
+                registered_req_ids.append(req_data.req_id)
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -332,17 +340,18 @@ class LwdEdgeWorker(NPUWorker):
             num_elements=payload.numel(),
             tensor=payload,
             seqno=seqno,
-            engine_index=batch_meta.engine_index,
+            engine_index=getattr(batch_meta, "engine_index", 0),
         )
         # UP send 完成水位(供边侧 pending 闸门摘除,语义 = 云侧已收讫):
         # 逐 future.done() 轮询前缀;通道 FIFO ⇒ 完成序 = seqno 序,
         # 前缀水位即精确。水位随本批 execute 返回捎带给引擎。
         fut = self.comm_service.submit_send(request)
-        sent = getattr(self, "_lwd_up_send_futures", None)
-        if sent is None:
-            sent = self._lwd_up_send_futures = []
-        sent.append((seqno, fut))
-        watermark = self._lwd_up_send_done_watermark()
+        sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
+        if sent_by_engine is None:
+            sent_by_engine = self._lwd_up_send_futures = {}
+        engine = getattr(batch_meta, "engine_index", 0)
+        sent_by_engine.setdefault(engine, []).append((seqno, fut))
+        watermark = self._lwd_up_send_done_watermark(engine)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
         # 广播提交(含 bridge 的 handle.wait)——若 UP 世界广播在等云侧
         # 入队,此段会显著变大(chunk 级锁步的直接证据)
@@ -354,22 +363,33 @@ class LwdEdgeWorker(NPUWorker):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
+        if getattr(batch_meta, "is_refill", False):
+            for req_id in registered_req_ids:
+                previous = previous_features.get(req_id)
+                if previous is None:
+                    self._lwd_mm_release_request(req_id)
+                else:
+                    self._lwd_mm_features_dict[req_id] = previous
         return ModelRunnerOutput(
             req_ids=[], req_id_to_index={}, sampled_token_ids=[],
             lwd_up_send_watermark=watermark,
         )
 
-    def _lwd_up_send_done_watermark(self) -> int:
-        """已完成的最高 UP send seqno(通道 FIFO ⇒ 前缀水位即精确)。
-
-        顺带摘除已完成条目的引用,让快照 keepalive 归还给分配器。"""
-        sent = getattr(self, "_lwd_up_send_futures", None)
-        if not sent:
-            return -1
+    def _lwd_up_send_done_watermark(self, engine: int) -> int:
+        """只推进指定 engine 的 UP FIFO,避免多 DP 跨通道误摘。"""
+        sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
+        sent = sent_by_engine.get(engine, []) if sent_by_engine else []
         hi = -1
         while sent and sent[0][1].done():
             hi = sent.pop(0)[0]
         return hi
+
+    def _lwd_up_send_done_watermarks(self) -> dict[int, int]:
+        sent_by_engine = getattr(self, "_lwd_up_send_futures", None) or {}
+        return {
+            engine: self._lwd_up_send_done_watermark(engine)
+            for engine in list(sent_by_engine)
+        }
 
     # ------------------------------------------------------------------ #
     # Multimodal (image) merge helpers                                     #
@@ -543,7 +563,7 @@ class LwdEdgeWorker(NPUWorker):
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
-                engine_index=batch_meta.engine_index,
+                engine_index=getattr(batch_meta, "engine_index", 0),
             )
         )
         _t_post = time.monotonic()
@@ -620,5 +640,8 @@ class LwdEdgeWorker(NPUWorker):
             sampled_token_ids=sampled_token_ids,
             # 捎带 UP send 完成水位:decode 期 embed 稀疏,unembed 是
             # 更密的载具,封住"末批 send 完成无人报告"的尾随泄漏。
-            lwd_up_send_watermark=self._lwd_up_send_done_watermark(),
+            lwd_up_send_watermark=self._lwd_up_send_done_watermark(
+                getattr(batch_meta, "engine_index", 0)
+            ),
+            lwd_up_send_watermarks=self._lwd_up_send_done_watermarks(),
         )

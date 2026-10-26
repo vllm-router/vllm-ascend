@@ -1090,20 +1090,19 @@ class NPUModelRunner(GPUModelRunner):
             if self._lwd_spec_persist_enabled:
                 self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
+            if self.use_async_scheduling and (prev_req_id_to_index or self._lwd_spec_persist_enabled):
                 prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
-                )
+                if prev_req_id_to_index:
+                    new_mask = prev_idx < 0
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[
+                            np.where(new_mask, 0, prev_idx)
+                        ]
+                    )
+                else:
+                    new_mask = np.ones(num_reqs, dtype=bool)
+                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
                 if self._lwd_spec_persist_enabled:
-                    # A decode request with prev_positions == -1 is not a new
-                    # request: use its own last-decode-step acceptance
-                    # (persisted in CachedRequestState by
-                    # _update_states_after_model_execute). Only genuine
-                    # new/prefill requests keep the default of 1.
                     for cur_idx in range(num_reqs):
                         if not new_mask[cur_idx]:
                             continue
@@ -1119,13 +1118,11 @@ class NPUModelRunner(GPUModelRunner):
                             self.num_accepted_tokens.np[cur_idx] = (
                                 req_state.num_accepted_tokens
                             )
-                else:
-                    self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
                     self.num_accepted_tokens.np[:num_reqs]
                 )
             else:
-                # Non-async mode: use values directly
+                # No async remapping or persistence: use values directly.
                 self.num_accepted_tokens.np[:num_reqs] = (
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
