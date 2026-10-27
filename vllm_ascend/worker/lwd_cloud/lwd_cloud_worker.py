@@ -357,7 +357,7 @@ class LwdCloudWorker(NPUWorker):
         (调用方排队重试,提示不丢弃);行表/几何缺失抛
         ``LwdHostStageGeometryError``(协议级错误,不可重试)。
 
-        ``fields`` = ``hint_fields()`` 的 8 元组;消费点补挂路径用 SO 的
+        ``fields`` = ``hint_fields()`` 的 9 元组;消费点补挂路径用 SO 的
         batch_meta 重建同形状元组。
         """
         num_elements = hash_payload_numel(
@@ -389,7 +389,7 @@ class LwdCloudWorker(NPUWorker):
                 f"prompt_lens); got fields={None if fields is None else 'incomplete'}"
             )
         (_seqno, _nt, _aux, req_ids, rows, _offsets, prompt_offsets,
-         prompt_lens) = fields
+         prompt_lens, refills) = fields
         hf = self.model_config.hf_config
         segments = stager.plan_recv_segments(
             seqno=int(seqno),
@@ -401,6 +401,7 @@ class LwdCloudWorker(NPUWorker):
             row_base=list(prompt_offsets) if prompt_offsets else None,
             num_hash_layers=hash_layer_count(hf),
             num_experts_per_tok=getattr(hf, "num_experts_per_tok", 0),
+            refills=refills,
         )
         slot_view, slot = stager.allocate(seqno=int(seqno), numel=num_elements)
         return replace(
@@ -700,6 +701,13 @@ class LwdCloudWorker(NPUWorker):
                 "[Lwd][host-stage] ARRIVED seqno=%d cumulative=%s host_MB=%.1f",
                 seqno, arrived, stager.host_bytes / 2 ** 20,
             )
+        done_mq = self._irecv_done_mq
+        if done_mq is not None:
+            for rid in stager.take_refill_done():
+                done_mq.enqueue(("refill_done", rid))
+                logger.info(
+                    "[Lwd][host-stage] REFILL-DONE req=%s reported", rid,
+                )
         return arrived
 
     def _lwd_handle_abort_notice(self, aborted_req_ids) -> None:

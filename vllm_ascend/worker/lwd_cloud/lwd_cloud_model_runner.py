@@ -91,20 +91,10 @@ class LwdCloudModelRunner(NPUModelRunner):
         return super()._update_states(scheduler_output)
 
     def _lwd_rewind_staged_reads(self, scheduler_output) -> None:
-        """重算回退:调度水位退到 stager 读指针之下 = 云侧 KV 抢占重算。
+        """在 harvest 前对齐调度水位与 stager 读指针。
 
-        原生抢占释放全部 KV 并把 ``num_computed_tokens`` 归零
-        (``Scheduler._preempt_request``);pinned host 载荷活到请求结束
-        (design v7 §6.1),整条 prompt 可本地重读,只有读指针要回退 ——
-        与 ``NPUModelRunner._update_states`` 里 KV-load-failure 的
-        rewind 守卫同型。必须在 harvest 之前完成(本方法就是):harvest
-        的恒等式校验要求 ``consumed == num_computed``(见
-        ``_lwd_stage_one_request``),抢占后不回退会在那里当场炸。
-
-        只按"回退"触发(consumed > 上报水位),不看 resumed_req_ids:
-        正常爬坡里调度水位恒 ≥ 读指针(spec 拒绝的回退发生在 decode
-        段,到不了 prompt 段),误触发面为零。非端点 rank 没有暂存池,
-        直接跳过。
+        回退用于抢占重算;前跳用于重准入 self-hit,跳过行由 KV cache
+        覆盖。decode 期越过 prompt 末尾不参与前跳。
         """
         worker = self.worker
         stager = getattr(worker, "_lwd_stager", None) if worker is not None else None
@@ -122,6 +112,15 @@ class LwdCloudModelRunner(NPUModelRunner):
                     "%d -> %d (preemption recompute; payload retained)",
                     req_id, consumed, new_computed,
                 )
+            elif new_computed > consumed:
+                req = stager.take_req(req_id)
+                if req is not None and consumed < req.prompt_rows:
+                    stager.skip_consumed(req_id, new_computed)
+                    logger.info(
+                        "[Lwd][cloud-runner] SKIP req=%s: host read pointer "
+                        "%d -> %d (re-admission hit)",
+                        req_id, consumed, new_computed,
+                    )
 
     def _prepare_input_ids(self, scheduler_output, num_reqs,
                            total_num_scheduled_tokens, cu_num_tokens):

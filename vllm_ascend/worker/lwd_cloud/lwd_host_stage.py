@@ -86,7 +86,9 @@ class LwdReqEmbed:
     tail_numel: int = 0
     num_hash_layers: int = 0
     num_experts_per_tok: int = 0
-    #: prompt row at which each request's storage was first created
+    #: buffer 第 0 行对应的 prompt 行。播种(前缀命中)后恒为 0 ——
+    #: buffer 行号 = prompt 绝对坐标;未播种时等于首个 hint 声明的
+    #: prompt 起点(正常为 0,见 plan_recv_segments)
     _row_base: int = 0
     # ---- the two counters (design §4.2) ----
     recv_rows: int = 0            # arrived (data plane)
@@ -94,6 +96,67 @@ class LwdReqEmbed:
     aborted: bool = False
     #: highest prompt row written so far, to detect gaps on arrival
     _written_hi: int = 0
+    #: 暂存地板 S(设计 §5.3):边侧实际发送过的行起点 = 首个 hint 的
+    #: prompt 起点(前缀命中请求 S=H>0,未命中 S=0)。buffer 行号恒为
+    #: prompt 绝对坐标,[0,S) 行永不写入也不读取;任何 offset < S 的
+    #: 到达都是 refill 补发行(在飞正常行不可能落在 S 以下)。refill
+    #: 补齐后推进到洞起点 H'(覆盖区间扩到 [H', prompt)),下一次
+    #: 抢占按新地板判补发 —— 与调度侧 lwd_resume_cap_tokens 同步。
+    _stage_floor: int = 0
+    #: refill 洞起点(= 首个 refill 行的 offset = 重查命中边界 H');
+    #: None = 无 refill 在途。补齐时随地板推进一并复位,二次 refill
+    #: 对新地板重新走完整 FIFO 推进/补齐/防呆链路
+    _refill_lo: int | None = None
+    #: refill 已补齐到的 prompt 行(洞 [H',S) 自 H' 起连续、FIFO 有序,
+    #: refill_hi 到达 S 即补齐);None = 本请求尚无 refill 到达
+    _refill_hi: int | None = None
+    #: refill 补齐事件的 edge 标志(_refill_hi 到达 S 时置位),由
+    #: stager 在 publish 时取走、经 worker 上报 done MQ 的 refill_done
+    _refill_completed: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Seeding (prefix-cache hit, design §3.2)                             #
+    # ------------------------------------------------------------------ #
+    def seed_prefix(self, hit_rows: int) -> None:
+        """前缀命中播种:暂存地板 S = 边侧实际上行起点(首个 hint 的
+        prompt offset)。
+
+        buffer 行号保持 prompt 绝对坐标(``_row_base = 0``,命中段
+        [0,S) 行永不写入也永不读取——调度窗口起点 ≥ S),三条水位一次
+        置齐:
+
+        * ``recv_rows = S``:首 chunk 到达前 ``recv_rows − num_computed``
+          = 0,调度谓词不可见;
+        * ``_written_hi = S``:首 chunk 落 [S, S+n) 不触发 arrival-gap
+          告警(命中前缀的空洞是协议约定,不是丢失);
+        * ``consumed = S``:读指针与 ``num_computed`` 起点(= H = S)
+          对齐,``_lwd_stage_one_request`` 的恒等式成立。
+
+        仅限注册期(任何水位都还没动过)调用一次;重复/迟到播种 = 记账
+        已分叉,fail-fast。
+        """
+        if hit_rows <= 0 or hit_rows >= self.prompt_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: seed_prefix({hit_rows}) outside "
+                f"(0, prompt_rows={self.prompt_rows})"
+            )
+        if (
+            self._stage_floor
+            or self.recv_rows
+            or self._written_hi
+            or self.consumed
+        ):
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: seed_prefix({hit_rows}) after "
+                f"arrivals/consumption (floor={self._stage_floor} "
+                f"recv={self.recv_rows} written_hi={self._written_hi} "
+                f"consumed={self.consumed})"
+            )
+        self._row_base = 0
+        self._stage_floor = hit_rows
+        self.recv_rows = hit_rows
+        self._written_hi = hit_rows
+        self.consumed = hit_rows
 
     # ------------------------------------------------------------------ #
     # Arrival (data plane)                                                #
@@ -135,6 +198,12 @@ class LwdReqEmbed:
                 f"req={self.req_id}: announced rows [{offset}, {end}) exceed "
                 f"prompt_rows={self.prompt_rows}"
             )
+        if offset < self._stage_floor:
+            # refill 补发行(设计 §5.3):重准入时命中块被逐出(H' < S),
+            # 边侧带外补发 [H', S) 的 embeddings。落在已到达过的区间,
+            # recv_rows/_written_hi 幂等不重推进(下方两个 if 对它恒为
+            # no-op),只推进 refill 低水位;补齐事件由 publish 收集上报。
+            self._note_refill_arrival(offset, rows)
         if end > self._written_hi:
             if offset > self._written_hi:
                 # 到达出现空洞:[_written_hi, offset) 从未写入,而高水位会
@@ -160,6 +229,47 @@ class LwdReqEmbed:
             self.req_id, id(self), offset, rows, end,
             self._written_hi, prev, self.recv_rows, self.prompt_rows,
         )
+
+    def _note_refill_arrival(self, offset: int, rows: int) -> None:
+        """refill 行计数(设计 §5.3):洞 [H', S) 自 H' 起连续补齐。
+
+        refill 行走既有 EMBED 批 + RangeNotify,通道 FIFO 有序、自首个
+        refill 行的起点(= 重查命中边界 H')连续推进;补齐
+        (``_refill_hi`` 到达暂存地板 S)时置 edge 标志,由 stager 在
+        publish 时收集、worker 随 done MQ 报 ``refill_done`` 摘闸门。
+        重放/乱序落在已补区间的行幂等不推进。
+        """
+        end = offset + rows
+        if end > self._stage_floor:
+            # refill 越过暂存地板会覆写 [S, ...) 的在飞正常行 —— 协议
+            # 错误(refill 范围恒为 [H', S)),fail-fast。
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: refill rows [{offset}, {end}) overrun "
+                f"stage floor S={self._stage_floor} (would clobber live "
+                f"rows above the floor)"
+            )
+        if self._refill_hi is None:
+            # 首个 refill 行的起点即重查命中边界 H'(洞起点)
+            self._refill_lo = offset
+            self._refill_hi = offset
+        elif offset > self._refill_hi:
+            # 连续水位不能越过未写入区间,否则会误报 refill_done 并摘闸。
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: refill gap [{self._refill_hi}, "
+                f"{offset}) before chunk [{offset}, {end})"
+            )
+        if end > self._refill_hi:
+            self._refill_hi = end
+        if (
+            not self._refill_completed
+            and self._refill_hi >= self._stage_floor
+        ):
+            self._refill_completed = True
+            logger.info(
+                "[Lwd][host-stage] req=%s refill complete: hole filled up "
+                "to stage floor S=%d",
+                self.req_id, self._stage_floor,
+            )
 
     def available(self) -> int:
         """Rows that may be dispatched now: ``recv_rows - consumed``."""
@@ -201,6 +311,25 @@ class LwdReqEmbed:
             raise LwdHostStageGeometryError(
                 f"req={self.req_id}: read {n_rows} rows at consumed="
                 f"{self.consumed} exceeds prompt_rows={self.prompt_rows}"
+            )
+        if self.consumed < self._stage_floor and (
+            self._refill_hi is None
+            or (
+                self._refill_hi < self._stage_floor
+                and self.consumed + n_rows > self._refill_hi
+            )
+        ):
+            # 读到未补齐的 refill 洞 [_refill_hi, S):W2 只挡"从未到达",
+            # 挡不住洞(refill 行落在已到达区间,recv_rows 不反映它)。
+            # _refill_hi is None = 补发一行未达,洞 [consumed, S) 整个
+            # 未填,同样要拦。正常流程靠调度器 refill 闸门隔离(填齐前
+            # 不开窗,设计 §5.3),读到即闸门失效,fail-fast。
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: read [{self.consumed}, "
+                f"{self.consumed + n_rows}) hits unfilled refill hole "
+                f"(refill_hi={self._refill_hi}, floor S="
+                f"{self._stage_floor}; refill gate should have hidden "
+                f"this request)"
             )
         start = self.consumed * self.hidden_size
         return start, start + n_rows * self.hidden_size
@@ -245,6 +374,11 @@ class LwdReqEmbed:
         ``consumed <= recv_rows`` is preserved because the target never
         exceeds the current pointer.
 
+        前缀缓存下 rewind 目标可以低于暂存地板 S(重查命中 H' < S,命中
+        块被逐出的 refill 场景,设计 §5.3)—— 这是**合法**目标,本处不做
+        S 下界拦截;[H', S) 洞在读侧的安全由调度器 refill 闸门保证
+        (填齐前不开窗),``read_range`` 另有读到未补齐洞的防呆。
+
         Raises:
             LwdHostStageGeometryError: if the target is outside
                 ``[0, consumed]`` - a rewind past what was ever read would
@@ -254,6 +388,35 @@ class LwdReqEmbed:
             raise LwdHostStageGeometryError(
                 f"req={self.req_id}: rewind target {to_rows} outside "
                 f"[0, consumed={self.consumed}]"
+            )
+        self.consumed = to_rows
+
+    def skip_consumed(self, to_rows: int) -> None:
+        """读指针前跳到 ``to_rows``(重准入命中越过读指针,设计 §5.3)。
+
+        H' > consumed 的 self-hit 场景:共享前缀的其他请求把缓存链补得
+        比本请求抢占前的进度更长,抢占重准入的重查命中边界越过读指针。
+        跳过的行 [consumed, to_rows) **永不读取** —— 它们的 KV 已被前缀
+        缓存命中覆盖;只有指针前进,``recv_rows``/``_written_hi`` 不动,
+        不变量 ``consumed <= recv_rows`` 由"跳界不超过高水位"直接保持。
+
+        跨仓契约:跳界 ≤ 引擎 recv 台账由调度侧重准入钳制保证(台账与
+        本池 recv_rows 同源);本处仍做硬校验,钳制失效即 fail-fast —
+        越过 recv_rows 的前跳会让后续 read_range 读到从未写入的行。
+
+        Raises:
+            LwdHostStageGeometryError: 目标在 ``[consumed, recv_rows]``
+                之外(回退请走 ``rewind_consumed``)或越过 prompt 末尾。
+        """
+        if to_rows < self.consumed or to_rows > self.recv_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: skip target {to_rows} outside "
+                f"[consumed={self.consumed}, recv_rows={self.recv_rows}]"
+            )
+        if to_rows > self.prompt_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: skip target {to_rows} exceeds "
+                f"prompt_rows={self.prompt_rows}"
             )
         self.consumed = to_rows
 
@@ -351,6 +514,9 @@ class LwdHostStager:
         #: at submit time (plan_recv_segments) and published by
         #: ``publish_received`` once the segmented D2H completes
         self._arrival_plan: dict[int, list] = {}
+        #: refill 补齐待上报名单(publish 时收集,worker 取走随 done MQ
+        #: 报 ("refill_done", req_id),引擎据此摘 refill 闸门,设计 §5.3)
+        self._refill_done: list[str] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -420,6 +586,24 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req.consumed if req is not None else 0
 
+    def stage_floor(self, req_id: str) -> int:
+        """该请求的暂存地板 S(非命中请求恒 0;诊断/核验用)。"""
+        with self._lock:
+            req = self._reqs.get(req_id)
+            return req._stage_floor if req is not None else 0
+
+    def take_refill_done(self) -> list[str]:
+        """取走自上次以来补齐的 refill 请求名单(设计 §5.3)。
+
+        worker 通信线程在每次发布后调用,逐个随 done MQ 报
+        ``("refill_done", req_id)``;引擎侧 ``lwd_refill_done`` 摘闸门,
+        请求按钉住的 H' 快照恢复可见。取走即清空,重复调用幂等。
+        """
+        with self._lock:
+            out = self._refill_done
+            self._refill_done = []
+        return out
+
     # ------------------------------------------------------------------ #
     # Admission (comm thread): bind a device slot to a recv                #
     # ------------------------------------------------------------------ #
@@ -475,6 +659,7 @@ class LwdHostStager:
         row_base: list[int] | None = None,
         num_hash_layers: int = 0,
         num_experts_per_tok: int = 0,
+        refills: list[bool] | None = None,
     ) -> list[tuple[Any, int, int]]:
         """提交期建行表:per-request buffer 按 prompt 全长一次分好,返回
         本批的 D2H 分段 ``[(dst_pinned_view, src_elem_offset, numel)]``,
@@ -512,6 +697,17 @@ class LwdHostStager:
                 f"seqno={seqno}: {len(row_base)} row bases vs {len(rows)} "
                 f"requests"
             )
+        # refill 标志(设计 §5.3):与 req_ids 平行的逐请求布尔表,
+        # 缺省/短表 = 全 False(缺省兼容旧版引擎);长表 = 协议错误。
+        if refills is None:
+            refills = [False] * len(rows)
+        elif len(refills) < len(rows):
+            refills = list(refills) + [False] * (len(rows) - len(refills))
+        elif len(refills) > len(rows):
+            raise LwdHostStageGeometryError(
+                f"seqno={seqno}: {len(refills)} refill flags vs "
+                f"{len(rows)} requests"
+            )
         batch = LwdStagedBatch(
             seqno=seqno,
             req_ids=list(req_ids),
@@ -529,6 +725,15 @@ class LwdHostStager:
                 n = rows[i]
                 host = self._reqs.get(rid)
                 if host is None:
+                    if refills[i]:
+                        # refill 行不能是请求的首个 hint:补发只发生在
+                        # 暂存条目已存在(且被抢占)之后,先建条目再补发
+                        # 的时序倒错 = 协议错误,fail-fast。
+                        raise LwdHostStageGeometryError(
+                            f"seqno={seqno} req={rid}: refill chunk for an "
+                            f"unknown request (refill presupposes a staged "
+                            f"entry)"
+                        )
                     # 一次按 prompt 全长分够:后续 chunk 直接落进预留区间,
                     # 没有扩容、没有 realloc、没有在飞拷贝的视图失效问题。
                     plen = int(prompt_lens[i])
@@ -571,13 +776,42 @@ class LwdHostStager:
                     # 该 buffer 的第 0 行对应 prompt 的哪一行 = 它在提示里声明
                     # 的 prompt 起点(首次到达的那一段的起点;正常为 0)。
                     host._row_base = row_base[i]
-                elif host.hidden_size != hidden_size:
-                    # 续传增量:几何必须与首批一致,否则后面的切片全会错位
-                    # (静默串数据),直接 fail-fast。
-                    raise LwdHostStageGeometryError(
-                        f"req={rid}: hidden_size {host.hidden_size} != "
-                        f"{hidden_size} on a later chunk"
-                    )
+                    if row_base[i] > 0:
+                        # 前缀命中(设计 §3.2):首个 hint 的 prompt 起点即
+                        # 暂存地板 S(边侧跳过 [0,S) 的 embed 与上行)。
+                        # 播种把 recv_rows/_written_hi/consumed 置齐到 S,
+                        # 并把 buffer 行号拉回 prompt 绝对坐标。
+                        host.seed_prefix(row_base[i])
+                else:
+                    # refills 标志与几何判定交叉校验(设计 §5.3:任何
+                    # offset < S 的到达都是 refill 行,在飞正常行不可能
+                    # 落在 S 以下);不一致 = 边云版本错配,fail-fast。
+                    geo_refill = row_base[i] < host._stage_floor
+                    if bool(refills[i]) != geo_refill:
+                        raise LwdHostStageGeometryError(
+                            f"seqno={seqno} req={rid}: refills flag "
+                            f"{bool(refills[i])} disagrees with geometry "
+                            f"(offset={row_base[i]} vs stage floor "
+                            f"S={host._stage_floor})"
+                        )
+                    if geo_refill and row_base[i] + n > host._stage_floor:
+                        # refill 越过暂存地板会覆写 [S, ...) 的在飞正常行:
+                        # plan 期(分段 D2H 挂出前)即 fail-fast —— 拖到
+                        # publish 期(note_arrival 的同款校验)数据已写入,
+                        # 且异常会杀死通信线程(daemon,仅 stderr 留栈)。
+                        raise LwdHostStageGeometryError(
+                            f"seqno={seqno} req={rid}: refill rows "
+                            f"[{row_base[i]}, {row_base[i] + n}) overrun "
+                            f"stage floor S={host._stage_floor} at plan "
+                            f"time (refill range is always [H', S))"
+                        )
+                    if host.hidden_size != hidden_size:
+                        # 续传增量:几何必须与首批一致,否则后面的切片全会错位
+                        # (静默串数据),直接 fail-fast。
+                        raise LwdHostStageGeometryError(
+                            f"req={rid}: hidden_size {host.hidden_size} != "
+                            f"{hidden_size} on a later chunk"
+                        )
                 # ---- 写入位置:prompt 坐标 − buffer 基准行 ----
                 # ``row_base[i]`` 是本段在**该请求 prompt 内**的起点(prompt
                 # 坐标);buffer 基准行是它首段的起点。两者相减得 buffer 内
@@ -652,11 +886,22 @@ class LwdHostStager:
             ]
             for host, dest_row, n in plan:
                 host.note_arrival(dest_row, n)
+                if host._refill_completed:
+                    # refill 补齐(设计 §5.3):摘 edge 标志并登记待上报,
+                    # worker 随 done MQ 报 refill_done,引擎侧摘闸门。
+                    host._refill_completed = False
+                    self._refill_done.append(host.req_id)
+                    # 暂存地板推进到洞起点 H'(洞 [H',S) 已填齐,覆盖区间
+                    # 扩到 [H', prompt)),refill 状态复位 —— 不复位的话第二
+                    # 次 refill 的首个 chunk 即撞上 _refill_hi >= 旧地板被
+                    # 误判补齐,提前上报 refill_done、闸门提前摘除。
+                    host._stage_floor = host._refill_lo
+                    host._refill_hi = None
+                    host._refill_lo = None
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
         return rows
-
 
     # ------------------------------------------------------------------ #
     # Consumption (forward thread)                                        #
@@ -702,6 +947,23 @@ class LwdHostStager:
             if req is None:
                 return False
             req.rewind_consumed(to_rows)
+        return True
+
+    def skip_consumed(self, req_id: str, to_rows: int) -> bool:
+        """前跳读指针:重准入命中边界越过暂存进度(self-hit,§5.3)。
+
+        Called by the runner when the scheduler's watermark lands above
+        the staged read pointer (re-admission hit H' exceeds the rows this
+        request had staged before preemption; the skipped rows are covered
+        by the prefix cache and are never read).  Returns False when the
+        request is unknown - e.g. it finished between scheduling and
+        execution under async scheduling; nothing to skip.
+        """
+        with self._lock:
+            req = self._reqs.get(req_id)
+            if req is None:
+                return False
+            req.skip_consumed(to_rows)
         return True
 
     def abort_request(self, req_id: str) -> bool:
