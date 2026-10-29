@@ -56,20 +56,16 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 
 ## 支持模型
 图例说明
+- ✅ = 支持的模型/功能
+- 🔵 = 实验性支持的模型/功能
+- ❌ = 不支持的模型/功能
+- 🟡 = 未经测试或验证
 
-- ●：充分验证支持
-- ●：仅功能支持
-- ✅：支持该列的特性
-- ❌：不支持该列特性
-
-| 模型 | Support | 最大上下文长度 | W8A8 | W4A8 | W8A16 | LoRA | atbgraph | aclgraph | 硬件规格 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek‑R1‑Distill‑Llama‑8B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐2卡)   Atlas 800I A3：1/2/4卡(推荐1卡)   Atlas 300I Duo：1/2/4卡(推荐1卡) |
-| DeepSeek‑R1‑Distill‑Llama‑70B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：8卡   Atlas 800I A3：4卡 |
-| DeepSeek‑R1‑Distill‑Qwen‑1.5B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4卡(推荐2卡)   Atlas 800I A3：1/2卡(推荐1卡)   Atlas 300I Duo：1/2卡（推荐1卡） |
-| DeepSeek‑R1‑Distill‑Qwen‑7B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4卡(推荐2卡)   Atlas 800I A3：1/2卡(推荐1卡)   Atlas 300I Duo：1/2卡(推荐1卡) |
-| DeepSeek‑R1‑Distill‑Qwen‑14B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐4卡)   Atlas 800I A3：1/2/4卡(推荐2卡)   Atlas 300I Duo：2/4卡(推荐2卡) |
-| DeepSeek‑R1‑Distill‑Qwen‑32B | ● | 128k | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | Atlas 800I A2：1/2/4/8卡(推荐4卡)   Atlas 800I A3：1/2/4卡(推荐2卡)   Atlas 300I Duo：1/2/4卡(推荐2卡) |
+| 模型 | 支持情况 | 备注 | BF16 | 支持的硬件 | W8A8 | 分<br/>块<br/>预<br/>填<br/>充 | 自<br/>动<br/>前<br/>缀<br/>缓<br/>存 | LoRA | 投<br/>机<br/>解<br/>码 | 异<br/>步<br/>调<br/>度 | 张<br/>量<br/>并<br/>行 | 流<br/>水<br/>线<br/>并<br/>行 | 专<br/>家<br/>并<br/>行 | 数<br/>据<br/>并<br/>行 | 与填充<br/>-<br/>解码分离 | 分段<br/>AclGraph | 全图<br/>AclGraph | max-model-len | MLP<br/>权重<br/>预取 | 文档 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |--- | --- | --- | --- | --- | --- |
+| DeepSeek V4-Flash | ✅ |  | ✅ | A2/A3 | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |  | ✅ | 1M |  | --- |
+| GLM-5.1 | ✅ |  | ✅ | A2/A3 | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 200k |  | --- |
+| gLM-5.2 | 🔵 |  | ✅ | A2/A3 | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 200k |  | --- |
 [更多](model_support_lists.md)
 
 ## 贡献

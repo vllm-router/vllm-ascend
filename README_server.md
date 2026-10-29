@@ -7,23 +7,33 @@
 
 2、容器部署完成
 
-3、网络部署
-
-需要分别配置边云服务器业务面和参数面网卡互通
+3、网络部署(需要分别配置边云服务器业务面和参数面网卡互通)
 
 ## 边云协同服务部署
 
 1. 进入容器后，执行以下命令启动服务。
 
+（1）边侧服务器
 ```
+#!/bin/bash
+
+# ========== 环境变量 ==========
+export VLLM_HOST_IP=<边侧IP>
+export GLOO_SOCKET_IFNAME=<边侧通信网卡名>
+export TP_SOCKET_IFNAME=<边侧通信网卡名>
+export HCCL_SOCKET_IFNAME=<边侧通信网卡名>
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=<边侧IP>
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=1
-export LD_PRELOAD=/usr/lib/aarch64‑linux‑gnu/libjemalloc.so.2:$LD_PRELOAD
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export TASK_QUEUE_ENABLE=1
-export CODEBASE_DIR="/vllm‑workspace"
-export PYTHONPATH="${CODEBASE_DIR}/vllm‑ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
@@ -31,28 +41,83 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
+export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
+export VLLM_LOGGING_LEVEL=INFO
 
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-vllm serve /home/weight/Qwen3.6‑27B \
-    --served‑model‑name "qwen3.6‑27b" \
+# ========== 启动命令 ==========
+vllm serve /home/weight/Qwen3.6-27B \
     --host 0.0.0.0 \
-    --port 8314 \
-    --tensor‑parallel‑size 8 \
-    --max‑model‑len 262144 \
-    --max‑num‑batched‑tokens 8192 \
-    --max‑num‑seqs 196 \
-    --gpu‑memory‑utilization 0.95 \
-    --trust‑remote‑code \
-    --async‑scheduling \
-    --allowed‑local‑media‑path / \
-    --mm_processor_cache_type="shm" \
-    --mm‑processor‑cache‑gb 0 \
-    --speculative‑config '{"num_speculative_tokens": 3, "method":"qwen3_5_mtp", "enforce_eager": true}' \
-    --additional‑config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert": true, "enable_weight_nz_layout":true}' \
-    --compilation‑config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600, 604, 608, 612, 616, 620, 624, 628, 632, 636, 640, 644, 648, 652, 656, 660, 664, 668, 672, 676, 680, 684, 688, 692, 696, 700, 704, 708, 712, 716, 720, 724, 728, 732, 736, 740, 744, 748, 752, 756, 760, 764, 768, 772, 776, 780, 784, 788, 792, 796, 800, 804, 808, 812, 816, 820, 824, 828, 832, 836, 840, 844, 848, 852, 856, 860, 864, 868, 872, 876, 880, 884, 888, 892, 896, 900, 904, 908, 912, 916, 920, 924, 928, 932, 936, 940, 944, 948, 952, 956, 960, 964, 968, 972, 976, 980, 984, 988, 992, 996, 1000]}'
+    --port <port> \
+    --master-addr <边侧IP> \
+    --master-port <master-port> \
+    --max-model-len 262144 \
+    --served-model-name <自定义模型名称> \
+    --pipeline-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}' \
+    --max-num-seqs 196 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.9
 ```
+（2）
+云测服务器
+```commandline
 
+#!/bin/bash
+
+# ========== 环境变量 ==========
+export VLLM_HOST_IP=<云侧IP>
+export GLOO_SOCKET_IFNAME=<云侧通信网卡名>
+export TP_SOCKET_IFNAME=<云侧通信网卡名>
+export HCCL_SOCKET_IFNAME=<云侧通信网卡名>
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=<边侧IP>
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD=1
+export VLLM_LOGGING_LEVEL=INFO
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
+export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧IP>
+
+# ========== 启动命令 ==========
+vllm serve /weight/weight/Qwen3.6-27B \
+    --master-addr <边侧IP> \
+    --master-port <master-port> \
+    --max-model-len 262144 \
+    --served-model-name <自定义模型名称> \
+    -pp 2 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code --nnodes 2 --node-rank 1  --edge-npu-count 1 --cloud-npu-count 8 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60]}' \
+    --max-num-seqs 196 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.9 \
+    --speculative-config '{"num_speculative_tokens": 3, "method":"qwen3_5_mtp", "enforce_eager": true}'
+```
 根据实际情况修改启动命令中的配置参数，参数说明如下
 
 表1 配置参数说明

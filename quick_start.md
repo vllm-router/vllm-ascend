@@ -38,7 +38,7 @@ chmod -R 755 /home/weight
 
 该镜像已具备模型运行所需的基础环境，包括：CANN、FrameworkPTAdapter、VLLM 与 VLLM‑Ascend，可实现模型快速上手推理。
 
-表 2 容器内各组件安装路径
+表 1 容器内各组件安装路径
 
 
 | 组件 | 安装路径 |
@@ -98,9 +98,9 @@ cd /vllm-workspace/vllm
 
 
 ## 边云协同分布式推理服务部署
-1. [使用标准服务器](README_server.md)
+1. [边云都使用服务器](README_server.md)
 
-2. [使用一体机](README_all-in-one.md)
+2. [边侧使用一体机，云测使用服务器](README_all-in-one.md)
 
 ## [更多模型部署参考](examples.md)
 
