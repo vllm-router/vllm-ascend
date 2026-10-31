@@ -276,6 +276,7 @@ class LwdEdgeWorker(NPUWorker):
         ring[idx][2] = ev
         return dev[:n]
 
+    @torch.inference_mode()
     def _execute_lwd_embed(
         self,
         seqno: int,
@@ -494,12 +495,12 @@ class LwdEdgeWorker(NPUWorker):
                     )
                     if s == e:
                         continue
-                    rows = item_embeds[s:e]
+                    rows = item_embeds[s:e].clone()
                     is_mm[req_start_pos + start_idx : req_start_pos + end_idx] |= (
                         is_embed[start_idx:end_idx]
                     )
                 else:
-                    rows = item_embeds[start_idx:end_idx]
+                    rows = item_embeds[start_idx:end_idx].clone()
                     is_mm[req_start_pos + start_idx : req_start_pos + end_idx] = True
                 mm_embeds.append(rows)
             if cached and p_offset + n >= max_end:
@@ -508,6 +509,7 @@ class LwdEdgeWorker(NPUWorker):
             req_start += n
         return mm_embeds, is_mm
 
+    @torch.inference_mode()
     def _execute_lwd_unembed(
         self, seqno: int, batch_meta: LwdUnembedBatch
     ) -> ModelRunnerOutput:
