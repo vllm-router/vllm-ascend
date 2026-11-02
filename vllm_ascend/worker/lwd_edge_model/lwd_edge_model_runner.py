@@ -292,13 +292,21 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     def _lwd_register_engram_prompts(self, scheduler_output: SchedulerOutput) -> None:
         """Keep the full prompt of each new request for its chunks' look-back;
-        released after its last chunk or by `lwd_release_finished`."""
+        released by `lwd_release_finished` only.
+
+        A refill re-announces a request that is already registered and carries
+        no prompt ids (the scheduler only needs the row range), so an entry is
+        kept until the request ends rather than dropped after its last chunk.
+        """
         if self.engram_hasher is None:
             return
         for req_data in scheduler_output.scheduled_new_reqs:
+            req_id = req_data.req_id
             if req_data.prompt_token_ids is None:
-                raise ValueError(f"[LWD] Engram hashing needs prompt token ids, request {req_data.req_id} has none")
-            self._lwd_engram_prompts[req_data.req_id] = torch.tensor(req_data.prompt_token_ids, dtype=torch.int64)
+                if req_id in self._lwd_engram_prompts:
+                    continue
+                raise ValueError(f"[LWD] Engram hashing needs prompt token ids, request {req_id} has none")
+            self._lwd_engram_prompts[req_id] = torch.tensor(req_data.prompt_token_ids, dtype=torch.int64)
 
     def _lwd_engram_hashes(self, batch_meta: LwdEmbedBatch) -> torch.Tensor:
         """CPU int32 `[T, L, C]` Engram bucket indices of this batch's rows,
@@ -316,8 +324,6 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 raise ValueError(f"[LWD] no registered prompt for Engram hashing of request {req_id}")
             end = start + len(token_ids)
             chunks.append(self.engram_hasher.prompt_hashes(prompt, start, end))
-            if end >= prompt.numel():
-                self._lwd_engram_prompts.pop(req_id)
         return torch.cat(chunks)
 
     def lwd_release_finished(self, finished_req_ids: set[str]) -> None:

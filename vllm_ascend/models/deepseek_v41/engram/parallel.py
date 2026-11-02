@@ -62,7 +62,11 @@ def gather_engram_hashes(hash_ids: torch.Tensor, *, dp_shared_memory: bool = Fal
     decode skips DP metadata synchronization and local graph sizes differ.
     """
     dp_group = get_engram_dp_group()
-    if dp_group is None or dp_shared_memory:
+    # A group of one has nothing to gather. LWD builds the group
+    # unconditionally (creation is a world collective), so unlike the native
+    # path it reaches here at world_size 1, where the token slot below would
+    # demand DP metadata that a single-DP deployment never builds.
+    if dp_group is None or dp_group.world_size == 1 or dp_shared_memory:
         return hash_ids
     slot = engram_gathered_num_tokens()
     if hash_ids.shape[0] > slot:

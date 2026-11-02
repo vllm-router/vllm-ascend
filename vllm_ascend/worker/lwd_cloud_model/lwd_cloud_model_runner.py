@@ -25,8 +25,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_engram_inputs import (
+    LwdEngramBatchView,
     LwdEngramDims,
     LwdEngramInputs,
+    LwdStageToDevice,
     lwd_check_image_placeholder_spans,
     lwd_embed_lookup,
 )
@@ -279,7 +281,56 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self._lwd_inject_remote_embeds(dev, win_idx, plan, num_scheduled_tokens)
         if self.lwd_hash_state is not None:
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
+        if self.lwd_engram_inputs is not None:
+            self.lwd_engram_inputs.plan_step(
+                self._lwd_engram_batch_view(self.input_batch.num_reqs),
+                num_scheduled_tokens,
+                self._lwd_engram_staging(
+                    "engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity
+                ),
+            )
         return out
+
+    def _lwd_engram_batch_view(self, num_reqs: int) -> LwdEngramBatchView:
+        return LwdEngramBatchView(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            num_prompt_tokens=self.input_batch.num_prompt_tokens[:num_reqs],
+        )
+
+    def _lwd_engram_staging(self, name: str, dtype: torch.dtype, capacity: int) -> LwdStageToDevice:
+        """Stage-to-device of a named ring sized once to the step's maximum."""
+        return self._lwd_staging(name, dtype=dtype, min_capacity=capacity).stage_to_device
+
+    def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
+        """Lookback window with the prompt tail taken from the edge.
+
+        The cloud token table holds placeholders at prompt positions, so tail
+        cells carry representative raw ids of the edge's compressed ids; see
+        ``LwdEngramInputs.build_window``.
+        """
+        engram = self.lwd_engram_inputs
+        if engram is None:
+            return super()._prepare_lookback_token_ids(num_reqs)
+        assert self.lookback_token_ids is not None
+        if num_reqs == 0:
+            # Synthetic forwards: no request rows, so no window cell is read.
+            self.lookback_token_ids.gpu.fill_(-1)
+            return self.lookback_token_ids.gpu
+        return engram.build_window(
+            self.lookback_token_ids.gpu,
+            self._lwd_engram_batch_view(num_reqs),
+            self.positions,
+            self.query_start_loc.gpu,
+            self._lwd_engram_staging("engram_window", torch.int64, engram.window_capacity),
+        )
+
+    def _get_engram_device_inputs(self) -> dict[str, torch.Tensor]:
+        """Native Engram metadata plus this step's edge-provided prompt-row hashes."""
+        inputs = super()._get_engram_device_inputs()
+        if inputs and self.lwd_engram_inputs is not None:
+            inputs.update(self.lwd_engram_inputs.device_inputs())
+        return inputs
 
     def _lwd_prepare_hash_batch(self, num_scheduled_tokens: np.ndarray) -> None:
         """Skip remote expert staging for decode, preserving graph buffers."""
@@ -405,6 +456,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             consumed = stager.consumed_rows(req_id)
             if consumed > new_computed:
                 stager.rewind_consumed(req_id, new_computed)
+                if self.lwd_engram_inputs is not None and new_computed == 0:
+                    # The rewound request re-sends its first chunk, which
+                    # builds a fresh record; the stale one would be a
+                    # duplicate.
+                    self.lwd_engram_inputs.release(req_id)
                 lwd_logger.info(
                     "[LWD][cloud-runner] REWIND req=%s: host read pointer "
                     "%d -> %d (preemption recompute; payload retained)",
@@ -551,9 +607,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # Clear the real-batch marker before cloud-side dummy forwards, so the
     # previous step's routing is never reused.
     def _dummy_run(self, *args, **kwargs) -> None:
-        """Clear the real-batch Hash routing marker, then run the dummy forward."""
+        """Clear the real-batch Hash routing and Engram markers, then run the dummy forward."""
         # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
+        if self.lwd_engram_inputs is not None:
+            self.lwd_engram_inputs.end_step()
         return super()._dummy_run(*args, **kwargs)
 
     def _model_forward(
@@ -608,14 +666,30 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 # request-side placeholder: all zeros, never read (the
                 # router swaps in row indices).
                 input_ids = torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])
-        return super()._model_forward(
-            num_tokens_padded,
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            **model_kwargs,
-        )
+        engram = self.lwd_engram_inputs
+        if engram is None:
+            return super()._model_forward(
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **model_kwargs,
+            )
+        # MoE bias_vl and the Engram dead mask read ids on every row, so the
+        # cloud's placeholder prompt ids are replaced by public values.
+        input_ids = engram.model_input_ids(self.input_ids.gpu, num_tokens_padded)
+        try:
+            return super()._model_forward(
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **model_kwargs,
+            )
+        finally:
+            engram.end_step()
 
     def lwd_up_layout(self) -> LwdUpPayloadLayout:
         """UP payload layout of this model, cached at first use.
@@ -664,6 +738,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 request = self.requests.get(req_id)
                 if request is None or request.num_computed_tokens >= request.num_prompt_tokens:
                     self.lwd_hash_state.discard(req_id)
+        if self.lwd_engram_inputs is not None:
+            self.lwd_engram_inputs.release_consumed(self.requests)
         embeds_map = self.input_batch.req_prompt_embeds
         if not embeds_map:
             return
@@ -889,11 +965,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if engram is not None:
                 if engram_hashes is None:
                     raise RuntimeError(f"[Lwd][cloud-runner] missing UP Engram hashes for {window.req_id}")
+                # The record is created by the first chunk and holds the whole
+                # request's spans; later chunks must present none.
+                spans = self._lwd_image_spans.get(window.req_id, []) if window.start == 0 else []
                 engram.add_prompt_chunk(
                     window.req_id,
                     window.start,
                     prompt_len,
-                    self._lwd_image_spans.get(window.req_id, []),
+                    spans,
                     embeds[row : row + window.rows],
                 )
                 engram.write_prompt_hashes(
