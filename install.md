@@ -9,13 +9,13 @@ _# 安装
 - 
 软件：
 
-| 软件 | 支持版本 | 说明 |
-| --- | --- | --- |
-| Ascend HDK | 请参阅 CANN 9.1.0 版本说明 | CANN 所需 |
-| CANN | == 9.1.0 | vllm-ascend 和 TorchNPU 所必需 |
-| TorchNPU | == 2.10.0.post4 | vllm-ascend 所需，无需手动安装，将在以下步骤中自动安装 |
-| torch | == 2.10.0 | TorchNPU 和 vllm 所必需，无需手动安装，将在以下步骤中自动安装 |
-| NNAL | == 9.1.0 | libatb.so 所需，支持高级张量运算 |
+| 软件       | 支持版本                   | 说明                                                          |
+|------------|----------------------------|---------------------------------------------------------------|
+| Ascend HDK | 请参阅 CANN 9.1.0 版本说明 | CANN 所需                                                     |
+| CANN       | == 9.1.0                   | vllm-ascend 和 TorchNPU 所必需                                |
+| TorchNPU   | == 2.10.0.post4            | vllm-ascend 所需，无需手动安装，将在以下步骤中自动安装        |
+| torch      | == 2.10.0                  | TorchNPU 和 vllm 所必需，无需手动安装，将在以下步骤中自动安装 |
+| NNAL       | == 9.1.0                   | libatb.so 所需，支持高级张量运算                              |
 
 ## 操作系统环境安装
 ### 服务器
@@ -66,6 +66,7 @@ ip addr show
 ```
 
 2、跨节点PING测试
+
 从服务器ping
 ```commandline
 hccn_tool -i 0 -ping -g address x.x.x.x 

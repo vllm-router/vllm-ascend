@@ -23,7 +23,6 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ./cann-hcomm_*.run --full
 dpkg hiroce3-*.deb
 ```
-
 3. 准备white_list白名单
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
@@ -35,7 +34,6 @@ dpkg hiroce3-*.deb
     ]
 }
 ```
-
 4. 准备ranktable
 ```commandline
 {
@@ -128,14 +126,12 @@ dpkg hiroce3-*.deb
 }
 
 ```
-
 5. 进入容器后，执行以下命令启动服务。
    
 (1)边侧一体机
 
-```
+```bash
 #!/bin/bash
-
 # ========== 环境变量 ==========
 export VLLM_HOST_IP=<边侧IP>
 export GLOO_SOCKET_IFNAME=<边侧通信网卡名>
@@ -170,7 +166,7 @@ export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
 export VLLM_LOGGING_LEVEL=INFO
 
 # ========== 启动命令 ==========
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve /home/weight/Qwen3.6-27B.md \
     --host 0.0.0.0 \
     --port <port> \
     --master-addr <边侧IP> \
@@ -190,9 +186,8 @@ vllm serve /home/weight/Qwen3.6-27B \
 
 （2）云测服务器
 
-```commandline
+```bash
 #!/bin/bash
-
 # ========== 环境变量 ==========
 export VLLM_HOST_IP=<云侧IP>
 export GLOO_SOCKET_IFNAME=<云侧通信网卡名>
@@ -228,7 +223,7 @@ export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
 export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧IP>
 
 # ========== 启动命令 ==========
-vllm serve /weight/weight/Qwen3.6-27B \
+vllm serve /weight/weight/Qwen3.6-27B.md \
     --master-addr <边侧IP> \
     --master-port <master-port> \
     --max-model-len 262144 \
@@ -249,14 +244,14 @@ vllm serve /weight/weight/Qwen3.6-27B \
 
 表1 配置参数说明
 
-| 配置项 | 配置说明 |
-| --- | --- |
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。 |
-| vllm serve | 模型权重路径。程序会读取该路径下的 config.json 中 torch_dtype 和 vocab_size 字段的值，需保证路径和相关字段存在。必填，默认值："/data/atb_testdata/weights/llama1‑65b‑safetensors"。该路径会进行安全校验，需要和执行用户的属组和权限保持一致。 |
-| served‑model‑name | 模型名称。 |
-| host | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。 |
-| port | 模型服务端口号。 |
-| max‑model‑len | 模型服务上下文长度。 |
+| 配置项                    | 配置说明                                                                                                                                                                                                                                      |
+|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                                                                                                                                       |
+| vllm serve                | 模型权重路径。程序会读取该路径下的 config.json 中 torch_dtype 和 vocab_size 字段的值，需保证路径和相关字段存在。必填，默认值："/data/atb_testdata/weights/llama1‑65b‑safetensors"。该路径会进行安全校验，需要和执行用户的属组和权限保持一致。 |
+| served‑model‑name         | 模型名称。                                                                                                                                                                                                                                    |
+| host                      | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                                                                                                                                             |
+| port                      | 模型服务端口号。                                                                                                                                                                                                                              |
+| max‑model‑len             | 模型服务上下文长度。                                                                                                                                                                                                                          |
 
 2. 发送请求。
 用户可使用 HTTPS 客户端（Linux curl 命令，Postman 工具等）发送 HTTPS 请求，此处以 Linux curl 命令为例进行说明。

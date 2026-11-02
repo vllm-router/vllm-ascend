@@ -46,7 +46,7 @@ export ASCEND_RT_VISIBLE_DEVICES=4,5
 
 ### 边侧启动命令
 ```bash
-vllm serve /weight/Qwen3.6-27B \
+vllm serve /weight/Qwen3.6-27B.md \
     --served-model-name "qwen3.6-27B" \
     --host 0.0.0.0 \
     --port 8314 \
@@ -89,7 +89,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 ### 云侧启动命令
 ```bash
-vllm serve /weight/Qwen3.6-27B \
+vllm serve /weight/Qwen3.6-27B.md \
     --served-model-name "qwen3.6-27B" \
     --headless \
     --master-addr <边侧IP> \
@@ -134,7 +134,7 @@ export ASCEND_RT_VISIBLE_DEVICES=4
 
 ### 边侧启动命令
 ```bash
-vllm serve /weight/Qwen3.6-27B \
+vllm serve /weight/Qwen3.6-27B.md \
     --served-model-name "qwen3.6-27B" \
     --host 0.0.0.0 \
     --port 8314 \
@@ -156,7 +156,7 @@ vllm serve /weight/Qwen3.6-27B \
 
 ### 云侧启动命令
 ```bash
-vllm serve /weight/Qwen3.6-27B \
+vllm serve /weight/Qwen3.6-27B.md \
     --served-model-name "qwen3.6-27B" \
     --headless \
     --master-addr <边侧IP> \

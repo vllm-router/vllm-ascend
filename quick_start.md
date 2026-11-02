@@ -41,42 +41,49 @@ chmod -R 755 /home/weight
 表 1 容器内各组件安装路径
 
 
-| 组件 | 安装路径 |
-| --- | --- |
-| CANN | /usr/local/Ascend/cann |
-| CANN‑NNAL‑ATB | /usr/local/Ascend/nnal/atb |
-| VLLM | /vllm‑workspace/vllm |
-| VLLM‑Ascend | /vllm‑workspace/vllm‑ascend |
+| 组件          | 安装路径                    |
+|---------------|-----------------------------|
+| CANN          | /usr/local/Ascend/cann      |
+| CANN‑NNAL‑ATB | /usr/local/Ascend/nnal/atb  |
+| VLLM          | /vllm‑workspace/vllm        |
+| VLLM‑Ascend   | /vllm‑workspace/vllm‑ascend |
 
 
 2. 下载并加载镜像后，参考以下命令创建容器。
 
 ```
-docker run -itd --privileged --name=<container-name> --ipc=host --net=host  --shm-size 500g  \
---device=/dev/davinci0  --device=/dev/davinci1  --device=/dev/davinci2  --device=/dev/davinci3  \
---device=/dev/davinci4  --device=/dev/davinci5  --device=/dev/davinci6  --device=/dev/davinci7  \
---device=/dev/davinci_manager  --device=/dev/hisi_hdc  --device /dev/devmm_svm  \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
--v /usr/local/sbin/npu‑smi:/usr/local/sbin/npu‑smi  -v /usr/local/sbin:/usr/local/sbin \
--v /etc/hccn.conf:/etc/hccn.conf -v /home/weight:/home/weight  fe1e88748912
+docker run -itd --privileged\
+--name=<container-name> \
+--ipc=host --net=host\
+--shm-size 500g \
+--device=/dev/davinci0 \
+--device=/dev/davinci1 \
+--device=/dev/davinci2 \
+--device=/dev/davinci3 \
+--device=/dev/davinci4 \
+--device=/dev/davinci5 \
+--device=/dev/davinci6 \
+--device=/dev/davinci7 \
+--device=/dev/davinci_manager \
+--device=/dev/hisi_hdc \
+--device /dev/devmm_svm \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+-v /usr/local/sbin/npu‑smi:/usr/local/sbin/npu‑smi \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /etc/hccn.conf:/etc/hccn.conf \
+-v /home/weight:/home/weight \
+-it $IMAGE bash
 ```
-
-> 
-> [!NOTE] 说明
-> 
-> 
-> - “fe1e88748912” 为镜像 ID，可根据实际情况修改。
 
 表 1 参数说明
 
-表格
-
-| 参数 | 参数说明 |
-| --- | --- |
-| --name | 设置容器名称。 |
-| --device | 表示映射的设备，可以挂载一个或者多个设备。需要挂载的设备如下：/dev/davinciX：NPU 设备，X 是 ID 号，如：davinci0。/dev/davinci_manager：davinci 相关的管理设备。/dev/hisi_hdc：hdc 相关管理设备。/dev/devmm_svm：内存管理相关设备。可根据以下命令查询 device 个数及名称方式，根据需要绑定设备，修改上面命令中的 "--device=****"。`ll /dev/` |
-| -v /usr/local/Ascend/driver:/usr/local/Ascend/driver | 将宿主机目录 “/usr/local/Ascend/driver” 挂载到容器，请根据驱动所在实际路径修改。 |
-| -v /path‑to‑weights:/path‑to‑weights | 设定权重挂载的路径，需要根据用户的情况修改。请将权重文件和数据集文件同时放置于该路径下。 |
+| 参数                                                 | 参数说明                                                                                                                                                                                                                                                                                                                                   |
+|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| --name                                               | 设置容器名称。                                                                                                                                                                                                                                                                                                                             |
+| --device                                             | 表示映射的设备，可以挂载一个或者多个设备。需要挂载的设备如下：/dev/davinciX：NPU 设备，X 是 ID 号，如：davinci0。/dev/davinci_manager：davinci 相关的管理设备。/dev/hisi_hdc：hdc 相关管理设备。/dev/devmm_svm：内存管理相关设备。可根据以下命令查询 device 个数及名称方式，根据需要绑定设备，修改上面命令中的 "--device=****"。`ll /dev/` |
+| -v /usr/local/Ascend/driver:/usr/local/Ascend/driver | 将宿主机目录 “/usr/local/Ascend/driver” 挂载到容器，请根据驱动所在实际路径修改。                                                                                                                                                                                                                                                           |
+| -v /path‑to‑weights:/path‑to‑weights                 | 设定权重挂载的路径，需要根据用户的情况修改。请将权重文件和数据集文件同时放置于该路径下。                                                                                                                                                                                                                                                   |
 
 3. 执行以下命令进入容器。
 
