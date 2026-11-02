@@ -145,7 +145,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # [Lwd][perf] Worker start time (subtract the engine's rpc-enqueue
         # ts = dispatch-to-start latency; spread across ranks = collective
         # alignment cost)
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
             self.rank,
             time.monotonic(),
@@ -162,7 +162,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
         # whole forward pass (sample/collect are itemized separately in
         # sample_tokens)
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] cloud-exec total=%.2fms",
             (time.monotonic() - _t0) * 1000,
         )
@@ -491,7 +491,7 @@ class LwdCloudWorker(LwdWorkerBase):
             # collection (rank computation included); send = the DOWN
             # submit (snapshot clone + isend + bridge wait); harvest =
             # the fenced meta copy; total = the whole step
-            lwd_logger.info(
+            lwd_logger.debug(
                 "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f harvest=%.2f total=%.2fms rows=%d",
                 seqno,
                 (_t_sample - _t0) * 1000,

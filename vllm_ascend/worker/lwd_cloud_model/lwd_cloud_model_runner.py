@@ -1164,7 +1164,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # could not fence the side-stream copy on this platform).
         ready_event = torch.npu.Event()
         ready_event.record()
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] collect rows=%d rank=%.2f total=%.2fms",
             hidden_packet.shape[0],
             (selection_done - _t0) * 1000,

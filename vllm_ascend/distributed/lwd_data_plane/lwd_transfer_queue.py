@@ -489,7 +489,7 @@ class LwdTransferQueue:
         # posting the send/recv blocks the host (the lockstep criterion).
         # log_analyze_tools/lwd_backlog_probe.py (mm branch) parses this line,
         # including the LwdChannelType repr in ch=; keep the format.
-        logger.info(
+        logger.debug(
             "[Lwd][perf] bridge-wait op=%s ch=%s dur=%.2fms",
             self.op,
             self.channel_type,

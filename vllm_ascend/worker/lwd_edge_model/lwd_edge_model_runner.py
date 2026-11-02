@@ -254,7 +254,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # bridge's handle.wait) — if the UP world broadcast is waiting on
         # the cloud's enqueue, this segment grows visibly (direct evidence
         # of chunk-level lockstep)
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f total=%.2fms tokens=%d",
             seqno,
             (_t_fwd - _t0) * 1000,
@@ -393,7 +393,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # tensor to land (network); lm_head = the vocabulary forward
         # (weight bandwidth); select = argsort name lookup (.item sync);
         # total = the whole edge tail
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] unembed seqno=%s post_recv=%.2f wait_tensor=%.2f "
             "lm_head=%.2f select=%.2f total=%.2fms reqs=%d",
             seqno,

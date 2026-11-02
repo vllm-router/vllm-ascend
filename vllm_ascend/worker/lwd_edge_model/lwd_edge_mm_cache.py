@@ -128,7 +128,7 @@ class LwdEdgeMmCache:
         while len(self._hash_embeds) > _LWD_MM_HASH_CACHE_MAX_ITEMS:
             self._hash_embeds.pop(next(iter(self._hash_embeds)))
         # [Lwd][perf] Vision tower duration (batch level, cache misses only; same-image reuse never re-encodes)
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] mm-encoder reqs=%d items=%d dur=%.2fms",
             len(batch_meta.req_ids),
             len(missing_features),
