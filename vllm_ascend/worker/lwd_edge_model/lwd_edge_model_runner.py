@@ -153,6 +153,30 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             lwd_up_send_watermarks=watermarks,
         )
 
+    def _lwd_gather_mm(
+        self,
+        batch_meta: LwdEmbedBatch,
+        scheduler_output: SchedulerOutput,
+        model: torch.nn.Module,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        is_refill = getattr(batch_meta, "is_refill", False)
+        new_reqs = scheduler_output.scheduled_new_reqs
+        snapshot = self.mm_cache.snapshot_features([req_data.req_id for req_data in new_reqs]) if is_refill else {}
+        try:
+            for req_data in new_reqs:
+                feats = [f for f in req_data.mm_features if f.modality != "prompt_embeds"]
+                if feats:
+                    self.mm_cache.register(req_data.req_id, feats)
+            return self.mm_cache.gather_chunk(
+                batch_meta,
+                model,
+                self.device,
+                self.pin_memory,
+            )
+        finally:
+            if is_refill:
+                self.mm_cache.restore_features(snapshot)
+
     @torch.inference_mode()
     def execute_lwd_embed(
         self,
@@ -164,18 +188,6 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if not batch_meta.token_ids:
             return self._lwd_watermarked_output(batch_meta.dp_idx)
 
-        # Register newly arrived requests' mm features (the first chunk
-        # carries data with scheduled_new_reqs; later chunks hit the
-        # cache). Registration deliberately does not filter data:None
-        # entries — the encoder execution point fails fast on them (see
-        # LwdEdgeMmCache.encoder_outputs); silently skipping would drop
-        # image embeds and embed placeholder tokens as text, i.e. compute
-        # garbage.
-        for req_data in scheduler_output.scheduled_new_reqs:
-            feats = [f for f in req_data.mm_features if f.modality != "prompt_embeds"]
-            if feats:
-                self.mm_cache.register(req_data.req_id, feats)
-
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
         lwd_logger.debug("[Lwd][edge-worker] embed token_ids=%s", flat_token_ids)
@@ -185,12 +197,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # collect vision-tower embeds for this chunk window + build the
         # is_multimodal mask and take the model's native embed_input_ids
         # merge branch; text-only batches take the original direct path.
-        mm_embeds, is_mm = self.mm_cache.gather_chunk(
-            batch_meta,
-            model,
-            self.device,
-            self.pin_memory,
-        )
+        mm_embeds, is_mm = self._lwd_gather_mm(batch_meta, scheduler_output, model)
         if mm_embeds:
             embeds = model.embed_input_ids(
                 token_ids_tensor,

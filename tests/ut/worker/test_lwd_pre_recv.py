@@ -69,8 +69,45 @@ def test_make_hint_preserves_complete_row_tables() -> None:
         "rows": [2, 2],
         "prompt_offsets": [1, 0],
         "prompt_lens": [5, 4],
+        "refills": [],
+        "prefix_nonces": [],
     }
-    assert pre_recv.hint_fields(hint) == (3, 4, 1, ["a", "b"], [2, 2], [1, 0], [5, 4])
+    assert pre_recv.hint_fields(hint) == (
+        3,
+        4,
+        1,
+        ["a", "b"],
+        [2, 2],
+        [1, 0],
+        [5, 4],
+        [False, False],
+        [0, 0],
+    )
+
+
+def test_prefix_nonces_are_a_parallel_table_with_zero_defaults() -> None:
+    hint = valid_hint()
+    hint["prefix_nonces"] = [7]
+    assert pre_recv.hint_fields(hint).prefix_nonces == [7, 0]
+
+    del hint["prefix_nonces"]
+    assert pre_recv.hint_fields(hint).prefix_nonces == [0, 0]
+    for invalid in ([1, 2, 3], True, ["7", 0], [True, 0], [-1, 0]):
+        hint["prefix_nonces"] = invalid
+        assert pre_recv.hint_fields(hint) is None
+
+
+def test_refills_are_a_parallel_table_with_false_defaults() -> None:
+    hint = valid_hint()
+    hint["refills"] = [True]
+    assert pre_recv.hint_fields(hint).refills == [True, False]
+
+    del hint["refills"]
+    assert pre_recv.hint_fields(hint).refills == [False, False]
+    hint["refills"] = [True, False, True]
+    assert pre_recv.hint_fields(hint) is None
+    hint["refills"] = True
+    assert pre_recv.hint_fields(hint) is None
 
 
 def test_sideband_slot_is_four_kib() -> None:

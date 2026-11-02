@@ -183,6 +183,8 @@ def make_hint(
     rows: list[int],
     offsets: list[int],
     prompt_lens: list[int],
+    refills: list[bool] | None = None,
+    prefix_nonces: list[int] | None = None,
 ) -> dict:
     return pre_recv.make_recv_hint(
         seqno,
@@ -192,6 +194,8 @@ def make_hint(
         rows=rows,
         prompt_offsets=offsets,
         prompt_lens=prompt_lens,
+        refills=refills,
+        prefix_nonces=prefix_nonces,
     )
 
 
@@ -266,6 +270,45 @@ def test_completion_reports_cumulative_rows_and_releases_device(worker) -> None:
     assert worker._data_plane.futures[0].events == ["done", "result", "staged_done", "result", "release"]
     assert worker._early_recv_last_delivered == 1
     assert not worker._early_recv_futures
+
+
+def test_refill_done_reports_nonce_after_staging_before_watermark(worker) -> None:
+    worker.start_early_irecv(make_hint(0, ["a"], [6], [4], [10], prefix_nonces=[7]))
+    worker._report_irecv_completions()
+    worker.start_early_irecv(make_hint(1, ["a"], [2], [2], [10], refills=[True], prefix_nonces=[7]))
+    future = worker._data_plane.futures[1]
+    future.is_staged = False
+
+    worker._report_irecv_completions()
+    assert len(worker._irecv_done_mq.items) == 1
+    assert worker._lwd_stager.take_refill_done() == []
+
+    future.is_staged = True
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mq.items == [
+        ((lwd_types.LwdChannelType.UP, 0), [("a", 10)]),
+        ("refill_done", "a", 7),
+        ((lwd_types.LwdChannelType.UP, 1), [("a", 4)]),
+    ]
+
+
+def test_aborted_refill_reports_only_watermark(worker) -> None:
+    worker.start_early_irecv(make_hint(0, ["a"], [6], [4], [10]))
+    worker._report_irecv_completions()
+    worker.start_early_irecv(make_hint(1, ["a"], [2], [2], [10], refills=[True]))
+    scheduler_output = NS(
+        lwd_batch=NS(
+            batch_type=FakeBatchType.LWD_EMBED,
+            batch_meta=NS(aborted_req_ids=["a"]),
+        )
+    )
+    worker._lwd_up_post_recvs(scheduler_output)
+
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mq.items == [
+        ((lwd_types.LwdChannelType.UP, 0), [("a", 10)]),
+        ((lwd_types.LwdChannelType.UP, 1), []),
+    ]
 
 
 def test_unstaged_completion_is_not_published(worker) -> None:

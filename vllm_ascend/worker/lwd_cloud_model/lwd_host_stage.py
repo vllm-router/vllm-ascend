@@ -53,6 +53,7 @@ class LwdReqEmbed:
     numel: int
     prompt_rows: int
     hidden_size: int
+    prefix_nonce: int = 0
     tail_off: int = -1
     tail_numel: int = 0
     num_hash_layers: int = 0
@@ -61,6 +62,23 @@ class LwdReqEmbed:
     consumed: int = 0
     aborted: bool = False
     _written_hi: int = 0
+    _stage_floor: int = 0
+    _refill_lo: int | None = None
+    _refill_hi: int | None = None
+    _refill_completed: bool = False
+
+    def seed_prefix(self, hit_rows: int) -> None:
+        """Seed the watermarks at a prefix-cache hit boundary."""
+        if hit_rows <= 0 or hit_rows >= self.prompt_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: seed_prefix({hit_rows}) outside (0, prompt_rows={self.prompt_rows})"
+            )
+        if self._stage_floor or self.recv_rows or self._written_hi or self.consumed:
+            raise LwdHostStageGeometryError(f"req={self.req_id}: seed_prefix({hit_rows}) after arrivals/consumption")
+        self._stage_floor = hit_rows
+        self.recv_rows = hit_rows
+        self._written_hi = hit_rows
+        self.consumed = hit_rows
 
     def note_arrival(self, offset: int, rows: int) -> None:
         """Publish a contiguous or repeated arrival range."""
@@ -71,6 +89,8 @@ class LwdReqEmbed:
             raise LwdHostStageGeometryError(
                 f"req={self.req_id}: announced rows [{offset}, {end}) exceed prompt_rows={self.prompt_rows}"
             )
+        if offset < self._stage_floor:
+            self._note_refill_arrival(offset, rows)
         if offset > self._written_hi:
             raise LwdHostStageGeometryError(
                 f"req={self.req_id}: arrival gap [{self._written_hi}, {offset}) before chunk [{offset}, {end})"
@@ -87,6 +107,24 @@ class LwdReqEmbed:
             previous,
             self.recv_rows,
         )
+
+    def _note_refill_arrival(self, offset: int, rows: int) -> None:
+        end = offset + rows
+        if end > self._stage_floor:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: refill rows [{offset}, {end}) overrun stage floor S={self._stage_floor}"
+            )
+        if self._refill_hi is None:
+            self._refill_lo = offset
+            self._refill_hi = offset
+        elif offset > self._refill_hi:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: refill gap [{self._refill_hi}, {offset}) before chunk [{offset}, {end})"
+            )
+        if end > self._refill_hi:
+            self._refill_hi = end
+        if not self._refill_completed and self._refill_hi >= self._stage_floor:
+            self._refill_completed = True
 
     def available(self) -> int:
         return max(self.recv_rows - self.consumed, 0)
@@ -108,6 +146,13 @@ class LwdReqEmbed:
             raise LwdHostStageGeometryError(
                 f"req={self.req_id}: read {n_rows} rows at consumed={self.consumed} "
                 f"exceeds prompt_rows={self.prompt_rows}"
+            )
+        if self.consumed < self._stage_floor and (
+            self._refill_hi is None or (self._refill_hi < self._stage_floor and end_row > self._refill_hi)
+        ):
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: read [{self.consumed}, {end_row}) hits unfilled refill hole "
+                f"(refill_hi={self._refill_hi}, floor S={self._stage_floor})"
             )
         start = self.consumed * self.hidden_size
         return start, start + n_rows * self.hidden_size
@@ -139,6 +184,19 @@ class LwdReqEmbed:
         """Move the read pointer back without changing arrival watermarks."""
         if to_rows < 0 or to_rows > self.consumed:
             raise LwdHostStageGeometryError(f"req={self.req_id}: rewind target {to_rows} outside [0, {self.consumed}]")
+        self.consumed = to_rows
+
+    def skip_consumed(self, to_rows: int) -> None:
+        """Skip rows covered by a re-admission prefix-cache hit."""
+        if to_rows < self.consumed or to_rows > self.recv_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: skip target {to_rows} outside "
+                f"[consumed={self.consumed}, recv_rows={self.recv_rows}]"
+            )
+        if to_rows > self.prompt_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: skip target {to_rows} exceeds prompt_rows={self.prompt_rows}"
+            )
         self.consumed = to_rows
 
     def mark_aborted(self) -> None:
@@ -201,6 +259,7 @@ class LwdHostStager:
         self._last_delivered = -1
         self._batch_reqs: dict[int, list[str]] = {}
         self._arrival_plan: dict[int, list[tuple[LwdReqEmbed, int, int]]] = {}
+        self._refill_done: list[tuple[str, int]] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -256,6 +315,17 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req.consumed if req is not None else 0
 
+    def stage_floor(self, req_id: str) -> int:
+        with self._lock:
+            req = self._reqs.get(req_id)
+            return req._stage_floor if req is not None else 0
+
+    def take_refill_done(self) -> list[tuple[str, int]]:
+        with self._lock:
+            done = self._refill_done
+            self._refill_done = []
+        return done
+
     def allocate(self, seqno: int, numel: int) -> tuple[LwdBuffer, int]:
         """Bind a free device slot to one receive sequence number."""
         with self._lock:
@@ -291,7 +361,7 @@ class LwdHostStager:
                 return
             for req_id in batch.created_req_ids:
                 req = self._reqs.get(req_id)
-                if req is not None and req.recv_rows == 0 and req._written_hi == 0:
+                if req is not None and batch.request_hosts.get(req_id) is req and req._written_hi == req._stage_floor:
                     self._reqs.pop(req_id)
                     self._host_bytes -= (req.numel + req.tail_numel) * 2
 
@@ -306,6 +376,8 @@ class LwdHostStager:
         row_base: list[int] | None = None,
         num_hash_layers: int = 0,
         num_experts_per_tok: int = 0,
+        refills: list[bool] | None = None,
+        prefix_nonces: list[int] | None = None,
     ) -> list[tuple[LwdBuffer, int, int]]:
         """Allocate request storage and return ``(destination, source, size)`` D2H segments."""
         started = time.monotonic()
@@ -321,6 +393,20 @@ class LwdHostStager:
             num_hash_layers,
             num_experts_per_tok,
         )
+        if refills is None:
+            refills = [False] * len(rows)
+        elif len(refills) < len(rows):
+            refills = list(refills) + [False] * (len(rows) - len(refills))
+        elif len(refills) > len(rows):
+            raise LwdHostStageGeometryError(f"seqno={seqno}: {len(refills)} refill flags vs {len(rows)} requests")
+        if prefix_nonces is None:
+            prefix_nonces = [0] * len(rows)
+        elif len(prefix_nonces) < len(rows):
+            prefix_nonces = list(prefix_nonces) + [0] * (len(rows) - len(prefix_nonces))
+        elif len(prefix_nonces) > len(rows):
+            raise LwdHostStageGeometryError(
+                f"seqno={seqno}: {len(prefix_nonces)} prefix nonces vs {len(rows)} requests"
+            )
         tail_per_row = 4 * num_hash_layers * num_experts_per_tok
         batch = LwdStagedBatch(
             seqno=seqno,
@@ -356,6 +442,8 @@ class LwdHostStager:
                         tail_per_row,
                         num_hash_layers,
                         num_experts_per_tok,
+                        refills[index],
+                        prefix_nonces[index],
                     )
                     batch.request_hosts[req_id] = host
                     plan.append((host, dest_row, rows[index]))
@@ -384,6 +472,13 @@ class LwdHostStager:
                 if host.req_id in self._ended_req_ids or host.aborted:
                     continue
                 host.note_arrival(dest_row, n_rows)
+                if host._refill_completed:
+                    assert host._refill_lo is not None
+                    host._stage_floor = host._refill_lo
+                    host._refill_lo = None
+                    host._refill_hi = None
+                    host._refill_completed = False
+                    self._refill_done.append((host.req_id, host.prefix_nonce))
                 rows.append((host.req_id, n_rows, dest_row))
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
@@ -418,6 +513,14 @@ class LwdHostStager:
             if req is None:
                 return False
             req.rewind_consumed(to_rows)
+            return True
+
+    def skip_consumed(self, req_id: str, to_rows: int) -> bool:
+        with self._lock:
+            req = self._reqs.get(req_id)
+            if req is None:
+                return False
+            req.skip_consumed(to_rows)
             return True
 
     def abort_request(self, req_id: str) -> bool:
@@ -530,19 +633,24 @@ class LwdHostStager:
         tail_per_row: int,
         num_hash_layers: int,
         num_experts_per_tok: int,
+        refill: bool,
+        prefix_nonce: int,
     ) -> LwdReqEmbed:
         host = self._reqs.get(req_id)
         if host is None:
-            if offset != 0:
-                raise LwdHostStageGeometryError(f"req={req_id}: first chunk offset {offset} must be 0")
-            if n_rows > prompt_rows:
-                raise LwdHostStageGeometryError(f"req={req_id}: chunk end {n_rows} exceeds prompt_rows={prompt_rows}")
+            if refill:
+                raise LwdHostStageGeometryError(f"req={req_id}: refill chunk for an unknown request")
+            if offset + n_rows > prompt_rows:
+                raise LwdHostStageGeometryError(
+                    f"req={req_id}: chunk end {offset + n_rows} exceeds prompt_rows={prompt_rows}"
+                )
             host = LwdReqEmbed(
                 req_id=req_id,
                 host=self._make_host_buffer(prompt_rows * (hidden_size + tail_per_row)),
                 numel=prompt_rows * hidden_size,
                 prompt_rows=prompt_rows,
                 hidden_size=hidden_size,
+                prefix_nonce=prefix_nonce,
                 tail_off=prompt_rows * hidden_size if tail_per_row else -1,
                 tail_numel=prompt_rows * tail_per_row,
                 num_hash_layers=num_hash_layers,
@@ -550,6 +658,8 @@ class LwdHostStager:
             )
             self._reqs[req_id] = host
             self._host_bytes += (host.numel + host.tail_numel) * 2
+            if offset > 0:
+                host.seed_prefix(offset)
         elif (
             host.prompt_rows != prompt_rows
             or host.hidden_size != hidden_size
@@ -558,6 +668,22 @@ class LwdHostStager:
             or host.num_experts_per_tok != num_experts_per_tok
         ):
             raise LwdHostStageGeometryError(f"req={req_id}: later chunk geometry differs from the first chunk")
+        else:
+            if host.prefix_nonce != prefix_nonce:
+                raise LwdHostStageGeometryError(
+                    f"req={req_id}: prefix nonce {prefix_nonce} cannot reuse active generation "
+                    f"with nonce {host.prefix_nonce} before drain"
+                )
+            geometry_refill = offset < host._stage_floor
+            if refill != geometry_refill:
+                raise LwdHostStageGeometryError(
+                    f"req={req_id}: refill flag {refill} disagrees with geometry "
+                    f"(offset={offset}, stage floor S={host._stage_floor})"
+                )
+            if geometry_refill and offset + n_rows > host._stage_floor:
+                raise LwdHostStageGeometryError(
+                    f"req={req_id}: refill rows [{offset}, {offset + n_rows}) overrun stage floor S={host._stage_floor}"
+                )
         if offset + n_rows > host.prompt_rows:
             raise LwdHostStageGeometryError(
                 f"req={req_id}: chunk rows [{offset}, {offset + n_rows}) exceed prompt_rows={host.prompt_rows}"

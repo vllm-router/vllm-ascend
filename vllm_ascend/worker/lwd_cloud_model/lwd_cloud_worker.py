@@ -358,6 +358,8 @@ class LwdCloudWorker(LwdWorkerBase):
             row_base=fields.prompt_offsets,
             num_hash_layers=self._lwd_up_num_hash_layers,
             num_experts_per_tok=self._lwd_up_num_experts_per_tok,
+            refills=fields.refills,
+            prefix_nonces=fields.prefix_nonces,
         )
         request = self._lwd_build_up_recv_request(fields, recv_buffer, segments)
         return lwd_get_data_plane().submit_recv(request)
@@ -421,6 +423,8 @@ class LwdCloudWorker(LwdWorkerBase):
                 stager.release_if_drained(key[1])
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
+                for req_id, prefix_nonce in stager.take_refill_done():
+                    done_mq.enqueue(("refill_done", req_id, prefix_nonce))
                 done_mq.enqueue((key, arrived))
             except Exception:
                 stager.abandon(key[1])

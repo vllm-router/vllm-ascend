@@ -356,7 +356,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # ------------------------------------------------------------------ #
 
     def _lwd_rewind_preempted_requests(self, scheduler_output: SchedulerOutput) -> None:
-        """Align host read pointers with scheduler rollbacks before native updates."""
+        """Align host read pointers with scheduler rollbacks and prefix hits."""
         worker = self.worker
         if worker is None or not worker._lwd_early_recv_endpoint:
             return
@@ -375,9 +375,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     consumed,
                     new_computed,
                 )
+            elif new_computed > consumed:
+                req = stager.take_req(req_id)
+                if req is not None and consumed < req.prompt_rows:
+                    stager.skip_consumed(req_id, new_computed)
+                    lwd_logger.info(
+                        "[LWD][cloud-runner] SKIP req=%s: host read pointer %d -> %d (re-admission hit)",
+                        req_id,
+                        consumed,
+                        new_computed,
+                    )
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable[[], None] | None:
-        """Rewind preempted host reads and materialize meta placeholders.
+        """Align host reads and materialize meta placeholders.
 
         The engine attaches prompt embeds as meta tensors (shape only,
         empty storage), so the placeholder rides the MQ inline pickle

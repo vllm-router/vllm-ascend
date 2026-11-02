@@ -48,6 +48,8 @@ class LwdRecvHintFields(NamedTuple):
     rows: list[int]
     prompt_offsets: list[int]
     prompt_lens: list[int]
+    refills: list[bool]
+    prefix_nonces: list[int]
 
 
 def make_recv_hint(
@@ -59,6 +61,8 @@ def make_recv_hint(
     rows: list[int],
     prompt_offsets: list[int],
     prompt_lens: list[int],
+    refills: list[bool] | None = None,
+    prefix_nonces: list[int] | None = None,
 ) -> dict[str, Any]:
     """Build one UP hint with the complete per-request chunk geometry."""
     return {
@@ -70,6 +74,8 @@ def make_recv_hint(
         "rows": [int(value) for value in rows],
         "prompt_offsets": [int(value) for value in prompt_offsets],
         "prompt_lens": [int(value) for value in prompt_lens],
+        "refills": [bool(value) for value in (refills or ())],
+        "prefix_nonces": list(prefix_nonces or ()),
     }
 
 
@@ -80,6 +86,8 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
     table_names = ("req_ids", "rows", "prompt_offsets", "prompt_lens")
     if any(not isinstance(hint.get(name), list) for name in table_names):
         return None
+    if any(not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces")):
+        return None
     try:
         fields = LwdRecvHintFields(
             seqno=int(hint["seqno"]),
@@ -89,6 +97,8 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
             rows=[int(value) for value in hint["rows"]],
             prompt_offsets=[int(value) for value in hint["prompt_offsets"]],
             prompt_lens=[int(value) for value in hint["prompt_lens"]],
+            refills=[bool(value) for value in hint.get("refills", [])],
+            prefix_nonces=list(hint.get("prefix_nonces", [])),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -110,6 +120,12 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
         for offset, rows, prompt_len in zip(fields.prompt_offsets, fields.rows, fields.prompt_lens)
     ):
         return None
+    if any(not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0 for nonce in fields.prefix_nonces):
+        return None
+    if len(fields.refills) > len(fields.req_ids) or len(fields.prefix_nonces) > len(fields.req_ids):
+        return None
+    fields.refills.extend([False] * (len(fields.req_ids) - len(fields.refills)))
+    fields.prefix_nonces.extend([0] * (len(fields.req_ids) - len(fields.prefix_nonces)))
     return fields
 
 

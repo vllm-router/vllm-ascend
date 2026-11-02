@@ -159,7 +159,8 @@ class FakeHostStager:
         self.events = []
 
     def consumed_rows(self, req_id):
-        return self.requests[req_id].consumed
+        req = self.requests.get(req_id)
+        return req.consumed if req is not None else 0
 
     def rewind_consumed(self, req_id, to_rows):
         req = self.requests.get(req_id)
@@ -169,6 +170,16 @@ class FakeHostStager:
             raise ValueError("invalid rewind target")
         req.consumed = to_rows
         self.events.append(("rewind", req_id, to_rows))
+        return True
+
+    def skip_consumed(self, req_id, to_rows):
+        req = self.requests.get(req_id)
+        if req is None:
+            return False
+        if to_rows < req.consumed or to_rows > req.recv_rows:
+            raise ValueError("invalid skip target")
+        req.consumed = to_rows
+        self.events.append(("skip", req_id, to_rows))
         return True
 
     def take_req(self, req_id):
@@ -230,10 +241,16 @@ class TestCloudPreemption(unittest.TestCase):
             1,
         )
 
-    def test_forward_progress_and_decode_do_not_rewind(self):
+    def test_self_hit_skips_forward_and_decode_does_not_skip(self):
         self.runner._update_states(self.output(("a", 3), ("decode", 9)))
-        self.assertEqual(self.stager.events, [("base", 2)])
+        self.assertEqual(self.stager.events, [("skip", "a", 3), ("base", 3)])
         self.assertEqual(self.stager.consumed_rows("decode"), 2)
+        self.logger.info.assert_called_once_with(
+            "[LWD][cloud-runner] SKIP req=%s: host read pointer %d -> %d (re-admission hit)",
+            "a",
+            2,
+            3,
+        )
 
         for worker in (
             NS(_lwd_early_recv_endpoint=False, _lwd_stager=self.stager),
@@ -241,7 +258,7 @@ class TestCloudPreemption(unittest.TestCase):
         ):
             self.runner.worker = worker
             self.runner._update_states(self.output(("a", 0)))
-            self.assertEqual(self.stager.consumed_rows("a"), 2)
+            self.assertEqual(self.stager.consumed_rows("a"), 3)
 
 
 class TestMixedInjection(unittest.TestCase):

@@ -150,7 +150,6 @@ def test_arrival_harvest_replaces_future_batches() -> None:
         "_lwd_harvest_tensors_one",
         "_lwd_check_up_windows",
         "_lwd_inject_mrope_positions",
-        "skip_consumed",
     ):
         assert stale not in src
     harvest = _segment(_RUNNER, "_lwd_harvest_up_batches")
