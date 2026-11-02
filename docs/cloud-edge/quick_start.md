@@ -52,7 +52,7 @@ chmod -R 755 /home/weight
 2. 下载并加载镜像后，参考以下命令创建容器。
 
 ```
-docker run -itd --privileged\
+docker run -itd --privileged \
 --name=<container-name> \
 --ipc=host --net=host\
 --shm-size 500g \

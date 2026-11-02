@@ -1,4 +1,4 @@
-_# 安装
+# 安装指南
 
 ## 环境要求
 - Atlas A2/A3 服务器 或 一体机 
@@ -80,7 +80,7 @@ ping x.x.x.x
 使用vLLM-ascend官方镜像可以高效运行环境，在节点运行以下示例命令启动容器
 - A2
 ```commandline
-docker run --rm \
+docker run -itd --privileged \
 --name vllm-ascend \
 --net=host \
 --shm-size=1g \
@@ -106,7 +106,7 @@ docker run --rm \
 ```
 - A3
 ```commandline
-docker run --rm \
+docker run -itd --privileged \
 --name vllm-ascend \
 --net=host \
 --shm-size=1g \
