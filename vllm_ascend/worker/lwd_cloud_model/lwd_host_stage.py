@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -55,9 +55,9 @@ class LwdReqEmbed:
     hidden_size: int
     prefix_nonce: int = 0
     tail_off: int = -1
-    tail_numel: int = 0
-    num_hash_layers: int = 0
-    num_experts_per_tok: int = 0
+    """Start of the tail region in the host buffer; -1 without tails."""
+    tail_sizes: tuple[int, ...] = ()
+    """Per-row bf16 elements of each tail segment, in wire order."""
     recv_rows: int = 0
     consumed: int = 0
     aborted: bool = False
@@ -66,6 +66,11 @@ class LwdReqEmbed:
     _refill_lo: int | None = None
     _refill_hi: int | None = None
     _refill_completed: bool = False
+
+    @property
+    def tail_numel(self) -> int:
+        """Elements the tail segments of the whole prompt occupy."""
+        return self.prompt_rows * sum(self.tail_sizes)
 
     def seed_prefix(self, hit_rows: int) -> None:
         """Seed the watermarks at a prefix-cache hit boundary."""
@@ -157,15 +162,20 @@ class LwdReqEmbed:
         start = self.consumed * self.hidden_size
         return start, start + n_rows * self.hidden_size
 
-    def tail_range(self, n_rows: int) -> tuple[int, int]:
-        return self.tail_range_at(self.consumed, n_rows)
+    def tail_range(self, index: int, n_rows: int) -> tuple[int, int]:
+        return self.tail_range_at(index, self.consumed, n_rows)
 
-    def tail_range_at(self, consumed_base: int, n_rows: int) -> tuple[int, int]:
-        """Return the expert-ID tail range from an explicit read pointer."""
-        if self.tail_numel <= 0:
+    def tail_range_at(self, index: int, consumed_base: int, n_rows: int) -> tuple[int, int]:
+        """Range of tail segment `index` from an explicit read pointer.
+
+        Each segment is stored whole-prompt, one after the other, so a row
+        range is a stride inside its own segment.
+        """
+        per_row = self.tail_sizes[index] if index < len(self.tail_sizes) else 0
+        if per_row <= 0:
             return 0, 0
-        per_row = 4 * self.num_hash_layers * self.num_experts_per_tok
-        start = self.tail_off + consumed_base * per_row
+        base = self.tail_off + self.prompt_rows * sum(self.tail_sizes[:index])
+        start = base + consumed_base * per_row
         return start, start + n_rows * per_row
 
     def note_consumed(self, n_rows: int) -> None:
@@ -214,10 +224,11 @@ class LwdStagedBatch:
     req_ids: list[str]
     num_tokens_per_req: list[int]
     hidden_size: int
-    num_hash_layers: int = 0
-    num_experts_per_tok: int = 0
+    tail_sizes: tuple[int, ...] = ()
+    """Per-row bf16 elements of each tail segment, in wire order."""
     src_offsets: list[int] = field(default_factory=list)
-    src_tail_offsets: list[int] = field(default_factory=list)
+    src_tail_offsets: list[tuple[int, ...]] = field(default_factory=list)
+    """Per request, the source start of each tail segment."""
     created_req_ids: list[str] = field(default_factory=list)
     request_hosts: dict[str, LwdReqEmbed] = field(default_factory=dict)
     recv_bytes: int = 0
@@ -374,8 +385,7 @@ class LwdHostStager:
         num_tokens_per_req: list[int],
         prompt_lens: list[int],
         row_base: list[int] | None = None,
-        num_hash_layers: int = 0,
-        num_experts_per_tok: int = 0,
+        tail_sizes: Sequence[int] = (),
         refills: list[bool] | None = None,
         prefix_nonces: list[int] | None = None,
     ) -> list[tuple[LwdBuffer, int, int]]:
@@ -390,8 +400,7 @@ class LwdHostStager:
             rows,
             prompt_lens,
             row_base,
-            num_hash_layers,
-            num_experts_per_tok,
+            tail_sizes,
         )
         if refills is None:
             refills = [False] * len(rows)
@@ -407,14 +416,13 @@ class LwdHostStager:
             raise LwdHostStageGeometryError(
                 f"seqno={seqno}: {len(prefix_nonces)} prefix nonces vs {len(rows)} requests"
             )
-        tail_per_row = 4 * num_hash_layers * num_experts_per_tok
+        tail_sizes = tuple(tail_sizes)
         batch = LwdStagedBatch(
             seqno=seqno,
             req_ids=list(req_ids),
             num_tokens_per_req=rows,
             hidden_size=hidden_size,
-            num_hash_layers=num_hash_layers,
-            num_experts_per_tok=num_experts_per_tok,
+            tail_sizes=tail_sizes,
             recv_bytes=numel * 2,
         )
         segments: list[tuple[LwdBuffer, int, int]] = []
@@ -439,9 +447,7 @@ class LwdHostStager:
                         dest_row,
                         prompt_lens[index],
                         hidden_size,
-                        tail_per_row,
-                        num_hash_layers,
-                        num_experts_per_tok,
+                        tail_sizes,
                         refills[index],
                         prefix_nonces[index],
                     )
@@ -491,14 +497,20 @@ class LwdHostStager:
         with self._lock:
             return self._batches.get(seqno)
 
-    def segment_for(self, req_id: str, n_rows: int) -> tuple[int, int, int]:
-        """Return ``(host_start, numel, tail_start)`` for the next read window."""
+    def segment_for(self, req_id: str, n_rows: int) -> tuple[int, int, tuple[int, ...]]:
+        """Return ``(host_start, numel, tail_starts)`` for the next read window.
+
+        ``tail_starts`` holds one start per tail segment, in wire order.
+        """
         req = self.take_req(req_id)
         if req is None:
             raise LwdHostStageGeometryError(f"req={req_id}: not staged")
         start, end = req.read_range(n_rows)
-        tail_start, _ = req.tail_range(n_rows)
-        return start, end - start, tail_start if req.tail_numel else -1
+        tail_starts = tuple(
+            req.tail_range(index, n_rows)[0] if per_row else -1
+            for index, per_row in enumerate(req.tail_sizes)
+        )
+        return start, end - start, tail_starts
 
     def consume(self, req_id: str, n_rows: int) -> None:
         req = self.take_req(req_id)
@@ -602,10 +614,9 @@ class LwdHostStager:
         rows: list[int],
         prompt_lens: list[int],
         row_base: list[int] | None,
-        num_hash_layers: int,
-        num_experts_per_tok: int,
+        tail_sizes: Sequence[int],
     ) -> list[int]:
-        if hidden_size < 1 or num_hash_layers < 0 or num_experts_per_tok < 0:
+        if hidden_size < 1 or any(size < 0 for size in tail_sizes):
             raise LwdHostStageGeometryError(f"seqno={seqno}: invalid hidden or tail geometry")
         if len(req_ids) != len(rows) or len(prompt_lens) != len(rows):
             raise LwdHostStageGeometryError(f"seqno={seqno}: request, row, and prompt tables must have equal length")
@@ -616,9 +627,8 @@ class LwdHostStager:
             raise LwdHostStageGeometryError(f"seqno={seqno}: negative row count or prompt length")
         if any(offset < 0 for offset in bases):
             raise LwdHostStageGeometryError(f"seqno={seqno}: negative prompt offset")
-        tail_per_row = 4 * num_hash_layers * num_experts_per_tok
         total_rows = sum(rows)
-        expected = total_rows * (hidden_size + tail_per_row)
+        expected = total_rows * (hidden_size + sum(tail_sizes))
         if numel != expected:
             raise LwdHostStageGeometryError(f"seqno={seqno}: payload {numel} != rows*(hidden+tail) = {expected}")
         return bases
@@ -630,9 +640,7 @@ class LwdHostStager:
         offset: int,
         prompt_rows: int,
         hidden_size: int,
-        tail_per_row: int,
-        num_hash_layers: int,
-        num_experts_per_tok: int,
+        tail_sizes: tuple[int, ...],
         refill: bool,
         prefix_nonce: int,
     ) -> LwdReqEmbed:
@@ -646,15 +654,13 @@ class LwdHostStager:
                 )
             host = LwdReqEmbed(
                 req_id=req_id,
-                host=self._make_host_buffer(prompt_rows * (hidden_size + tail_per_row)),
+                host=self._make_host_buffer(prompt_rows * (hidden_size + sum(tail_sizes))),
                 numel=prompt_rows * hidden_size,
                 prompt_rows=prompt_rows,
                 hidden_size=hidden_size,
                 prefix_nonce=prefix_nonce,
-                tail_off=prompt_rows * hidden_size if tail_per_row else -1,
-                tail_numel=prompt_rows * tail_per_row,
-                num_hash_layers=num_hash_layers,
-                num_experts_per_tok=num_experts_per_tok,
+                tail_off=prompt_rows * hidden_size if sum(tail_sizes) else -1,
+                tail_sizes=tail_sizes,
             )
             self._reqs[req_id] = host
             self._host_bytes += (host.numel + host.tail_numel) * 2
@@ -663,9 +669,7 @@ class LwdHostStager:
         elif (
             host.prompt_rows != prompt_rows
             or host.hidden_size != hidden_size
-            or host.tail_numel != prompt_rows * tail_per_row
-            or host.num_hash_layers != num_hash_layers
-            or host.num_experts_per_tok != num_experts_per_tok
+            or host.tail_sizes != tail_sizes
         ):
             raise LwdHostStageGeometryError(f"req={req_id}: later chunk geometry differs from the first chunk")
         else:
@@ -701,10 +705,15 @@ class LwdHostStager:
     ) -> list[tuple[LwdBuffer, int, int]]:
         hidden_size = batch.hidden_size
         embed_source = source_row * hidden_size
-        tail_per_row = 4 * batch.num_hash_layers * batch.num_experts_per_tok
-        tail_source = total_rows * hidden_size + source_row * tail_per_row if tail_per_row else -1
+        # The payload is segment-major: every segment holds the whole batch,
+        # so a request's rows are a stride inside each one.
+        tail_sources: list[int] = []
+        segment_base = total_rows * hidden_size
+        for per_row in batch.tail_sizes:
+            tail_sources.append(segment_base + source_row * per_row if per_row else -1)
+            segment_base += total_rows * per_row
         batch.src_offsets.append(embed_source)
-        batch.src_tail_offsets.append(tail_source)
+        batch.src_tail_offsets.append(tuple(tail_sources))
         if host is None:
             return []
         segments = [
@@ -714,16 +723,11 @@ class LwdHostStager:
                 n_rows * hidden_size,
             )
         ]
-        if tail_per_row:
-            segments.append(
-                (
-                    host.host[
-                        host.tail_off + dest_row * tail_per_row : host.tail_off + (dest_row + n_rows) * tail_per_row
-                    ],
-                    tail_source,
-                    n_rows * tail_per_row,
-                )
-            )
+        for index, per_row in enumerate(batch.tail_sizes):
+            if not per_row:
+                continue
+            dest_start, dest_end = host.tail_range_at(index, dest_row, n_rows)
+            segments.append((host.host[dest_start:dest_end], tail_sources[index], n_rows * per_row))
         return segments
 
     def _make_host_buffer(self, numel: int) -> LwdBuffer:

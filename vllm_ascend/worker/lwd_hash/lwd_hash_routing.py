@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Lossless LWD expert-ID transport and request-position bookkeeping."""
+"""LWD Hash MoE expert-ID merging and request-position bookkeeping.
+
+The expert ids travel UP as a segment of `lwd_up_payload.LwdUpPayloadLayout`.
+"""
 
 import torch
 
@@ -7,43 +10,6 @@ import torch
 def hash_layer_count(config: "PretrainedConfig") -> int:
     """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
     return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
-
-
-def hash_payload_numel(num_tokens: int, hidden_size: int, num_layers: int, top_k: int) -> int:
-    """Compute the transport payload element count: embeddings plus expert IDs encoded as four bytes each."""
-    # Each int32 expert ID is encoded as four exactly representable BF16 bytes.
-    return num_tokens * (hidden_size + 4 * num_layers * top_k)
-
-
-def pack_hash_payload(embeds: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
-    """Pack embeddings and [tokens, hash_layers, top_k] expert IDs into a 1-D BF16 payload."""
-    if embeds.dtype != torch.bfloat16:
-        raise ValueError("LWD V4 expert transport requires bfloat16 embeddings")
-    if expert_ids.ndim != 3 or expert_ids.shape[0] != embeds.shape[0]:
-        raise ValueError("LWD expert IDs must have shape [tokens, hash_layers, top_k]")
-    # Numeric BF16 conversion of IDs would round values above 256 (e.g. Pro).
-    # Encode byte values, rather than interpreting integer bits as BF16 NaNs.
-    encoded = expert_ids.to(torch.int32).contiguous().view(torch.uint8).flatten().to(embeds.dtype)
-    return torch.cat((embeds.flatten(), encoded.to(embeds.device)))
-
-
-def unpack_hash_payload(
-    payload: torch.Tensor,
-    num_tokens: int,
-    hidden_size: int,
-    num_layers: int,
-    top_k: int,
-) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Validate and unpack the payload; returns on-device embeddings and CPU int32 expert IDs."""
-    expected = hash_payload_numel(num_tokens, hidden_size, num_layers, top_k)
-    if payload.numel() != expected:
-        raise ValueError(f"LWD V4 payload size mismatch: got {payload.numel()}, expected {expected}")
-    flat = payload.flatten()
-    embed_end = num_tokens * hidden_size
-    embeds = flat[:embed_end].view(num_tokens, hidden_size)
-    # Request-position bookkeeping lives on CPU; decode the wire bytes there.
-    expert_ids = flat[embed_end:].cpu().to(torch.uint8).contiguous().view(torch.int32)
-    return embeds, expert_ids.view(num_tokens, num_layers, top_k)
 
 
 def merge_hash_expert_ids(

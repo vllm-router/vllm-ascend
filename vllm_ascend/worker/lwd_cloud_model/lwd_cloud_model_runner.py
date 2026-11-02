@@ -24,12 +24,19 @@ from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
+from vllm_ascend.worker.lwd_cloud_model.lwd_engram_inputs import (
+    LwdEngramDims,
+    LwdEngramInputs,
+    lwd_check_image_placeholder_spans,
+    lwd_embed_lookup,
+)
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
 )
+from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,6 +85,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # the HF config are immutable at runtime. Class-level defaults keep
     # instances built via __new__ (tests) from tripping on missing attrs.
     _lwd_hash_dims_cached: tuple[int, int] | None = None
+    _lwd_up_layout_cached: LwdUpPayloadLayout | None = None
 
     def __init__(
         self,
@@ -97,6 +105,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         else:
             self._lwd_prompt_lens_gpu = None
         self.lwd_hash_state = None
+        self.lwd_engram_inputs: LwdEngramInputs | None = None
+        # Image placeholder spans the edge announced, by request id; primed
+        # from the scheduler output and read when a prompt chunk lands.
+        self._lwd_image_spans: dict[str, list[int]] = {}
         # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
         config = self.model_config.hf_config
@@ -127,6 +139,27 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
+
+    def load_model(self) -> None:
+        """Load the model, then the Engram inputs built from its own config."""
+        super().load_model()
+        engram_dims = LwdEngramDims.from_model_config(self.model_config)
+        if engram_dims is None:
+            return
+        self.lwd_engram_inputs = LwdEngramInputs(
+            engram_dims,
+            self.device,
+            lwd_embed_lookup(self.get_model()),
+            self.max_num_tokens,
+            self.max_num_reqs,
+            self.num_spec_tokens,
+        )
+        lwd_logger.info(
+            "[LWD] cloud Engram inputs: %d layers x %d hash columns, lookback %d",
+            engram_dims.num_layers,
+            engram_dims.num_hash_cols,
+            engram_dims.lookback_depth,
+        )
 
     def _lwd_reset_reused_row(
         self,
@@ -221,6 +254,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
         """Prime full-prompt M-RoPE and harvest arrivals before native preparation."""
         for new_req in scheduler_output.scheduled_new_reqs:
+            spans = list(new_req.lwd_image_placeholder_spans)
+            lwd_check_image_placeholder_spans(new_req.req_id, spans, self.lwd_engram_inputs is not None)
+            if spans:
+                self._lwd_image_spans[new_req.req_id] = spans
             payload = new_req.lwd_mrope_positions or b""
             if not payload:
                 continue
@@ -580,6 +617,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             **model_kwargs,
         )
 
+    def lwd_up_layout(self) -> LwdUpPayloadLayout:
+        """UP payload layout of this model, cached at first use.
+
+        The edge builds the same one from its own config, so a disagreement
+        shows up as a numel mismatch at unpack rather than as wrong rows.
+        """
+        layout = self._lwd_up_layout_cached
+        if layout is None:
+            layout = LwdUpPayloadLayout.from_hf_config(
+                self.model_config.get_hidden_size(), self.model_config.hf_config
+            )
+            self._lwd_up_layout_cached = layout
+        return layout
+
     def _lwd_hash_dims(self) -> tuple[int, int]:
         """(num_hash_layers, experts_per_tok), cached at first use."""
         dims = self._lwd_hash_dims_cached
@@ -640,6 +691,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         for req_id in finished_req_ids:
             if self.lwd_hash_state is not None:
                 self.lwd_hash_state.discard(req_id)
+            if self.lwd_engram_inputs is not None:
+                self.lwd_engram_inputs.release(req_id)
+            self._lwd_image_spans.pop(req_id, None)
             idx = req_id_to_index.get(req_id)
             if idx is not None:
                 embeds_map.pop(idx, None)
@@ -654,17 +708,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         worker = self.worker
         if worker is None:
             raise RuntimeError("[Lwd][cloud-runner] cloud runner has no worker")
-        hidden_size = self.model_config.get_hidden_size()
-        num_hash_layers, top_k = self._lwd_hash_dims()
-        tail_per_row = 4 * num_hash_layers * top_k
+        layout = self.lwd_up_layout()
+        hidden_size = layout.hidden_size
         total_rows = sum(window.rows for window in plan)
-        numel = total_rows * (hidden_size + tail_per_row)
+        numel = layout.numel(total_rows)
         if worker._lwd_early_recv_endpoint:
             stager = worker._lwd_stager
             if stager is None:
                 raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
             dev, win_idx = self._lwd_window_device(numel)
-            self._lwd_stage_window(stager, plan, dev, hidden_size, tail_per_row)
+            self._lwd_stage_window(stager, plan, dev, layout)
         else:
             dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
             win_idx = None
@@ -704,12 +757,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         stager: LwdHostStager,
         plan: list[LwdPromptWindow],
         dev: torch.Tensor,
-        hidden_size: int,
-        tail_per_row: int,
+        layout: LwdUpPayloadLayout,
     ) -> None:
-        """Reassemble host embeddings and expert tails on the dedicated H2D stream."""
+        """Reassemble host embeddings and tail segments on the dedicated H2D stream."""
         started = time.monotonic()
-        embed_numel = sum(window.rows for window in plan) * hidden_size
+        hidden_size = layout.hidden_size
+        total_rows = sum(window.rows for window in plan)
         stream = self._lwd_h2d_stream()
         # _lwd_window_device has already advanced the flip for this window.
         used_event = self._lwd_win_used_ev[self._lwd_win_flip ^ 1]
@@ -717,20 +770,24 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if used_event is not None:
                 stream.wait_event(used_event)
             embed_offset = 0
-            tail_offset = embed_numel
+            # The device window is segment-major like the wire payload, so
+            # each segment is filled at its own running offset.
+            tail_offsets = list(layout.segment_offsets(total_rows))
             for window in plan:
                 self._lwd_stage_one_request(stager, window, dev, embed_offset, hidden_size)
                 embed_offset += window.rows * hidden_size
-                if tail_per_row:
-                    req = stager.take_req(window.req_id)
-                    assert req is not None
-                    tail_start, _ = req.tail_range_at(window.start, window.rows)
-                    numel = window.rows * tail_per_row
-                    dev[tail_offset : tail_offset + numel].copy_(
+                req = stager.take_req(window.req_id)
+                assert req is not None
+                for index, per_row in enumerate(layout.tail_sizes_per_token):
+                    if not per_row:
+                        continue
+                    tail_start, _ = req.tail_range_at(index, window.start, window.rows)
+                    numel = window.rows * per_row
+                    dev[tail_offsets[index] : tail_offsets[index] + numel].copy_(
                         req.host[tail_start : tail_start + numel],
                         non_blocking=True,
                     )
-                    tail_offset += numel
+                    tail_offsets[index] += numel
             ready_event = torch.npu.Event()
             ready_event.record(stream)
         torch.npu.current_stream().wait_event(ready_event)
@@ -755,9 +812,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """Return a rotating device window protected by a prior-use event."""
         buffers = getattr(self, "_lwd_win_dev", None)
         if buffers is None or buffers[0].numel() < numel:
-            hidden_size = self.model_config.get_hidden_size()
-            num_hash_layers, top_k = self._lwd_hash_dims()
-            per_row = hidden_size + 4 * num_hash_layers * top_k
+            per_row = self.lwd_up_layout().bytes_per_token
             budget = self.vllm_config.scheduler_config.max_num_batched_tokens
             capacity = max(numel, per_row * budget)
             buffers = [torch.empty(capacity, dtype=torch.bfloat16, device=self.device) for _ in range(2)]
@@ -806,35 +861,46 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """Inject the broadcast windows into native flattened embedding rows."""
         if dev is None:
             return
-        hidden_size = self.model_config.get_hidden_size()
-        num_hash_layers, top_k = self._lwd_hash_dims()
-        tail_per_row = 4 * num_hash_layers * top_k
-        embed_numel = sum(window.rows for window in plan) * hidden_size
-        embeds = dev[:embed_numel].view(-1, hidden_size)
+        layout = self.lwd_up_layout()
+        hidden_size = layout.hidden_size
+        total_rows = sum(window.rows for window in plan)
+        # Same split as the wire payload: the broadcast window is one batch.
+        embeds, expert_ids, engram_hashes = layout.unpack(dev, total_rows)
         offsets: list[int] = []
         offset = 0
         for idx in range(len(self.input_batch.req_ids)):
             offsets.append(offset)
             if idx < len(num_scheduled_tokens):
                 offset += int(num_scheduled_tokens[idx])
+        engram = self.lwd_engram_inputs
         row = 0
         for window in plan:
+            prompt_len = int(self.input_batch.num_prompt_tokens[window.req_index])
             if self.lwd_hash_state is not None:
-                tail_start = embed_numel + row * tail_per_row
-                tail_end = embed_numel + (row + window.rows) * tail_per_row
-                expert_ids = self._lwd_decode_expert_ids(
-                    dev[tail_start:tail_end],
-                    window.rows,
-                    num_hash_layers,
-                    top_k,
-                )
+                if expert_ids is None:
+                    raise RuntimeError(f"[Lwd][cloud-runner] missing UP expert ids for {window.req_id}")
                 self.lwd_hash_state.add_chunk(
                     window.req_id,
-                    int(self.input_batch.num_prompt_tokens[window.req_index]),
+                    prompt_len,
                     window.start,
-                    expert_ids,
+                    expert_ids[row : row + window.rows],
                 )
             output = offsets[window.req_index]
+            if engram is not None:
+                if engram_hashes is None:
+                    raise RuntimeError(f"[Lwd][cloud-runner] missing UP Engram hashes for {window.req_id}")
+                engram.add_prompt_chunk(
+                    window.req_id,
+                    window.start,
+                    prompt_len,
+                    self._lwd_image_spans.get(window.req_id, []),
+                    embeds[row : row + window.rows],
+                )
+                engram.write_prompt_hashes(
+                    window.req_index,
+                    output,
+                    engram_hashes[row : row + window.rows],
+                )
             self.inputs_embeds.gpu[output : output + window.rows].copy_(
                 embeds[row : row + window.rows],
                 non_blocking=True,

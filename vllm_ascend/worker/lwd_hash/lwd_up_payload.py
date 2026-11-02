@@ -26,7 +26,8 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-_LWD_INT32_BYTES = torch.tensor([], dtype=torch.int32).element_size()
+_LWD_INT32_BYTES = 4
+"""Bytes of one int32 id, each carried as its own bf16 element."""
 
 
 def lwd_engram_payload_dims(hf_text_config: PretrainedConfig) -> tuple[int, int]:
@@ -112,16 +113,42 @@ class LwdUpPayloadLayout:
         )
 
     @property
-    def _hash_bytes_per_token(self) -> int:
+    def hash_bytes_per_token(self) -> int:
+        """bf16 elements one token spends on the hash-MoE expert ids."""
         return _LWD_INT32_BYTES * self.num_hash_layers * self.hash_top_k
 
     @property
-    def _engram_bytes_per_token(self) -> int:
+    def engram_bytes_per_token(self) -> int:
+        """bf16 elements one token spends on the Engram bucket indices."""
         return _LWD_INT32_BYTES * self.num_engram_layers * self.num_engram_cols
+
+    @property
+    def tail_sizes_per_token(self) -> tuple[int, ...]:
+        """Per-row elements of each non-embedding segment, in wire order.
+
+        Host staging carves the main frame by these, so it never has to know
+        which model the segments belong to.
+        """
+        return (self.hash_bytes_per_token, self.engram_bytes_per_token)
+
+    @property
+    def bytes_per_token(self) -> int:
+        """bf16 elements one token spends across every segment."""
+        return self.hidden_size + self.hash_bytes_per_token + self.engram_bytes_per_token
+
+    def segment_offsets(self, num_tokens: int) -> tuple[int, int]:
+        """Start of the hash-MoE and Engram segments of a `num_tokens` payload.
+
+        The payload is segment-major -- all embeddings, then all expert ids,
+        then all bucket indices -- so a request's rows are a stride into each
+        segment rather than one contiguous run.
+        """
+        hash_start = num_tokens * self.hidden_size
+        return hash_start, hash_start + num_tokens * self.hash_bytes_per_token
 
     def numel(self, num_tokens: int) -> int:
         """bf16 element count of a `num_tokens`-row payload."""
-        return num_tokens * (self.hidden_size + self._hash_bytes_per_token + self._engram_bytes_per_token)
+        return num_tokens * self.bytes_per_token
 
     def pack(
         self,
@@ -175,8 +202,7 @@ class LwdUpPayloadLayout:
                 f"[LWD] UP payload size mismatch: got {payload.numel()}, expected {expected} for {num_tokens} tokens"
             )
         flat = payload.flatten()
-        embed_end = num_tokens * self.hidden_size
-        hash_end = embed_end + num_tokens * self._hash_bytes_per_token
+        embed_end, hash_end = self.segment_offsets(num_tokens)
         embeds = flat[:embed_end].view(num_tokens, self.hidden_size)
         expert_ids = None
         if self.num_hash_layers:

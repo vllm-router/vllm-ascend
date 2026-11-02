@@ -58,6 +58,27 @@ host_stage = load_module(
     ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_host_stage.py",
     {"vllm": fake_vllm, "vllm.lwd_logger": fake_logger_module},
 )
+# The layout is pure geometry here; its torch-backed pack/unpack is covered
+# where a real tensor is available.
+fake_hf_config_module = types.ModuleType("vllm.transformers_utils.config")
+fake_hf_config_module.get_hf_text_config = lambda config: config
+fake_routing = types.ModuleType("vllm_ascend.worker.lwd_hash.lwd_hash_routing")
+fake_routing.hash_layer_count = lambda hf_config: getattr(hf_config, "num_hash_layers", 0)
+up_payload = load_module(
+    "lwd_up_payload_for_cloud_early_recv_test",
+    ROOT / "vllm_ascend/worker/lwd_hash/lwd_up_payload.py",
+    {
+        "torch": types.ModuleType("torch"),
+        "vllm": fake_vllm,
+        "vllm.transformers_utils": types.ModuleType("vllm.transformers_utils"),
+        "vllm.transformers_utils.config": fake_hf_config_module,
+        "vllm_ascend.worker.lwd_hash.lwd_hash_routing": fake_routing,
+        **{
+            name: types.ModuleType(name)
+            for name in ("vllm_ascend.worker", "vllm_ascend.worker.lwd_hash")
+        },
+    },
+)
 
 
 def load_worker_methods():
@@ -91,8 +112,7 @@ def load_worker_methods():
         "LwdHostStageSlotBusy": host_stage.LwdHostStageSlotBusy,
         "LwdHostStager": host_stage.LwdHostStager,
         "LwdRecvHintFields": pre_recv.LwdRecvHintFields,
-        "hash_layer_count": lambda hf_config: hf_config.num_hash_layers,
-        "hash_payload_numel": lambda rows, hidden, layers, top_k: rows * (hidden + 4 * layers * top_k),
+        "LwdUpPayloadLayout": up_payload.LwdUpPayloadLayout,
         "lwd_get_data_plane": lambda: None,
         "lwd_logger": fake_logger_module.lwd_logger,
         "_LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S": 0.0005,
@@ -230,9 +250,9 @@ def worker(monkeypatch: pytest.MonkeyPatch):
     instance.device = "cpu"
     instance.rank = 0
     instance._lwd_dp_idx = 0
-    instance._lwd_up_hidden_size = 4
-    instance._lwd_up_num_hash_layers = 0
-    instance._lwd_up_num_experts_per_tok = 0
+    instance._lwd_up_layout = up_payload.LwdUpPayloadLayout(hidden_size=4)
+    instance._lwd_up_hidden_size = instance._lwd_up_layout.hidden_size
+    instance._lwd_up_tail_sizes = instance._lwd_up_layout.tail_sizes_per_token
     instance._early_recv_max_inflight = 2
     instance._lwd_stager = host_stage.LwdHostStager(
         device="cpu",
@@ -247,8 +267,7 @@ def worker(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_host_stager_init_uses_scheduler_token_capacity(worker) -> None:
-    worker._lwd_up_num_hash_layers = 2
-    worker._lwd_up_num_experts_per_tok = 3
+    worker._lwd_up_layout = up_payload.LwdUpPayloadLayout(hidden_size=4, num_hash_layers=2, hash_top_k=3)
     worker.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=7))
 
     worker._lwd_init_lwd_host_stager()

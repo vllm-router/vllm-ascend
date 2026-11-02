@@ -36,7 +36,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
 )
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
+from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 if TYPE_CHECKING:
     from typing import Any
@@ -79,9 +79,13 @@ class LwdCloudWorker(LwdWorkerBase):
         endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
         global_rank = dist.get_rank()
         self._lwd_early_recv_endpoint = global_rank == endpoint_rank
-        self._lwd_up_hidden_size = self.model_config.get_hidden_size()
-        self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
-        self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
+        # One description of the UP main frame, shared with the edge: the
+        # worker sizes and stages what the runner unpacks.
+        self._lwd_up_layout: LwdUpPayloadLayout = LwdUpPayloadLayout.from_hf_config(
+            self.model_config.get_hidden_size(), self.model_config.hf_config
+        )
+        self._lwd_up_hidden_size = self._lwd_up_layout.hidden_size
+        self._lwd_up_tail_sizes = self._lwd_up_layout.tail_sizes_per_token
         if self._lwd_early_recv_endpoint:
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
@@ -98,12 +102,7 @@ class LwdCloudWorker(LwdWorkerBase):
     def _lwd_init_lwd_host_stager(self) -> None:
         """Create endpoint host staging with fixed limits."""
         self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
-        max_numel = hash_payload_numel(
-            self.vllm_config.scheduler_config.max_num_batched_tokens,
-            self._lwd_up_hidden_size,
-            self._lwd_up_num_hash_layers,
-            self._lwd_up_num_experts_per_tok,
-        )
+        max_numel = self._lwd_up_layout.numel(self.vllm_config.scheduler_config.max_num_batched_tokens)
         self._lwd_stager = LwdHostStager(device=str(self.device), slots=_LWD_HOST_STAGE_SLOTS, max_numel=max_numel)
 
     def load_model(self) -> None:
@@ -210,12 +209,7 @@ class LwdCloudWorker(LwdWorkerBase):
             channel=LwdChannelType.UP,
             op="recv",
             dp_idx=self._lwd_dp_idx,
-            num_elements=hash_payload_numel(
-                fields.num_tokens,
-                self._lwd_up_hidden_size,
-                self._lwd_up_num_hash_layers,
-                self._lwd_up_num_experts_per_tok,
-            ),
+            num_elements=self._lwd_up_layout.numel(fields.num_tokens),
             seqno=fields.seqno,
             aux_num_elements=fields.aux_rows * 3,
             recv_buffer=recv_buffer,
@@ -341,12 +335,7 @@ class LwdCloudWorker(LwdWorkerBase):
         """Plan host destinations, allocate a device slot, and submit one receive."""
         stager = self._lwd_stager
         assert stager is not None
-        numel = hash_payload_numel(
-            fields.num_tokens,
-            self._lwd_up_hidden_size,
-            self._lwd_up_num_hash_layers,
-            self._lwd_up_num_experts_per_tok,
-        )
+        numel = self._lwd_up_layout.numel(fields.num_tokens)
         recv_buffer, _slot = stager.allocate(fields.seqno, numel)
         segments = stager.plan_recv_segments(
             seqno=fields.seqno,
@@ -356,8 +345,7 @@ class LwdCloudWorker(LwdWorkerBase):
             num_tokens_per_req=fields.rows,
             prompt_lens=fields.prompt_lens,
             row_base=fields.prompt_offsets,
-            num_hash_layers=self._lwd_up_num_hash_layers,
-            num_experts_per_tok=self._lwd_up_num_experts_per_tok,
+            tail_sizes=self._lwd_up_tail_sizes,
             refills=fields.refills,
             prefix_nonces=fields.prefix_nonces,
         )
