@@ -52,7 +52,7 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 
 | Version    | Release type | Doc                                                    |
 |------------|--------------|--------------------------------------------------------|
-| v0.23.0rc1 | 最新RC版本   | 请查看[快速入门](cloud-edge/quick_start.md)和[安装指南](cloud-edge/install.md)了解更多 |
+| v0.23.0rc1 | 最新RC版本   | 请查看[快速入门](docs/cloud-edge/quick_start.md)和[安装指南](docs/cloud-edge/install.md)了解更多 |
 
 ## 支持模型
 图例说明
@@ -66,7 +66,7 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 | DeepSeek V4-Flash | ✅       |      | ✅   | A2/A3      | ✅   | ✅                             | ✅                                    |      | ✅                      | ✅                      | ✅                      |                                | ✅                      | ✅                      | ✅                        |                   | ✅                | 1M            |                       | ---  |
 | GLM-5.1           | ✅       |      | ✅   | A2/A3      | ✅   | ✅                             | ✅                                    |      | ✅                      | ✅                      | ✅                      | ✅                             | ✅                      | ✅                      | ✅                        | ✅                | ✅                | 200k          |                       | ---  |
 | GLM-5.2           | 🔵       |      | ✅   | A2/A3      | ✅   | ✅                             | ✅                                    |      | ✅                      | ✅                      | ✅                      | ✅                             | ✅                      | ✅                      | ✅                        | ✅                | ✅                | 200k          |                       | ---  |
-[更多](cloud-edge/model_support_lists.md)
+[更多](docs/cloud-edge/model_support_lists.md)
 
 ## 贡献
 
@@ -84,4 +84,4 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 
 ## 许可证
 
-Apache 许可证 2.0，如 [LICENSE](../LICENSE) 文件中所示。
+Apache 许可证 2.0，如 [LICENSE](LICENSE) 文件中所示。
