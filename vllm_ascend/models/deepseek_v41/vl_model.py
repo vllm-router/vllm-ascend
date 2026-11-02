@@ -235,6 +235,8 @@ class AscendDeepseekV41ForCausalLM(
         token_indices=None,
         force_dummy=False,
         cg_mode=None,
+        external_hashes: torch.Tensor | None = None,
+        external_rows: torch.Tensor | None = None,
     ):
         return self.language_model.prepare_engram_inputs(
             input_ids,
@@ -247,6 +249,8 @@ class AscendDeepseekV41ForCausalLM(
             token_indices=token_indices,
             force_dummy=force_dummy,
             cg_mode=cg_mode,
+            external_hashes=external_hashes,
+            external_rows=external_rows,
         )
 
     @property

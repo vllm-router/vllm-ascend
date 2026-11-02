@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+# Registers the `lwd_edge` load format, which the edge projection selects, in
+# the worker process that resolves the model loader.
+import vllm.v1.lwd_control.lwd_model.lwd_edge_loader  # noqa: F401
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
@@ -61,12 +64,13 @@ class LwdEdgeWorker(LwdWorkerBase):
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         self.comm_service.poll_completions()
         lwd_batch = scheduler_output.lwd_batch
-        # Multimodal cache lifecycle: when a request finishes (abort
-        # included) drop its mm feature/encoder-output caches to prevent
-        # cross-request leaks (the healthy path already removed them once
-        # the chunk window passed all mm segments; this is the backstop).
+        # Per-request edge state lifecycle: when a request finishes (abort
+        # included) drop its mm feature/encoder-output caches and its cached
+        # Engram prompt to prevent cross-request leaks (the healthy path
+        # already removed the mm caches once the chunk window passed all mm
+        # segments; this is the backstop).
         if scheduler_output.finished_req_ids:
-            self.model_runner.mm_cache.release_finished(scheduler_output.finished_req_ids)
+            self.model_runner.lwd_release_finished(set(scheduler_output.finished_req_ids))
         if lwd_batch is None:
             lwd_logger.debug("[lwd-edge] step carries no LWD batch; returning send watermarks")
             return self.model_runner._lwd_watermarked_output()

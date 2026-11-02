@@ -134,7 +134,7 @@ def _backup_token_id(req_state, idx: int) -> int:
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
-    # LWD: provider of edge-computed prompt embeddings for the
+    # LWD: provider of edge-computed prompt embeddings for the MTP
     # draft model's first pass (set by the worker at bring-up on the cloud).
     # provider(req_id) -> Tensor [N, H] | None.
     _lwd_prompt_embeds_provider = None
@@ -1856,12 +1856,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         prompt segments to placeholder zeros, corrupting draft state at
         the root (a known defect under MTP mixed batching).
 
-        Returns None (caller falls back to the token-id path) when no
-        provider is configured, a request that needs prompt embeds lacks
-        received rows / the chunk's rows are not yet fully assembled, the
-        draft model does not consume ``inputs_embeds``, or a CP (pcp)
-        manager rewrites first-pass inputs (different layout).
+        Returns None (caller falls back to the token-id path) when the
+        method is not MTP, no provider is configured, a request that needs
+        prompt embeds lacks received rows / the chunk's rows are not yet
+        fully assembled, the draft model does not consume
+        ``inputs_embeds``, or a CP (pcp) manager rewrites first-pass inputs
+        (different layout).
         """
+        # The shifted-prompt layout above is MTP's. Parallel drafters such as
+        # DSpark/DFlash build their own first pass (anchor token + noise ids)
+        # and never consume prompt embeddings.
+        if self.method != "mtp":
+            return None
         runner = self.runner
         if runner is None:
             return None
