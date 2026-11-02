@@ -214,7 +214,6 @@ The parameters are explained as follows:
     --gpu-memory-utilization 0.90 \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --kv-cache-dtype int8 \
     --attention_config.indexer_kv_dtype int8 \
     --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"c8_enable_reshape_optim":false, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
@@ -262,7 +261,6 @@ The parameters are explained as follows:
     --gpu-memory-utilization 0.90 \
     --quantization ascend \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --kv-cache-dtype int8 \
     --attention_config.indexer_kv_dtype int8 \
     --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"c8_enable_reshape_optim":false, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
@@ -361,7 +359,7 @@ The parameters are explained as follows:
 
 We'd like to show the deployment guide of `GLM-5.2` on multi-node environment with 1P1D for better performance.
 
-In the PD disaggregation scenario, Mooncake is used as the KV cache transfer connector between the prefill and decode nodes. Please refer to [KV Cache Pool (Ascend Store) Deployment Guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_pool.md) for the Mooncake configuration.
+In the PD disaggregation scenario, Mooncake is used as the KV cache transfer connector between the prefill and decode nodes. Please refer to [KV Cache Pool (Ascend Store) Deployment Guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md) for the Mooncake configuration.
 
 ##### 5.1.3.1 Deployment on 4 Atlas 800 A3
 

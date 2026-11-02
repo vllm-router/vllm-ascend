@@ -73,7 +73,7 @@ if get_ascend_device_type() == AscendDeviceType.A5:
     )
 
 
-def _is_mrv2_idle_dp_dummy(forward_context: ForwardContext) -> bool:
+def _is_mrv2_idle_dp_dummy(forward_context: ForwardContext, *, use_v2_model_runner: bool) -> bool:
     """Return whether this is an eager MRV2 idle-DP padding-only forward."""
     is_padding = getattr(forward_context, "is_padding", None)
     dp_metadata = getattr(forward_context, "dp_metadata", None)
@@ -87,7 +87,7 @@ def _is_mrv2_idle_dp_dummy(forward_context: ForwardContext) -> bool:
 
     is_dummy = False
     if (
-        get_current_vllm_config().use_v2_model_runner
+        use_v2_model_runner
         and forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
         and is_padding.numel() == 1
         and dp_metadata.num_tokens_across_dp_cpu.numel() > 1
@@ -441,6 +441,8 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         kv_cache_torch_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
+        # The current config is scoped to initialization, not graph capture.
+        self.use_v2_model_runner = get_current_vllm_config().use_v2_model_runner
         self.num_kv_heads = num_kv_heads
         self.scale = scale
         self.topk_blocks = topk_blocks
@@ -537,7 +539,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             and index_md.num_decodes > 0
             and index_md.num_prefills == 0
             and get_tp_group().world_size > 1
-            and _is_mrv2_idle_dp_dummy(forward_context)
+            and _is_mrv2_idle_dp_dummy(forward_context, use_v2_model_runner=self.use_v2_model_runner)
         ):
             if forward_context.additional_kwargs.get(
                 _MRV2_DUMMY_INDEXER_TP_WARMED_KEY,
@@ -1417,6 +1419,40 @@ def minimax_m3_sparse_forward_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+def minimax_m3_fused_sparse_forward(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    attn_output: torch.Tensor,
+    layer_name: str,
+    index_qk: torch.Tensor | None = None,
+) -> None:
+    forward_context = get_forward_context()
+    if not isinstance(forward_context.attn_metadata, dict):
+        attn_output.zero_()
+        return
+    layer = forward_context.no_compile_layers[layer_name]
+    layer._run_fused_sparse_attention(qkv, positions, attn_output, index_qk)
+
+
+def minimax_m3_fused_sparse_forward_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    attn_output: torch.Tensor,
+    layer_name: str,
+    index_qk: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_fused_sparse_forward",
+    op_func=minimax_m3_fused_sparse_forward,
+    mutates_args=["attn_output"],
+    fake_impl=minimax_m3_fused_sparse_forward_fake,
+    dispatch_key="PrivateUse1",
+)
 
 
 direct_register_custom_op(
