@@ -963,8 +963,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         The step meta stays on device (no pinned D2H here — the side-stream
         copy was not fenceable on this platform); a per-step ready event is
         recorded on the main stream, and the fenced harvest (dedicated
-        stream + wait_event + same-stream done event) runs in the worker's
-        sample_tokens, off this collect. Zero added synchronization on the
+        stream + wait_event + same-stream done event) runs in the executor's
+        output thread, off this collect. Zero added synchronization on the
         compute critical path; batch order/mask come from the capture-time
         snapshot (guards against batch-queue overlap reordering).
         Returns:
@@ -1012,8 +1012,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         selection_done = time.monotonic()
         # Per-step ready event: recorded on the main stream before the
         # payload leaves the collect. The fenced harvest (dedicated stream
-        # + wait_event + same-stream done event) lives in the worker's
-        # sample_tokens, NOT here — keeping the compute critical path free
+        # + wait_event + same-stream done event) lives in the executor's
+        # output thread, NOT here — keeping the compute critical path free
         # of any synchronization. The device tensor travels with the
         # payload; the pinned D2H + shared-event scheme is retired (it
         # could not fence the side-stream copy on this platform).
