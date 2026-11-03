@@ -210,7 +210,9 @@ dpkg hiroce3-*.deb
 | HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（图1中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                                                                                                                                                                                     |
 
 图1. npu-smi info回显
+
 ![img.png](../figure/npu-smi-info/img.png)
+
 
 （1）边侧一体机
 ```bash
