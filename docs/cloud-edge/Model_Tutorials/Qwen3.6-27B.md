@@ -429,25 +429,463 @@ vllm serve /weight/weight/Qwen3.6-27B.md \
 ### 4.2 多实例
 因为边云特性在边侧占用很少算力，所以可在边侧部署多个容器，创建多个服务和不同云侧服务器算卡对接，以下以一体机作为边侧算力，云侧使用不同服务器为例部署两实例：
 
-（1）实例1
+(1)边测一体机容器1
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=76.76.26.140
+export GLOO_SOCKET_IFNAME=enp125s0f1
+export TP_SOCKET_IFNAME=enp125s0f1
+export HCCL_SOCKET_IFNAME=enp125s0f1
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
+export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
+export HCCL_IF_BASE_PORT=16657
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
 
-a.边测一体机
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
 
-b.云侧服务器1
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
+export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
+export VLLM_LOGGING_LEVEL=INFO
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
-（2）实例2
 
-a.边侧一体机
+vllm serve /home/weight/Qwen3.6-27B \
+    --host 0.0.0.0 \
+    --port 8123 \
+    --master-addr 76.76.26.140 \
+    --api-server-count 2 \
+    --api-server-rpc-port  23657 \
+    --master-port 23657 \
+    --pipeline-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8  --instance_parallel_size 2 --instance_parallel_start_rank 0 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.92 \
+    --chat-template /home/weight/Qwen3.6-27B/chat_template.jinja \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+```
+(2)边侧一体机容器2
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=76.76.26.140
+export GLOO_SOCKET_IFNAME=enp125s0f1
+export TP_SOCKET_IFNAME=enp125s0f1
+export HCCL_SOCKET_IFNAME=enp125s0f1
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
+export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
+export HCCL_IF_BASE_PORT=16657
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
 
-b.云侧服务器2
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
 
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
+export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
+export VLLM_LOGGING_LEVEL=INFO
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
+
+
+vllm serve /home/weight/Qwen3.6-27B \
+    --host 0.0.0.0 \
+    --port 8124 \
+    --master-addr 76.76.26.140 \
+    --api-server-count 2 \
+    --api-server-attach  76.76.26.140:23657 \
+    --master-port 23657 \
+    --pipeline-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8   --instance_parallel_size 2 --instance_parallel_start_rank 1 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.92 \
+    --chat-template /home/weight/Qwen3.6-27B/chat_template.jinja \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+```
+(3)云侧服务器1
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=776.76.26.190
+export GLOO_SOCKET_IFNAME=enp189s0f0
+export TP_SOCKET_IFNAME=enp189s0f0
+export HCCL_SOCKET_IFNAME=enp189s0f0
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.26.140  # Node 0 的实际 IP
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
+export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
+export HCCL_IF_BASE_PORT=16657
+# 增大分布式超时
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
+
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
+export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=776.76.26.190    #云的ip
+export VLLM_LOGGING_LEVEL=INFO
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
+
+
+vllm serve /weight/Qwen3.6-27B \
+    --master-addr 76.76.26.140 \
+    --master-port 23657 \
+    -pp 2 \
+    --tensor-parallel-size 4 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --trust-remote-code --nnodes 2 --node-rank 1  --edge-npu-count 1 --cloud-npu-count 8 --instance_parallel_size 2 --instance_parallel_start_rank 0 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600, 604, 608, 612, 616, 620, 624, 628, 632, 636, 640, 644, 648, 652, 656, 660, 664, 668, 672, 676, 680, 684, 688, 692, 696, 700, 704, 708, 712, 716, 720]}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.92 \
+    --speculative-config '{"num_speculative_tokens": 3,"method": "mtp"}' \
+    --chat-template /weight/Qwen3.6-27B/chat_template.jinja \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+```
+(4)云侧服务器2
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=776.76.26.190
+export GLOO_SOCKET_IFNAME=enp189s0f0
+export TP_SOCKET_IFNAME=enp189s0f0
+export HCCL_SOCKET_IFNAME=enp189s0f0
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.26.140  # Node 0 的实际 IP
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
+export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
+export HCCL_IF_BASE_PORT=16657
+# 增大分布式超时
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
+
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=2,3
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
+export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=776.76.26.190    #云的ip
+export VLLM_LOGGING_LEVEL=INFO
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
+
+
+vllm serve /weight/Qwen3.6-27B \
+    --master-addr 76.76.26.140 \
+    --master-port 23657 \
+    -pp 2 \
+    --tensor-parallel-size 4 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --trust-remote-code --nnodes 2 --node-rank 1  --edge-npu-count 1 --cloud-npu-count 8 --instance_parallel_size 2 --instance_parallel_start_rank 1 \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600, 604, 608, 612, 616, 620, 624, 628, 632, 636, 640, 644, 648, 652, 656, 660, 664, 668, 672, 676, 680, 684, 688, 692, 696, 700, 704, 708, 712, 716, 720]}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.92 \
+    --speculative-config '{"num_speculative_tokens": 3,"method": "mtp"}' \
+    --chat-template /weight/Qwen3.6-27B/chat_template.jinja \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+```
 ### 4.3 云测复用
 
 部署模型时云侧设备算例如果有空闲，可云测复用部署多个服务，以下以多台一体机作为边测算力，云侧使用一台服务器为例部署：
+（1）边测一体机1
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=76.76.7.134
+export GLOO_SOCKET_IFNAME=enp125s0f1
+export TP_SOCKET_IFNAME=enp125s0f1
+export HCCL_SOCKET_IFNAME=enp125s0f1
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
 
-（1）实例1
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 
-（2）实例2
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
+export VLLM_LOGGING_LEVEL=ERROR
+
+export VLLM_ASCEND_LWD_DEBUG=1
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
+export HCCL_IF_BASE_PORT=16658
+export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
+export VLLM_ASCEND_LWD_DBG_SEND=0
+
+REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
+#export ASCEND_GLOBAL_LOG_LEVEL=3
+#export HCCL_ENTRY_LOG_ENABLE=1
+#export ASCEND_SLOG_PRINT_TO_STDOUT=1
+
+vllm serve /home/weight/Qwen3.6-27B \
+    --host 0.0.0.0 \
+    --port 8094 \
+    --master-addr 76.76.7.134 \
+    --master-port 29525 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --pipeline-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --trust-remote-code --nnodes 3 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 4 \
+    --edge-id 0 \
+    --no-enable-prefix-caching \
+    --role-registry "$REGISTRY" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge0", "connect_timeout":5.0}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.95 \
+```
+（1）边测一体机2
+```commandline
+#!/bin/sh
+export VLLM_HOST_IP=76.76.7.134
+export GLOO_SOCKET_IFNAME=enp125s0f1
+export TP_SOCKET_IFNAME=enp125s0f1
+export HCCL_SOCKET_IFNAME=enp125s0f1
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
+
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+
+export ASCEND_RT_VISIBLE_DEVICES=1
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
+export VLLM_LOGGING_LEVEL=ERROR
+
+export VLLM_ASCEND_LWD_DEBUG=1
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
+export HCCL_IF_BASE_PORT=16656
+export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
+export VLLM_ASCEND_LWD_DBG_SEND=0
+
+REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
+#export ASCEND_GLOBAL_LOG_LEVEL=3
+#export HCCL_ENTRY_LOG_ENABLE=1
+#export ASCEND_SLOG_PRINT_TO_STDOUT=1
+
+vllm serve /home/weight/Qwen3.6-27B \
+    --host 0.0.0.0 \
+    --port 8095 \
+    --master-addr 76.76.7.134 \
+    --master-port 29525 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    --pipeline-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --trust-remote-code --nnodes 3 --node-rank 1 --edge-npu-count 1 --cloud-npu-count 4 \
+    --edge-id 1 \
+    --no-enable-prefix-caching \
+    --role-registry "$REGISTRY" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge1", "connect_timeout":5.0}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.95 \
+```
+（3）云测服务器
+```commandline
+#!/bin/sh
+export VLLM_VERSION=0.23.0
+export VLLM_HOST_IP=76.76.7.158
+export GLOO_SOCKET_IFNAME=enp189s0f0
+export TP_SOCKET_IFNAME=enp189s0f0
+export HCCL_SOCKET_IFNAME=enp189s0f0
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export MASTER_ADDR=76.76.7.134  # Node 0 的实际 IP
+
+# 增大分布式超时
+export TORCH_DISTRIBUTED_DETAIL=DEBUG
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export HCCL_BUFFSIZE=1024
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export CODEBASE_DIR="/vllm-workspace"
+export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
+export VLLM_ASCEND_ENABLE_NZ=1
+
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_GDN_FAST_PATH=1
+export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
+export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+
+#export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.7.158
+export VLLM_LOGGING_LEVEL=ERROR
+
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
+export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
+
+#export ASCEND_GLOBAL_LOG_LEVEL=3
+#export HCCL_ENTRY_LOG_ENABLE=1
+#export ASCEND_SLOG_PRINT_TO_STDOUT=1
+
+export VLLM_ASCEND_LWD_DBG_SEND=0
+
+REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
+
+vllm serve /weight/weight/Qwen3.6-27B \
+    --master-addr 76.76.7.134 \
+    --master-port 29525 \
+    --max-model-len 262144 \
+    --served-model-name qwen3.6 \
+    -pp 2 \
+    --tensor-parallel-size 4 \
+    --trust-remote-code --nnodes 3 --node-rank 2  --edge-npu-count 1 --cloud-npu-count 4 \
+    --cloud-id 0 \
+    --no-enable-prefix-caching \
+    --role-registry "$REGISTRY" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "listen_host": "0.0.0.0", "listen_port": 9133, "instance_id": "cloud-0"}}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600]}' \
+    --max-num-seqs 230 \
+    --max-num-batched-tokens 8192 \
+    --long-prefill-token-threshold 2048 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.95 \
+    --speculative-config '{"num_speculative_tokens": 3,"method": "mtp","enforce_eager": true}' \
+```
+
 
 ## 5 功能验证
 服务启动后，可通过发送提示词调用模型。支持两个API接口：completions和chat.completions。使用您配置的`--served-model-name`。
