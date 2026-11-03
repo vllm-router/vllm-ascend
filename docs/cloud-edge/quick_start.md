@@ -25,16 +25,19 @@ SP681网卡驱动安装参考：[SP220&SP600 标准网卡 用户指南](https://
 
 2. 获取模型权重
 
-下载权重，这里以 Qwen3.6‑27B 为例，将权重文件上传至服务器任意目录（如 /home/weight），修改权重文件权限：
+下载权重，这里以 [Qwen3.6‑27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) 为例，将权重文件上传至服务器任意目录（如 /home/weight），修改权重文件权限：
 
 ```
 chmod -R 755 /home/weight
 ```
 
-## docker部署
-### 使用vllm-ascend预构建镜像
+## 环境部署
 
-1. 进入[昇腾官方镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)，根据设备型号选择下载对应的镜像。
+我们推荐使用vLLM-ascend发布镜像创建容器，然后进行编译安装；此外我们也提供了编译后版本的镜像
+
+### 使用vLLM-ascend预构建镜像编译安装
+
+1. 进入[vLLM-ascend镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest),根据设备型号选择下载对应的镜像；本教程按照A2部署，推荐下载[v0.23.0](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=v0.23.0rc1)版本。
 
 该镜像已具备模型运行所需的基础环境，包括：CANN、FrameworkPTAdapter、VLLM 与 VLLM‑Ascend，可实现模型快速上手推理。
 
@@ -49,9 +52,10 @@ chmod -R 755 /home/weight
 | VLLM‑Ascend   | /vllm‑workspace/vllm‑ascend |
 
 
-2. 下载并加载镜像后，参考以下命令创建容器。
+2. 参考以下命令创建容器。
 
-```
+```commandline
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.post1
 docker run -itd --privileged \
 --name=<container-name> \
 --ipc=host --net=host\
@@ -87,13 +91,13 @@ docker run -itd --privileged \
 
 3. 执行以下命令进入容器。
 
-```
+```commandline
 docker exec -it <container-name> bash
 ```
 4. 编译安装
 
 下载vllm和vllm-ascend代码，并编译
-```
+```commandline
 #设置安装的版本，需要与下载的代码版本一致 
 export VLLM_VERSION_OVERRIDE=0.23.0 
 cd /vllm-workspace/vllm
@@ -101,15 +105,16 @@ cd /vllm-workspace/vllm
  cd ../vllm-ascend 
  pip install -v -e . --no-build-isolation --no-deps
 ```
-### 使用[vllm-router/vllm-ascend]()预构建镜像直接创建容器无需额外编译
+### 使用预构建镜像直接创建容器无需额外编译
+
+进入[镜像仓库](https://quay.io/user/kyoshiki/),根据设备型号选择下载对应的镜像。
+该镜像已具备模型运行所需的基础环境，并且完成边云协同特性代码的编译，可以直接用于边云协同服务的部署，容器部署可参考上一节内容。
 
 
 ## 边云协同分布式推理服务部署
 1. [边云都使用服务器](README_server.md)
 
 2. [边侧使用一体机，云测使用服务器](README_all-in-one.md)
-
-## [更多模型部署参考](examples.md)
 
 
 

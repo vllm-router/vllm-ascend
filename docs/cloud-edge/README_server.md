@@ -14,7 +14,7 @@
 1. 进入容器后，执行以下命令启动服务。
 
 （1）边侧服务器
-``` bash
+```bash
 #!/bin/bash
 # ========== 环境变量 ==========
 export VLLM_HOST_IP=<边侧IP>
@@ -46,7 +46,7 @@ export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
 export VLLM_LOGGING_LEVEL=INFO
 
 # ========== 启动命令 ==========
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve model_path \
     --host 0.0.0.0 \
     --port <port> \
     --master-addr <边侧IP> \
@@ -99,7 +99,7 @@ export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
 export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧IP>
 
 # ========== 启动命令 ==========
-vllm serve /weight/weight/Qwen3.6-27B.md \
+vllm serve model_path \
     --master-addr <边侧IP> \
     --master-port <master-port> \
     --max-model-len 262144 \
@@ -132,7 +132,7 @@ vllm serve /weight/weight/Qwen3.6-27B.md \
 用户可使用 HTTPS 客户端（Linux curl 命令，Postman 工具等）发送 HTTPS 请求，此处以 Linux curl 命令为例进行说明。
 重开一个窗口，使用以下命令发送请求。例如验证服务是否拉起：
 
-```
+```commandline
 curl http://<IP>:<Port>/v1/chat/completions \
   -H "Content‑Type: application/json" \
   -d '{
@@ -150,7 +150,7 @@ curl http://<IP>:<Port>/v1/chat/completions \
 
 回显如下则表明请求发送成功：
 
-```
+```commandline
 {
     "id": "chatcmpl‑984264b9b96eee5d",
     "object": "chat.completion",

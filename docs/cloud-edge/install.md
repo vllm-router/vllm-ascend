@@ -46,7 +46,7 @@ SP681网卡驱动安装参考：
 [驱动下载地址](https://support.huawei.com/enterprise/zh/computing-module/in220-pid-253287505/software/268628573?idAbsPath=fixnode01|23710424|269761301|269764423|269766398|253287505)
 
 ## 使用docker软件设置环境
-vllm-ascend提供用户部署的Docker镜像，您可以直接从[镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)拉取预构建进行，并使用bash运行
+vLLM-ascend提供用户部署的Docker镜像，您可以从[镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)拉取预构建进行，并使用bash运行；此外我们也提供了预先
 
 ## 节点通信验证
 首先检查物理层链接，然后验证节点间链接
@@ -80,6 +80,7 @@ ping x.x.x.x
 使用vLLM-ascend官方镜像可以高效运行环境，在节点运行以下示例命令启动容器
 - A2
 ```commandline
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0rc1
 docker run -itd --privileged \
 --name vllm-ascend \
 --net=host \
@@ -106,6 +107,7 @@ docker run -itd --privileged \
 ```
 - A3
 ```commandline
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.rc1-a3
 docker run -itd --privileged \
 --name vllm-ascend \
 --net=host \
