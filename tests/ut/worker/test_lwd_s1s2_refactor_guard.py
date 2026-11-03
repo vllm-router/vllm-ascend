@@ -186,21 +186,23 @@ def test_inject_reuses_carried_index() -> None:
     assert "offsets[window.req_index]" in seg
 
 
-def test_meta_ready_via_worker_api() -> None:
+def test_meta_ready_handoff_to_output_thread() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     worker = _segment(_WORKER, "sample_tokens")
     assert "note_lwd_meta_ready" not in runner
     collect = _segment(_RUNNER, "_lwd_collect_down_payload")
     assert "ready_event = torch.npu.Event()" in collect
     assert "ready_event.record()" in collect
-    # The worker fences the device meta D2H with ready/done events before
-    # publishing the carrier; the runner never performs the host wait.
-    wait = worker.index("stream.wait_event(ready_event)")
-    copy = worker.index("buf[:n_dev].copy_(meta_dev, non_blocking=True)")
-    done = worker.index("done.record()")
-    sync = worker.rindex("done.synchronize()")
+    # The worker only hands the device meta and its per-step event to the
+    # executor output thread; it must not block the compute critical path.
+    assert "stream.wait_event(ready_event)" not in worker
+    assert "done.synchronize()" not in worker
     carrier = worker.index("target.lwd_down_carrier = (")
-    assert wait < copy < done < sync < carrier
+    event = worker.index("target.lwd_meta_ready_event = ready_event")
+    handoff = worker[carrier:event]
+    for field in ("meta_dev", "seg_lens_host", "req_ids", "hidden.numel()", "seqno"):
+        assert field in handoff
+    assert carrier < event
 
 
 def test_collect_split_and_payload_protocol() -> None:
