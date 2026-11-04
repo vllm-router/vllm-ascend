@@ -127,6 +127,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
+            # Retain the zero placeholder so graph replay uses the captured storage.
+            self._lwd_hash_placeholder_ids = torch.zeros_like(self.input_ids.gpu)
 
     def _lwd_reset_reused_row(
         self,
@@ -470,7 +472,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # models keep the native None unchanged.
         model_input_ids: torch.Tensor | None = None
         if self.lwd_hash_state is not None:
-            model_input_ids = torch.zeros_like(self.input_ids.gpu[:num_input_tokens])
+            model_input_ids = self._lwd_hash_placeholder_ids[:num_input_tokens]
         return (
             model_input_ids,
             self.inputs_embeds.gpu[:num_input_tokens],
@@ -560,7 +562,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 # router's dummy-token-0 path can run. Same contract as the
                 # request-side placeholder: all zeros, never read (the
                 # router swaps in row indices).
-                input_ids = torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])
+                input_ids = self._lwd_hash_placeholder_ids[:num_tokens_padded]
         return super()._model_forward(
             num_tokens_padded,
             input_ids,
