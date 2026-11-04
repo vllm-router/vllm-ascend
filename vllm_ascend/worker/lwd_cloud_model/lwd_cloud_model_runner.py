@@ -141,6 +141,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
+            # Retain the zero placeholder so graph replay uses the captured storage.
+            self._lwd_hash_placeholder_ids = torch.zeros_like(self.input_ids.gpu)
 
     def load_model(self) -> None:
         """Load the model, then the Engram inputs built from its own config."""
@@ -573,7 +575,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # models keep the native None unchanged.
         model_input_ids: torch.Tensor | None = None
         if self.lwd_hash_state is not None:
-            model_input_ids = torch.zeros_like(self.input_ids.gpu[:num_input_tokens])
+            model_input_ids = self._lwd_hash_placeholder_ids[:num_input_tokens]
         return (
             model_input_ids,
             self.inputs_embeds.gpu[:num_input_tokens],
@@ -665,7 +667,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 # router's dummy-token-0 path can run. Same contract as the
                 # request-side placeholder: all zeros, never read (the
                 # router swaps in row indices).
-                input_ids = torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])
+                input_ids = self._lwd_hash_placeholder_ids[:num_tokens_padded]
         engram = self.lwd_engram_inputs
         if engram is None:
             return super()._model_forward(
@@ -1108,8 +1110,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         The step meta stays on device (no pinned D2H here — the side-stream
         copy was not fenceable on this platform); a per-step ready event is
         recorded on the main stream, and the fenced harvest (dedicated
-        stream + wait_event + same-stream done event) runs in the worker's
-        sample_tokens, off this collect. Zero added synchronization on the
+        stream + wait_event + same-stream done event) runs in the executor's
+        output thread, off this collect. Zero added synchronization on the
         compute critical path; batch order/mask come from the capture-time
         snapshot (guards against batch-queue overlap reordering).
         Returns:
@@ -1157,8 +1159,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         selection_done = time.monotonic()
         # Per-step ready event: recorded on the main stream before the
         # payload leaves the collect. The fenced harvest (dedicated stream
-        # + wait_event + same-stream done event) lives in the worker's
-        # sample_tokens, NOT here — keeping the compute critical path free
+        # + wait_event + same-stream done event) lives in the executor's
+        # output thread, NOT here — keeping the compute critical path free
         # of any synchronization. The device tensor travels with the
         # payload; the pinned D2H + shared-event scheme is retired (it
         # could not fence the side-stream copy on this platform).
