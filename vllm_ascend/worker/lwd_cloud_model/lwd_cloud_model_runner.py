@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import ModelRunnerOutput
@@ -530,25 +530,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs,
     ) -> torch.Tensor:
-        """Shard embeddings per the SP layout and publish the full Hash routing data into the forward context."""
+        """Publish the full Hash routing data into the forward context."""
         context = get_forward_context()
-        # flash_comm_v1_enabled is only set by the SP fast path; without SP
-        # (the LWD 1+8 TP layout) it is absent and the sharding is skipped.
-        if (
-            inputs_embeds is not None
-            and intermediate_tensors is None
-            and getattr(context, "flash_comm_v1_enabled", False)
-            and not self.supports_mm_inputs
-        ):
-            # Passing embeddings directly bypasses the native embedding layer; re-apply the sequence split here.
-            tp_group = get_tp_group()
-            if tp_group.world_size > 1:
-                if inputs_embeds.shape[0] != num_tokens_padded:
-                    raise ValueError("LWD SP expects full-token inputs_embeds before slicing")
-                if context.pad_size:
-                    inputs_embeds = torch.nn.functional.pad(inputs_embeds, (0, 0, 0, context.pad_size))
-                inputs_embeds = inputs_embeds.chunk(tp_group.world_size, dim=0)[tp_group.rank_in_group]
-            # Positions, attention metadata and the Hash routing tables keep the full-token layout.
         if self.lwd_hash_state is not None:
             # Initialize the routing index cache first so padded rows use the legal zero index.
             self._lwd_hash_token_ids.zero_()
