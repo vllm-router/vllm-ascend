@@ -21,10 +21,10 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import merge_hash_expert_ids
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import merge_hash_expert_ids
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
@@ -162,19 +162,31 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
                 input_ids = input_ids.to(torch.int64)
-                # LWD LWD: prompt rows' expert IDs arrive from the
-                # edge's table lookup over the UP channel (the cloud has no
-                # prompt token ids). Build the per-step merged table
-                # (prompt rows = remote IDs, decode rows = local lookup
-                # rows) and let row indices play the role of token ids —
-                # everything downstream reuses the native TP/EP prep and
-                # gating kernel verbatim.
+                # LWD: prompt rows' expert IDs arrive from the edge's table
+                # lookup over the UP channel (the cloud has no prompt token
+                # ids). Build the per-step merged table (prompt rows = remote
+                # IDs, decode rows = local lookup rows) and let row indices
+                # play the role of token ids — everything downstream reuses
+                # the native TP/EP prep and gating kernel verbatim.
                 remote_ids = getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)
+                # Per-layer constant published by the MoE module; a forward
+                # context attribute would be stale under torch.compile.
+                hash_layer_idx = getattr(self, "hash_layer_idx", None)
+                if self.tid2eid is None:
+                    # Non-Hash layers own no row in the remote table. Vision
+                    # checkpoints still carry bias_vl on them, so this branch is
+                    # reachable; they keep the native dynamic selection.
+                    remote_ids = None
+                elif remote_ids is not None and hash_layer_idx is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 Hash layer router is missing its layer index; "
+                        "the LWD remote expert table cannot be merged."
+                    )
                 if remote_ids is not None:
                     tid2eid_ones = merge_hash_expert_ids(
                         self.tid2eid,
                         _EXTRA_CTX.input_ids,
-                        remote_ids[:, _EXTRA_CTX.lwd_hash_layer_idx],
+                        remote_ids[:, hash_layer_idx],
                         _EXTRA_CTX.lwd_hash_prompt_mask,
                     ).to(torch.int32)
                     input_ids = torch.arange(
@@ -197,10 +209,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     input_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1)).reshape(-1)
                 input_ids = torch.where(input_ids == -1, 0, input_ids)
                 if remote_ids is not None and input_ids.shape[0] != router_logits.shape[0]:
-                    raise ValueError(
-                        "Hash MoE routing rows do not match router logits "
-                        "after TP/EP splitting"
-                    )
+                    raise ValueError("Hash MoE routing rows do not match router logits after TP/EP splitting")
             else:
                 input_ids = None
                 tid2eid_ones = None

@@ -254,18 +254,20 @@ def test_v4_hash_wiring_on_main() -> None:
     B side (ww branch) = the deepseek_v4.py:460 construction-time runner wiring +
     the experts_selector merge block + the fused_moe forward injection.
     main object graph changed (the runner is held indirectly; no .runner attr),
-      ported as: (1) single-point context injection at the model forward entry
-         (hash layer = index, ordinary layer = None); the forwarding layers
-         never inject separately, so an inner layer cannot clobber the outer;
+      ported as: (1) construction-time publication of the layer index on the
+         layer's own router. It cannot ride the forward context: torch.compile
+         traces the model forward once, so a per-forward context write is stale
+         by the time the MoE op body routes;
       (2) the merge block in router/fused_topk_router sqrtsoftplus branch
          (merged table + row indices as token ids; reuses native TP/EP kernels);
       (3) the B-side post-TP/EP row-count fail-fast is kept.
     """
     model_src = (_REPO_ROOT / "vllm_ascend/models/deepseek_v4/model.py").read_text(encoding="utf-8")
-    assert "get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None" in model_src
+    assert "self.experts.router.hash_layer_idx = self.layer_idx if self.hash else None" in model_src
     for path in ("vllm_ascend/ops/fused_moe/fused_moe.py", "vllm_ascend/ops/fused_moe/routed_experts.py"):
         assert "lwd_hash_layer_idx" not in (_REPO_ROOT / path).read_text(encoding="utf-8"), path
     router_src = (_REPO_ROOT / "vllm_ascend/ops/fused_moe/router/fused_topk_router.py").read_text(encoding="utf-8")
     assert "merge_hash_expert_ids(" in router_src
     assert 'getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)' in router_src
+    assert 'hash_layer_idx = getattr(self, "hash_layer_idx", None)' in router_src
     assert "routing rows do not match router logits" in router_src
