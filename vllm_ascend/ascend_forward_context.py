@@ -453,6 +453,10 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        # LWD DSV4 Hash routing, published by LwdCloudModelRunner._model_forward.
+        "input_ids",
+        "lwd_hash_expert_ids",
+        "lwd_hash_prompt_mask",
     )
 
     def check_extra_attr(self, name: str):
