@@ -28,7 +28,7 @@ DeepSeek-V4-Flash-w8a8-mtp（量化版本）：需要1个Atlas 800 A3（128GB ×
 ```
 insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
-2. 准备white_list白名单（一体机和云测服务器都需要）
+2. 准备white_list白名单（一体机和云侧服务器都需要）
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
 ```commandline
@@ -39,7 +39,9 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
     ]
 }
 ```
-3. 准备ranktable（一体机和云测服务器都需要）
+3. 准备ranktable（一体机和云侧服务器都需要）
+
+参考以下创建文件，写入一体机host网卡和服务器的npu网卡信息。
 ```commandline
 {
     "status":"completed",   // ranktable可用标识，completed为可用
@@ -133,7 +135,15 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 
 ## 3 环境安装
 
-我们推荐使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后进行编译安装；此外我们也提供了[编译后版本的镜像](https://quay.io/user/kyoshiki/),使用该镜像的话可跳过3.3节。
+可以使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后下载代码进行编译安装，以下是三个版本代码的下载路径；
+- [典型一边一云](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)
+- [多实例](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)
+- [云侧复用](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)
+
+此外我们也提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像的话可跳过3.3节。
+
+请按需求下载代码或者预编译镜像
+
 ### 3.1 容器创建
 参考以下命令创建容器。
 ```commandline
@@ -195,74 +205,53 @@ dpkg hiroce3-*.deb
 
 ## 4 服务部署
 
-根据实际情况修改启动命令中的关键配置参数，参数说明如下
-
-表1 关键配置参数说明
-
-| 配置项                    | 配置说明                                                                                                                                                                                                                                      |
-|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                                                                                                                                       |
-| vllm serve                | 模型权重路径。程序会读取该路径下的 config.json 中 torch_dtype 和 vocab_size 字段的值，需保证路径和相关字段存在。必填，默认值："/data/atb_testdata/weights/llama1‑65b‑safetensors"。该路径会进行安全校验，需要和执行用户的属组和权限保持一致。 |
-| served‑model‑name         | 模型名称。                                                                                                                                                                                                                                    |
-| host                      | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                                                                                                                                             |
-| port                      | 模型服务端口号。                                                                                                                                                                                                                              |
-| max‑model‑len             | 模型服务上下文长度。                                                                                                                                                                                                                          |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（图1中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                                                                                                                                                                                     |
-
-图1. npu-smi info回显
-
-![img.png](../figure/npu-smi-info/img.png)
-
-
 （1）边侧一体机
 ```bash
 #!/usr/bin/bash
-export VLLM_HOST_IP=76.76.7.134
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡名>
+export TP_SOCKET_IFNAME=<边侧业务面网卡名>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡名>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134  # Node 0 的实际 IP
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-
 export USE_MULTI_GROUPS_KV_CACHE=1
-
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
-
 export USE_MULTI_BLOCK_POOL=1
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_prefill_only.json'
-export HCCL_IF_BASE_PORT=16655
-
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
-vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE='<rank_table文件路径>'
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
+
+vllm serve <model_path> \
   --host 0.0.0.0 \
   --port 8088 \
-  --master-addr 76.76.7.134 \
+  --master-addr <边侧业务面IP> \
   --master-port 29508 \
   --safetensors-load-strategy 'prefetch' \
   --max-model-len 135168 \
   --max-num-batched-tokens 20480 \
-  --served-model-name dsv4 \
+  --served-model-name <自定义模型名称> \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 128 \
   --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8 \
@@ -280,50 +269,49 @@ vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
   --compilation-config '{"cudagraph_mode":"NONE","cudagraph_capture_sizes":[2,4,6,8,10,12,14,16,18,20,22,24,32,36,40]}' \
 ```
 （2）
-云测服务器
+云侧服务器
 ```bash
 #!/usr/bin/bash
-nic_name="enp189s0f0"
-local_ip="76.76.7.158"
-export HCCL_IF_IP=$local_ip
-export GLOO_SOCKET_IFNAME=$nic_name
-export TP_SOCKET_IFNAME=$nic_name
-export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=<云侧业务面IP>
+export GLOO_SOCKET_IFNAME=<云侧业务面网卡名>
+export TP_SOCKET_IFNAME=<云侧业务面网卡名>
+export HCCL_SOCKET_IFNAME=<云侧业务面网卡名>
+
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-
 export USE_MULTI_GROUPS_KV_CACHE=1
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
 export USE_MULTI_BLOCK_POOL=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
-
-export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
-export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.7.158
 export TORCH_DISTRIBUTED_DETAIL=ERROR
 export VLLM_LOGGING_LEVEL=ERROR
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_prefill_only.json'
 
-vllm serve /weight/weight/DeepSeek-V4-Flash-w8a8-mtp \
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
+export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧业务面IP>
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE='<rank_table文件路径>'
+
+vllm serve <model_path> \
     --safetensors-load-strategy 'prefetch' \
-    --master-addr 76.76.7.134\
+    --master-addr <边侧业务面IP> \
     --master-port 29508\
     --max-model-len 136096 \
     --max-num-batched-tokens 20480 \
      -pp 2 \
-    --served-model-name dsv4 \
+    --served-model-name <自定义模型名称> \
     --gpu-memory-utilization 0.92 \
     --max-num-seqs 128 \
     --tensor-parallel-size 8 \
@@ -342,67 +330,81 @@ vllm serve /weight/weight/DeepSeek-V4-Flash-w8a8-mtp \
     --async-scheduling \
     --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
 ```
+表4.1.1 关键配置参数说明
+
+
+| 配置项                    | 配置说明                                                                                                                        |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| --served‑model‑name       | 模型名称。                                                                                                                      |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
+| --port                    | 模型服务端口号。                                                                                                                |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
+
+![img.png](../figure/npu-smi-info/img.png)
 
 ### 4.2 多实例
 因为边云特性在边侧占用很少算力，所以可在边侧部署多个容器，创建多个服务和不同云侧服务器算卡对接，以下以一体机作为边侧算力，云侧使用不同服务器为例部署两实例：
 
-(1)边测一体机容器1
+(1) 边侧一体机容器1
 ```commandline
 #!/usr/bin/bash
-export VLLM_HOST_IP=76.76.26.140
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
+export TP_SOCKET_IFNAME=<边侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-
 export USE_MULTI_GROUPS_KV_CACHE=1
-
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
-
 export USE_MULTI_BLOCK_POOL=1
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_ds.json'
-export HCCL_IF_BASE_PORT=16656
-
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
 export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
-export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
-vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
+
+vllm serve <model_path> \
   --host 0.0.0.0 \
   --port 8088 \
-  --master-addr 76.76.26.140 \
-    --api-server-count 2 \
-    --api-server-rpc-port  23657 \
+  --master-addr <边侧业务面IP> \
+  --api-server-count 2 \
+  --api-server-rpc-port  23657 \
   --master-port 33657 \
-    --pipeline-parallel-size 1 \
+  --pipeline-parallel-size 1 \
   --safetensors-load-strategy 'prefetch' \
   --max-model-len 300000 \
   --max-num-batched-tokens 12800 \
-  --served-model-name dsv4 \
+  --served-model-name <自定义模型名称> \
   --gpu-memory-utilization 0.94 \
   --max-num-seqs 128 \
-    --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 16  --instance_parallel_size 2 --instance_parallel_start_rank 0 \
+  --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 16  --instance_parallel_size 2 --instance_parallel_start_rank 0 \
   --enable-expert-parallel \
   --quantization ascend \
   --block-size 128 \
@@ -419,60 +421,59 @@ vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
 (2)边侧一体机容器2
 ```commandline
 #!/usr/bin/bash
-export VLLM_HOST_IP=76.76.26.140
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
+export TP_SOCKET_IFNAME=<边侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-
 export USE_MULTI_GROUPS_KV_CACHE=1
-
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
-
 export USE_MULTI_BLOCK_POOL=1
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_ds.json'
-export HCCL_IF_BASE_PORT=16656
-
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
 export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
-export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
-vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
+
+vllm serve <model_path> \
   --host 0.0.0.0 \
   --port 8089 \
-  --master-addr 76.76.26.140 \
-    --api-server-count 2 \
-    --api-server-attach  76.76.26.140:23657 \
+  --master-addr <边侧业务面IP> \
+  --api-server-count 2 \
+  --api-server-attach  <边侧业务面IP>:23657 \
   --master-port 33657 \
-    --pipeline-parallel-size 1 \
+  --pipeline-parallel-size 1 \
   --safetensors-load-strategy 'prefetch' \
   --max-model-len 300000 \
   --max-num-batched-tokens 12800 \
-  --served-model-name dsv4 \
+  --served-model-name <自定义模型名称> \
   --gpu-memory-utilization 0.94 \
   --max-num-seqs 128 \
-    --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 16  --instance_parallel_size 2 --instance_parallel_start_rank 1 \
+  --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 16  --instance_parallel_size 2 --instance_parallel_start_rank 1 \
   --enable-expert-parallel \
   --quantization ascend \
   --block-size 128 \
@@ -489,49 +490,49 @@ vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
 (3)云侧服务器1
 ```commandline
 #!/usr/bin/bash
-nic_name="enp189s0f0"
-local_ip="76.76.26.192"
-export HCCL_IF_IP=$local_ip
-export GLOO_SOCKET_IFNAME=$nic_name
-export TP_SOCKET_IFNAME=$nic_name
-export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=<云1业务面IP>
+export GLOO_SOCKET_IFNAME=<云1业务面网卡>
+export TP_SOCKET_IFNAME=<云1业务面网卡>
+export HCCL_SOCKET_IFNAME=<云1业务面网卡>
+
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-
 export USE_MULTI_GROUPS_KV_CACHE=1
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
 export USE_MULTI_BLOCK_POOL=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
-
-export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.26.192
 export TORCH_DISTRIBUTED_DETAIL=ERROR
 export VLLM_LOGGING_LEVEL=ERROR
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_ds.json'
-export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
 export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
-vllm serve /weight/DeepSeek-V4-Flash-w8a8-mtp \
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云1业务面IP>
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+
+vllm serve <model_path> \
     --safetensors-load-strategy 'prefetch' \
-    --master-addr 76.76.26.140\
+    --master-addr <边侧业务面IP> \
     --master-port 33657\
     --max-model-len 300000 \
     --max-num-batched-tokens 12800 \
-     -pp 2 \
-    --served-model-name dsv4 \
+    -pp 2 \
+    --served-model-name <自定义模型名称> \
     --gpu-memory-utilization 0.94 \
     --max-num-seqs 128 \
     --tensor-parallel-size 8 \
@@ -553,49 +554,49 @@ vllm serve /weight/DeepSeek-V4-Flash-w8a8-mtp \
 (4)云侧服务器2
 ```commandline
 #!/usr/bin/bash
-nic_name="enp189s0f0"
-local_ip="76.76.26.190"
-export HCCL_IF_IP=$local_ip
-export GLOO_SOCKET_IFNAME=$nic_name
-export TP_SOCKET_IFNAME=$nic_name
-export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=<云2业务面IP>
+export GLOO_SOCKET_IFNAME=<云2业务面网卡>
+export TP_SOCKET_IFNAME=<云2业务面网卡>
+export HCCL_SOCKET_IFNAME=<云2业务面网卡>
+
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-
 export USE_MULTI_GROUPS_KV_CACHE=1
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
 export USE_MULTI_BLOCK_POOL=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
-
-export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.26.190
 export TORCH_DISTRIBUTED_DETAIL=ERROR
 export VLLM_LOGGING_LEVEL=ERROR
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_ds.json'
-export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
 export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=4800
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
-vllm serve /weight/DeepSeek-V4-Flash-w8a8-mtp \
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6853
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6854
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云2业务面IP>
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
+
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+
+vllm serve <model_path> \
     --safetensors-load-strategy 'prefetch' \
-    --master-addr 76.76.26.140\
+    --master-addr <边侧业务面IP> \
     --master-port 33657 \
     --max-model-len 300000 \
     --max-num-batched-tokens 12800 \
      -pp 2 \
-    --served-model-name dsv4 \
+    --served-model-name <自定义模型名称> \
     --gpu-memory-utilization 0.94 \
     --max-num-seqs 128 \
     --tensor-parallel-size 8 \
@@ -614,65 +615,100 @@ vllm serve /weight/DeepSeek-V4-Flash-w8a8-mtp \
     --async-scheduling \
     --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
 ```
-### 4.3 云测复用
+表4.2.1 关键配置参数说明
 
-部署模型时云侧设备算例如果有空闲，可云测复用部署多个服务，以下以多台一体机作为边测算力，云侧使用一台服务器为例部署：
-（1）边测一体机1
+| 配置项                    | 配置说明                                                                                                                 |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                  |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                 |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                            |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
+| --served‑model‑name       | 模型名称。                                                                                                               |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                        |
+| --port                    | 模型服务端口号。                                                                                                         |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                     |
+| --api-server-count        | 边侧实例数。                                                                                                             |
+| --api-server-rpc-port     | 实例0和其他实例通信端口。                                                                                                |
+| --api-server-attach       | 非实例0和实例0通信ip和端口                                                                                               |
+
+### 4.3 云侧复用
+
+部署模型时云侧设备算例如果有空闲，可云侧复用部署多个服务，具体流程如下图所示。服务器到达边侧后，由一体机进行处理生成kv和中间层向量，后转发到AI网关，由AI网关根据云侧服务器负载情况转发到合适的云侧服务器进行处理。在无AI网关情况下，可在边侧配置直接转发到云侧服务器。
+
+![1793756876456.jpeg](../figure/1793756876456.jpeg)
+
+以下以多个一体机服务作为边侧算力，云侧使用一台服务器为例部署：
+1、创建边云全局共享的静态角色注册表，规定边云的拓扑结构（yaml格式文件）
+```commandline
+world:
+    master_addr:<node0 IP,复用边1业务面IP>
+    master_port:<master_port>
+edge:
+    -id:0
+    addr:<边1业务面IP>
+    ranks:[0] #使用npu的卡号
+    -id:1
+    addr:<边2业务面IP>
+    ranks:[0] #使用npu的卡号
+clouds:
+    -id:0
+    addr:<云侧业务面IP>
+    ranks:[0,1,2,3] #使用npu的卡号
+    zmq_base_port:<port> #假设由n个边，需要占用[port,port+2*n]区间内的端口，确保这些端口无占用
+```
+2、创建租户密钥文件tenant_key_file隔离不同来源的kv
+只在边侧持有，按照十六进制写入，二进制读取，需要≥16字节，例如`7a2f9d4c810e3b56290f74ac58bd32071ce694085f213bc709426da518c4963`
+
+3、服务部署
+（1） 边侧一体机1
 ```commandline
 #!/usr/bin/bash
-export VLLM_HOST_IP=76.76.7.134
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+export VLLM_HOST_IP=<边1业务面IP>
+export GLOO_SOCKET_IFNAME=<边1业务面网卡>
+export TP_SOCKET_IFNAME=<边1业务面网卡>
+export HCCL_SOCKET_IFNAME=<边1业务面网卡>
+export MASTER_ADDR=<node0 IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-
 export USE_MULTI_GROUPS_KV_CACHE=1
-
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
-
 export USE_MULTI_BLOCK_POOL=1
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_prefill_only_2e1c.json'
-export HCCL_IF_BASE_PORT=16657
-
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c_ds.yaml
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-
-
-vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
+vllm serve <model_path> \
   --host 0.0.0.0 \
   --port 8094 \
-  --master-addr 76.76.7.134 \
+  --master-addr <node0 IP> \
   --master-port 29508 \
   --edge-id 0 \
-  --role-registry "$REGISTRY" \
+  --role-registry "<边云全局共享的静态角色注册表.yaml>" \
   --safetensors-load-strategy 'prefetch' \
   --max-model-len 135168 \
   --max-num-batched-tokens 20480 \
-  --served-model-name dsv4 \
+  --served-model-name <自定义模型名称> \
   --gpu-memory-utilization 0.9 \
   --max-num-seqs 128 \
   --trust-remote-code --nnodes 3 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8 \
@@ -686,65 +722,58 @@ vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
   --async-scheduling \
-  --additional-config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge0", "connect_timeout":5.0}}' \
+  --additional-config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "control_url": "<控制url,此场景填写云侧服务监听地址>", "tenant_key_file": "<租户密钥文件>", "consumer_id": "enterprise-a-edge0", "connect_timeout":5.0}}' \
   --compilation-config '{"cudagraph_mode":"NONE","cudagraph_capture_sizes":[2,4,6,8,10,12,14,16,18,20,22,24,32,36,40]}' \
 ```
-（1）边测一体机2
+（1） 边侧一体机2
 ```commandline
 #!/usr/bin/bash
-export VLLM_HOST_IP=76.76.7.134
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+export VLLM_HOST_IP=<边2业务面IP>
+export GLOO_SOCKET_IFNAME=<边2业务面网卡>
+export TP_SOCKET_IFNAME=<边2业务面网卡>
+export HCCL_SOCKET_IFNAME=<边2业务面网卡>
+export MASTER_ADDR=<node0 IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-
 export USE_MULTI_GROUPS_KV_CACHE=1
-
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
-
 export USE_MULTI_BLOCK_POOL=1
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_prefill_only_2e1c.json'
-export HCCL_IF_BASE_PORT=16656
-
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
 export ASCEND_RT_VISIBLE_DEVICES=1
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c_ds.yaml
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-
-
-vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
+vllm serve <model_path> \
   --host 0.0.0.0 \
   --port 8095 \
-  --master-addr 76.76.7.134 \
+  --master-addr <node0 IP> \
   --master-port 29508 \
   --edge-id 1 \
-  --role-registry "$REGISTRY" \
+  --role-registry "<边云全局共享的静态角色注册表yaml>" \
   --safetensors-load-strategy 'prefetch' \
   --max-model-len 135168 \
   --max-num-batched-tokens 20480 \
-  --served-model-name dsv4 \
+  --served-model-name <自定义模型名称> \
   --gpu-memory-utilization 0.9 \
   --max-num-seqs 128 \
   --trust-remote-code --nnodes 3 --node-rank 1 --edge-npu-count 1 --cloud-npu-count 8 \
@@ -758,55 +787,55 @@ vllm serve /home/weight/DeepSeek-V4-Flash-w8a8-mtp \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
   --async-scheduling \
-    --additional-config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge1", "connect_timeout":5.0}}' \
+    --additional-config '{"enable_cpu_binding":true, "multistream_overlap_shared_expert":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "control_url": "<控制url,此场景填写云侧服务监听地址>", "tenant_key_file": "<租户密钥文件>", "consumer_id": "enterprise-a-edge1", "connect_timeout":5.0}}' \
   --compilation-config '{"cudagraph_mode":"NONE","cudagraph_capture_sizes":[2,4,6,8,10,12,14,16,18,20,22,24,32,36,40]}' \
 ```
-（3）云测服务器
+（3）云侧服务器
 ```commandline
 #!/usr/bin/bash
-nic_name="enp189s0f0"
-local_ip="76.76.7.158"
-export HCCL_IF_IP=$local_ip
-export GLOO_SOCKET_IFNAME=$nic_name
-export TP_SOCKET_IFNAME=$nic_name
-export HCCL_SOCKET_IFNAME=$nic_name
+export VLLM_HOST_IP=<云侧业务面IP>
+export GLOO_SOCKET_IFNAME=<云侧业务面IP>
+export TP_SOCKET_IFNAME=<云侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<云侧业务面网卡>
+export MASTER_ADDR=<node0 IP>
+
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-
 export USE_MULTI_GROUPS_KV_CACHE=1
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
 export USE_MULTI_BLOCK_POOL=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl kernel.sched_migration_cost_ns=50000
+export TORCH_DISTRIBUTED_DETAIL=ERROR
+export VLLM_LOGGING_LEVEL=ERROR
 
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7853
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7854
 export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.7.158
-export TORCH_DISTRIBUTED_DETAIL=ERROR
-export VLLM_LOGGING_LEVEL=ERROR
+
+#一体机配置
 export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_prefill_only_2e1c.json'
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c_ds.yaml
-vllm serve /weight/weight/DeepSeek-V4-Flash-w8a8-mtp \
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+
+vllm serve <model_path> \
     --safetensors-load-strategy 'prefetch' \
-    --master-addr 76.76.7.134\
+    --master-addr <node0 IP> \
     --master-port 29508\
     --max-model-len 136096 \
     --max-num-batched-tokens 20480 \
-    --role-registry "$REGISTRY" \
+    --role-registry "<边云全局共享的静态角色注册表yaml>" \
     --cloud-id 0 \
      -pp 2 \
-    --served-model-name dsv4 \
+    --served-model-name <自定义模型名称> \
     --gpu-memory-utilization 0.9 \
     --max-num-seqs 128 \
     --tensor-parallel-size 8 \
@@ -823,8 +852,27 @@ vllm serve /weight/weight/DeepSeek-V4-Flash-w8a8-mtp \
     --speculative-config '{"num_speculative_tokens": 1, "method":"mtp"}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 180, 182, 184, 186, 188, 190, 192, 194, 196, 198, 200]}' \
     --async-scheduling \
-    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "listen_host": "0.0.0.0", "listen_port": 9133, "instance_id": "cloud-0"}}' \
+    --additional-config '{"enable_cpu_binding":true, "ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": true, "listen_host": "0.0.0.0", "listen_port": <port>, "instance_id": "cloud-0"}}' \
 ```
+表 4.3.1 关键参数说明
+
+| 配置项                    | 配置说明                                                                                                                        |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| --served‑model‑name       | 模型名称。                                                                                                                      |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
+| --port                    | 模型服务端口号。                                                                                                                |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
+| --edge-id                 | 边侧设备的唯一id标识，从0开始                                                                                                   |
+| --role-registry           | 边云全局共享的yaml格式的静态角色注册表，规定边云的拓扑结构                                                                      |
+| control_url               | 控制url,需要网关调度填写网关地址，无网关地址则填写需要使用的云侧服务监听地址，例如：http://xx.xx.xx.xx:port/v1/chat/completions |
+| listen_host/port          | 云侧协调HTTP服务监听地址，默认为0.0.0.0：8100，和边侧的control_url搭配使用                                                      |
+| tenant_key_file           | 租户密钥文件，用户多个服务间隔离，只在边侧持有                                                                                  |
+| consumer_id               | 边侧标识id,每个服务不一样，例如enterprise-a-edge0                                                                               |
+| instance_id               | 云侧标识id,每个服务不一样，例如cloud-0                                                                                          |
 
 ## 5 功能验证
 服务启动后，可通过发送提示词调用模型。支持两个API接口：completions和chat.completions。使用您配置的`--served-model-name`。

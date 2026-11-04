@@ -22,7 +22,7 @@ GLM-5.2-w4a8c8（实验性）：需要 1 个 Atlas 800 A3（128GB × 8）节点�
 ```
 insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
-2. 准备white_list白名单（一体机和云测服务器都需要）
+2. 准备white_list白名单（一体机和云侧服务器都需要）
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
 ```commandline
@@ -33,7 +33,9 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
     ]
 }
 ```
-3. 准备ranktable（一体机和云测服务器都需要）
+3. 准备ranktable（一体机和云侧服务器都需要）
+
+参考以下创建文件，写入一体机host网卡和服务器的npu网卡信息。
 ```commandline
 {
     "status":"completed",   // ranktable可用标识，completed为可用
@@ -127,7 +129,13 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 
 ## 3 环境安装
 
-我们推荐使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后进行编译安装；此外我们也提供了[编译后版本的镜像](https://quay.io/user/kyoshiki/),使用该镜像的话可跳过3.3节。
+可以使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后下载代码进行编译安装，以下是三个版本代码的下载路径；
+- [典型一边一云](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)
+- [多实例](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)
+- [云侧复用](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)
+
+此外我们也提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像的话可跳过3.3节。
+
 ### 3.1 容器创建
 参考以下命令创建容器。
 ```commandline
@@ -196,45 +204,17 @@ dpkg hiroce3-*.deb
 ```
 
 ## 4 服务部署
-
-根据实际情况修改启动命令中的关键配置参数，参数说明如下
-
-表1 关键配置参数说明
-
-| 配置项                    | 配置说明                                                                                                                                                                                                                                      |
-|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                                                                                                                                       |
-| vllm serve                | 模型权重路径。程序会读取该路径下的 config.json 中 torch_dtype 和 vocab_size 字段的值，需保证路径和相关字段存在。必填，默认值："/data/atb_testdata/weights/llama1‑65b‑safetensors"。该路径会进行安全校验，需要和执行用户的属组和权限保持一致。 |
-| served‑model‑name         | 模型名称。                                                                                                                                                                                                                                    |
-| host                      | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                                                                                                                                             |
-| port                      | 模型服务端口号。                                                                                                                                                                                                                              |
-| max‑model‑len             | 模型服务上下文长度。                                                                                                                                                                                                                          |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（图1中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                                                                                                                                                                                     |
-
-图1. npu-smi info回显
-
-
-![img.png](../figure/npu-smi-info/img.png)
-
-
-
 (1)边侧一体机
 ```bash
 #!/bin/bash
-export VLLM_HOST_IP=76.76.26.150
-export GLOO_SOCKET_IFNAME=enp125s0f0
-export TP_SOCKET_IFNAME=enp125s0f0
-export HCCL_SOCKET_IFNAME=enp125s0f0
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
+export TP_SOCKET_IFNAME=<边侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.150
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/rank_table_file_150_233.json'
-export HCCL_IF_BASE_PORT=16657
-export CLOUD_MACHINE_A3=1
-
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -247,25 +227,30 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7253
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7254
-export VLLM_LOGGING_LEVEL=INFO
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE='<rank_table文件路径>'
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
+export CLOUD_MACHINE_A3=1
 
-vllm serve /home/GLM-5.2-w4a8c8/ \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port 9876 \
-    --master-addr 76.76.26.150 \
+    --master-addr <边侧业务面IP> \
     --master-port 38976 \
     --max-model-len 67000 \
-    --served-model-name glm5 \
+    --served-model-name <自定义模型名称> \
     --no-enable-prefix-caching \
     --quantization ascend \
     --seed 1024 \
@@ -282,23 +267,17 @@ vllm serve /home/GLM-5.2-w4a8c8/ \
     --enable-chunked-prefill \
 ```
 
-（2）云测服务器
+（2）云侧服务器
 ```bash
 #!/bin/bash
-export VLLM_HOST_IP=76.76.26.233
-export GLOO_SOCKET_IFNAME=enp196s0f0
-export TP_SOCKET_IFNAME=enp196s0f0
-export HCCL_SOCKET_IFNAME=enp196s0f0
+export VLLM_HOST_IP=<云侧业务面IP>
+export GLOO_SOCKET_IFNAME=<云侧业务面网卡名>
+export TP_SOCKET_IFNAME=<云侧业务面网卡名>
+export HCCL_SOCKET_IFNAME=<云侧业务面网卡名>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.150
-
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ytj/rank_table_file_150_233.json'
-#export HCCL_INTER_HCCS_DISABLE=TRUE
-# ▒▒▒ֲ▒ʽ▒▒ʱ
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -321,14 +300,18 @@ export VLLM_LOGGING_LEVEL=INFO
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7253
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7254
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.26.233
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧业务面IP>
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE='<rank_table文件路径>'
 
-vllm serve /mnt/mnt1/GLM-5.2-w4a8c8/ \
-    --master-addr 76.76.26.150 \
+vllm serve <model_path> \
+    --master-addr <边侧业务面IP> \
     --master-port 38976 \
     --max-model-len 67000 \
-    --served-model-name glm5 \
+    --served-model-name <自定义模型名称> \
     --no-enable-prefix-caching \
     --quantization ascend \
     --seed 1024 \
@@ -347,6 +330,22 @@ vllm serve /mnt/mnt1/GLM-5.2-w4a8c8/ \
     --no-enable-prefix-caching \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' \
 ```
+根据实际情况修改启动命令中的关键配置参数，参数说明如下
+
+表4.1.1 关键配置参数说明
+
+
+| 配置项                    | 配置说明                                                                                                                        |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| --served‑model‑name       | 模型名称。                                                                                                                      |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
+| --port                    | 模型服务端口号。                                                                                                                |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |                                                                                                               |
+![img.png](../figure/npu-smi-info/img.png)
 
 ## 5 功能验证
 服务启动后，可通过发送提示词调用模型。支持两个API接口：completions和chat.completions。使用您配置的`--served-model-name`。

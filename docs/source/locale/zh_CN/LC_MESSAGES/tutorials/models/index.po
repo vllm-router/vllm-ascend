@@ -22,7 +22,7 @@ msgstr ""
 
 #: ../../source/tutorials/models/index.md:1
 #: ../../source/tutorials/models/index.md:5
-msgid "Model Tutorials"
+msgid "Model_Tutorials"
 msgstr "模型教程"
 
 #: ../../source/tutorials/models/index.md:3

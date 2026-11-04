@@ -22,7 +22,7 @@ Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A3（64GB × 16）节点�
 ```
 insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
-2. 准备white_list白名单（一体机和云测服务器都需要）
+2. 准备white_list白名单（一体机和云侧服务器都需要）
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
 ```commandline
@@ -33,7 +33,9 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
     ]
 }
 ```
-3. 准备ranktable（一体机和云测服务器都需要）
+3. 准备ranktable（一体机和云侧服务器都需要）
+
+参考以下创建文件，写入一体机host网卡和服务器的npu网卡信息。
 ```commandline
 {
     "status":"completed",   // ranktable可用标识，completed为可用
@@ -127,11 +129,18 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 
 ## 3 环境安装
 
-我们推荐使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后进行编译安装；此外我们也提供了[编译后版本的镜像](https://quay.io/user/kyoshiki/),使用该镜像的话可跳过3.3节。
+可以使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后下载代码进行编译安装，以下是三个版本代码的下载路径；
+- [典型一边一云](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)
+- [多实例](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)
+- [云侧复用](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)
+
+此外我们也提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像的话可跳过3.3节。
+
+请按需求下载代码或者预编译镜像
 ### 3.1 容器创建
 参考以下命令创建容器。
 ```commandline
-export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.rc1 #可修改
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.rc1 #按情况修改
 docker run -itd --privileged \
 --name=<container-name> \
 --ipc=host --net=host\
@@ -156,7 +165,7 @@ docker run -itd --privileged \
 -it $IMAGE bash
 ```
 
-表 1 参数说明
+表 3.1 参数说明
 
 | 参数                                                 | 参数说明                                                                                                                                                                                                                                                                                                                                   |
 |------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -189,26 +198,6 @@ dpkg hiroce3-*.deb
 
 ## 4 服务部署
 
-根据实际情况修改启动命令中的关键配置参数，参数说明如下
-
-表1 关键配置参数说明
-
-| 配置项                    | 配置说明                                                                                                                                                                                                                                      |
-|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                                                                                                                                       |
-| vllm serve                | 模型权重路径。程序会读取该路径下的 config.json 中 torch_dtype 和 vocab_size 字段的值，需保证路径和相关字段存在。必填，默认值："/data/atb_testdata/weights/llama1‑65b‑safetensors"。该路径会进行安全校验，需要和执行用户的属组和权限保持一致。 |
-| served‑model‑name         | 模型名称。                                                                                                                                                                                                                                    |
-| host                      | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                                                                                                                                             |
-| port                      | 模型服务端口号。                                                                                                                                                                                                                              |
-| max‑model‑len             | 模型服务上下文长度。                                                                                                                                                                                                                          |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（图1中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                                                                                                                                                                                     |
-
-图1. npu-smi info回显
-
-
-![img.png](../figure/npu-smi-info/img.png)
-
-
 ### 4.1 典型一边一云
 
 #### 4.1.1 边云都是服务器部署
@@ -220,9 +209,10 @@ export VLLM_HOST_IP=<边侧业务面IP>
 export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
 export TP_SOCKET_IFNAME=<边侧业务面网卡>
 export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=<边侧IP>
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -239,13 +229,14 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
-export VLLM_LOGGING_LEVEL=INFO
 
 # ========== 启动命令 ==========
-vllm serve model_path \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port <port> \
     --master-addr <边侧业务面IP> \
@@ -263,7 +254,7 @@ vllm serve model_path \
     --gpu-memory-utilization 0.9
 ```
 （2）
-云测服务器
+云侧服务器
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -271,9 +262,10 @@ export VLLM_HOST_IP=<云侧业务面IP>
 export GLOO_SOCKET_IFNAME=<云侧业务面网卡名>
 export TP_SOCKET_IFNAME=<云侧业务面网卡名>
 export HCCL_SOCKET_IFNAME=<云侧业务面网卡名>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=<边侧IP>
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -292,13 +284,14 @@ export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
 export VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD=1
 export VLLM_LOGGING_LEVEL=INFO
+
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
 export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧IP>
 
 # ========== 启动命令 ==========
-vllm serve model_path \
+vllm serve <model_path> \
     --master-addr <边侧业务面IP> \
     --master-port <master-port> \
     --max-model-len 262144 \
@@ -324,9 +317,10 @@ export VLLM_HOST_IP=<边侧业务面IP>
 export GLOO_SOCKET_IFNAME=<边侧业务面网卡名>
 export TP_SOCKET_IFNAME=<边侧业务面网卡名>
 export HCCL_SOCKET_IFNAME=<边侧业务面网卡名>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=<边侧IP>
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -343,24 +337,26 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
-export VLLM_LOGGING_LEVEL=INFO
-#一体机专用环境变量
+
+#一体机配置
 export HCCL_WHITELIST_DISABLE="0"
 export HCCL_WHITELIST_FILE="<白名单文件路径>"
 export RANK_TABLE_FILE='<rank_table文件路径>'
 export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
 # ========== 启动命令 ==========
-vllm serve /home/weight/Qwen3.6-27B.md \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port <port> \
     --master-addr <边侧业务面IP> \
     --master-port <master-port> \
     --max-model-len 262144 \
-    --served-model-name <模型识别名称> \
+    --served-model-name <自定义模型名称> \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size 1 \
     --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 4 \
@@ -372,7 +368,7 @@ vllm serve /home/weight/Qwen3.6-27B.md \
     --gpu-memory-utilization 0.9
 ```
 
-（2）云测服务器
+（2）云侧服务器
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -380,9 +376,10 @@ export VLLM_HOST_IP=<云侧业务面IP>
 export GLOO_SOCKET_IFNAME=<云侧业务面网卡名>
 export TP_SOCKET_IFNAME=<云侧业务面网卡名>
 export HCCL_SOCKET_IFNAME=<云侧业务面网卡名>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=<边侧IP>
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -401,18 +398,19 @@ export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
 export VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD=1
 export VLLM_LOGGING_LEVEL=INFO
+
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧IP>
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧业务面IP>
 
-#一体机专用环境变量
+#一体机配置
 export HCCL_WHITELIST_DISABLE="0"
 export HCCL_WHITELIST_FILE="<白名单文件路径>"
 export RANK_TABLE_FILE='<rank_table文件路径>'
 
 # ========== 启动命令 ==========
-vllm serve /weight/weight/Qwen3.6-27B.md \
+vllm serve <model_path> \
     --master-addr <边侧业务面IP> \
     --master-port <master-port> \
     --max-model-len 262144 \
@@ -429,23 +427,35 @@ vllm serve /weight/weight/Qwen3.6-27B.md \
     --speculative-config '{"num_speculative_tokens": 3, "method":"qwen3_5_mtp", "enforce_eager": true}'
 ```
 
+表4.1.1 关键配置参数说明
+
+
+| 配置项                    | 配置说明                                                                                                                        |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| --served‑model‑name       | 模型名称。                                                                                                                      |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
+| --port                    | 模型服务端口号。                                                                                                                |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
+
+![img.png](../figure/npu-smi-info/img.png)
 ### 4.2 多实例
 因为边云特性在边侧占用很少算力，所以可在边侧部署多个容器，创建多个服务和不同云侧服务器算卡对接，以下以一体机作为边侧算力，云侧使用不同服务器为例部署两实例：
 
-(1)边测一体机容器1
+(1) 边侧一体机容器1
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=76.76.26.140
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+#!/bin/bash
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
+export TP_SOCKET_IFNAME=<边侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
-export HCCL_IF_BASE_PORT=16657
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -458,31 +468,35 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
 export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
-export VLLM_LOGGING_LEVEL=INFO
 export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
-export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port 8123 \
-    --master-addr 76.76.26.140 \
+    --master-addr <边侧业务面IP> \
     --api-server-count 2 \
     --api-server-rpc-port  23657 \
     --master-port 23657 \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size 1 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8  --instance_parallel_size 2 --instance_parallel_start_rank 0 \
     --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
@@ -490,7 +504,7 @@ vllm serve /home/weight/Qwen3.6-27B \
     --max-num-batched-tokens 8192 \
     --async-scheduling \
     --gpu-memory-utilization 0.92 \
-    --chat-template /home/weight/Qwen3.6-27B/chat_template.jinja \
+    --chat-template /xxxx/Qwen3.6-27B/chat_template.jinja \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
@@ -498,18 +512,15 @@ vllm serve /home/weight/Qwen3.6-27B \
 ```
 (2)边侧一体机容器2
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=76.76.26.140
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+#!/bin/bash
+export VLLM_HOST_IP=<边侧业务面IP>
+export GLOO_SOCKET_IFNAME=<边侧业务面网卡>
+export TP_SOCKET_IFNAME=<边侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<边侧业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140   # Node 0 的实际 IP
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
-export HCCL_IF_BASE_PORT=16657
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -522,31 +533,35 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
 export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
-export VLLM_LOGGING_LEVEL=INFO
 export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
-export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port 8124 \
-    --master-addr 76.76.26.140 \
+    --master-addr <边侧业务面IP> \
     --api-server-count 2 \
-    --api-server-attach  76.76.26.140:23657 \
+    --api-server-attach  <边侧业务面IP>:23657 \
     --master-port 23657 \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size 1 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --trust-remote-code --nnodes 2 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 8   --instance_parallel_size 2 --instance_parallel_start_rank 1 \
     --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
@@ -554,7 +569,7 @@ vllm serve /home/weight/Qwen3.6-27B \
     --max-num-batched-tokens 8192 \
     --async-scheduling \
     --gpu-memory-utilization 0.92 \
-    --chat-template /home/weight/Qwen3.6-27B/chat_template.jinja \
+    --chat-template /xxx/Qwen3.6-27B/chat_template.jinja \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
@@ -562,18 +577,15 @@ vllm serve /home/weight/Qwen3.6-27B \
 ```
 (3)云侧服务器1
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=776.76.26.190
-export GLOO_SOCKET_IFNAME=enp189s0f0
-export TP_SOCKET_IFNAME=enp189s0f0
-export HCCL_SOCKET_IFNAME=enp189s0f0
+#!/bin/bash
+export VLLM_HOST_IP=<云1业务面IP>
+export GLOO_SOCKET_IFNAME=<云1业务面网卡>
+export TP_SOCKET_IFNAME=<云1业务面网卡>
+export HCCL_SOCKET_IFNAME=<云1业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140  # Node 0 的实际 IP
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
-export HCCL_IF_BASE_PORT=16657
 # 增大分布式超时
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -587,28 +599,31 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
 export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=776.76.26.190    #云的ip
-export VLLM_LOGGING_LEVEL=INFO
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云1业务面IP>
 export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
-export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
 
-vllm serve /weight/Qwen3.6-27B \
-    --master-addr 76.76.26.140 \
+vllm serve <model_path> \
+    --master-addr <边侧业务面IP> \
     --master-port 23657 \
     -pp 2 \
     --tensor-parallel-size 4 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --trust-remote-code --nnodes 2 --node-rank 1  --edge-npu-count 1 --cloud-npu-count 8 --instance_parallel_size 2 --instance_parallel_start_rank 0 \
     --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600, 604, 608, 612, 616, 620, 624, 628, 632, 636, 640, 644, 648, 652, 656, 660, 664, 668, 672, 676, 680, 684, 688, 692, 696, 700, 704, 708, 712, 716, 720]}' \
@@ -617,7 +632,7 @@ vllm serve /weight/Qwen3.6-27B \
     --async-scheduling \
     --gpu-memory-utilization 0.92 \
     --speculative-config '{"num_speculative_tokens": 3,"method": "mtp"}' \
-    --chat-template /weight/Qwen3.6-27B/chat_template.jinja \
+    --chat-template /xxx/Qwen3.6-27B/chat_template.jinja \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
@@ -625,18 +640,15 @@ vllm serve /weight/Qwen3.6-27B \
 ```
 (4)云侧服务器2
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=776.76.26.190
-export GLOO_SOCKET_IFNAME=enp189s0f0
-export TP_SOCKET_IFNAME=enp189s0f0
-export HCCL_SOCKET_IFNAME=enp189s0f0
+#!/bin/bash
+export VLLM_HOST_IP=<云2业务面IP>
+export GLOO_SOCKET_IFNAME=<云2业务面网卡>
+export TP_SOCKET_IFNAME=<云2业务面网卡>
+export HCCL_SOCKET_IFNAME=<云2业务面网卡>
+export MASTER_ADDR=<边侧业务面IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.26.140  # Node 0 的实际 IP
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/l30027191/vllm/ranktable/white_list.json"
-export RANK_TABLE_FILE='/home/l30027191/vllm/ranktable/rank_table_140_190.json'
-export HCCL_IF_BASE_PORT=16657
 # 增大分布式超时
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -650,29 +662,31 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
-
-export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export CUDA_VISIBLE_DEVICES=2,3
-export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
-export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=776.76.26.190    #云的ip
 export VLLM_LOGGING_LEVEL=INFO
-export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
 export VLLM_ASCEND_LWD_HELLO_TIMEOUT_S=2400
 
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=5293
+export VLLM_ASCEND_LWD_POST_OUT_PORT=5294
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云2业务面IP>
+export HCCL_NPU_SOCKET_PORT_RANGE=18710-18730
 
-vllm serve /weight/Qwen3.6-27B \
-    --master-addr 76.76.26.140 \
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+
+vllm serve <model_path> \
+    --master-addr <边侧业务面IP> \
     --master-port 23657 \
     -pp 2 \
     --tensor-parallel-size 4 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --trust-remote-code --nnodes 2 --node-rank 1  --edge-npu-count 1 --cloud-npu-count 8 --instance_parallel_size 2 --instance_parallel_start_rank 1 \
     --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600, 604, 608, 612, 616, 620, 624, 628, 632, 636, 640, 644, 648, 652, 656, 660, 664, 668, 672, 676, 680, 684, 688, 692, 696, 700, 704, 708, 712, 716, 720]}' \
@@ -681,25 +695,69 @@ vllm serve /weight/Qwen3.6-27B \
     --async-scheduling \
     --gpu-memory-utilization 0.92 \
     --speculative-config '{"num_speculative_tokens": 3,"method": "mtp"}' \
-    --chat-template /weight/Qwen3.6-27B/chat_template.jinja \
+    --chat-template /xxx/Qwen3.6-27B/chat_template.jinja \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
 ```
-### 4.3 云测复用
+表4.2.1 关键配置参数说明
 
-部署模型时云侧设备算例如果有空闲，可云测复用部署多个服务，以下以多台一体机作为边测算力，云侧使用一台服务器为例部署：
-（1）边测一体机1
+| 配置项                    | 配置说明                                                                                                                 |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                  |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                 |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                            |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
+| --served‑model‑name       | 模型名称。                                                                                                               |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                        |
+| --port                    | 模型服务端口号。                                                                                                         |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                     |
+| --api-server-count        | 边侧实例数。                                                                                                             |
+| --api-server-rpc-port     | 实例0和其他实例通信端口。                                                                                                |
+| --api-server-attach       | 非实例0和实例0通信ip和端口                                                                                               |
+
+
+### 4.3 云侧复用
+
+部署模型时云侧设备算例如果有空闲，可云侧复用部署多个服务，具体流程如下图所示。服务器到达边侧后，由一体机进行处理生成kv和中间层向量，后转发到AI网关，由AI网关根据云侧服务器负载情况转发到合适的云侧服务器进行处理。在无AI网关情况下，可在边侧配置直接转发到云侧服务器。
+
+![1793756876456.jpeg](../figure/1793756876456.jpeg)
+
+以下以多个一体机服务作为边侧算力，云侧使用一台服务器为例部署：
+1、创建边云全局共享的静态角色注册表，规定边云的拓扑结构（yaml格式文件）
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=76.76.7.134
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+world:
+    master_addr:<node0 IP,复用边1业务面IP>
+    master_port:<master_port>
+edge:
+    -id:0
+    addr:<边1业务面IP>
+    ranks:[0] #使用npu的卡号
+    -id:1
+    addr:<边2业务面IP>
+    ranks:[0] #使用npu的卡号
+clouds:
+    -id:0
+    addr:<云侧业务面IP>
+    ranks:[0,1,2,3] #使用npu的卡号
+    zmq_base_port:<port> #假设由n个边，需要占用[port,port+2*n]区间内的端口，确保这些端口无占用
+```
+2、创建租户密钥文件tenant_key_file隔离不同来源的kv
+只在边侧持有，按照十六进制写入，二进制读取，需要≥16字节，例如`7a2f9d4c810e3b56290f74ac58bd32071ce694085f213bc709426da518c4963`
+
+3、服务部署
+
+（1） 边侧一体机1
+```commandline
+#!/bin/bash
+export VLLM_HOST_IP=<边1业务面IP>
+export GLOO_SOCKET_IFNAME=<边1业务面网卡>
+export TP_SOCKET_IFNAME=<边1业务面网卡>
+export HCCL_SOCKET_IFNAME=<边1业务面网卡>
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
+export MASTER_ADDR=<node0 IP>
 
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -712,59 +770,54 @@ export CODEBASE_DIR="/vllm-workspace"
 export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
-
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=ERROR
+export VLLM_ASCEND_LWD_DEBUG=1
+export VLLM_ASCEND_LWD_DBG_SEND=0
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
 export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
-export VLLM_LOGGING_LEVEL=ERROR
 
-export VLLM_ASCEND_LWD_DEBUG=1
+#一体机配置
 export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export HCCL_IF_BASE_PORT=16658
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
-export VLLM_ASCEND_LWD_DBG_SEND=0
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
-#export ASCEND_GLOBAL_LOG_LEVEL=3
-#export HCCL_ENTRY_LOG_ENABLE=1
-#export ASCEND_SLOG_PRINT_TO_STDOUT=1
-
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port 8094 \
-    --master-addr 76.76.7.134 \
+    --master-addr <node0 IP> \
     --master-port 29525 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size 1 \
     --trust-remote-code --nnodes 3 --node-rank 0 --edge-npu-count 1 --cloud-npu-count 4 \
     --edge-id 0 \
     --no-enable-prefix-caching \
-    --role-registry "$REGISTRY" \
-    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge0", "connect_timeout":5.0}}' \
+    --role-registry "<边云全局共享的静态角色注册表.yaml>" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "<控制url,此场景填写云侧服务监听地址>", "tenant_key_file": "<租户密钥文件>", "consumer_id": "enterprise-a-edge0", "connect_timeout":5.0}}' \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
     --max-num-seqs 230 \
     --max-num-batched-tokens 8192 \
     --async-scheduling \
     --gpu-memory-utilization 0.95 \
 ```
-（1）边测一体机2
+（1） 边侧一体机2
 ```commandline
-#!/bin/sh
-export VLLM_HOST_IP=76.76.7.134
-export GLOO_SOCKET_IFNAME=enp125s0f1
-export TP_SOCKET_IFNAME=enp125s0f1
-export HCCL_SOCKET_IFNAME=enp125s0f1
+#!/bin/bash
+export VLLM_HOST_IP=<边2业务面IP>
+export GLOO_SOCKET_IFNAME=<边2业务面网卡>
+export TP_SOCKET_IFNAME=<边2业务面网卡>
+export HCCL_SOCKET_IFNAME=<边2业务面网卡>
+export MASTER_ADDR=<node0 IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134   # Node 0 的实际 IP
-
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
@@ -776,60 +829,54 @@ export CODEBASE_DIR="/vllm-workspace"
 export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
-
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=ERROR
+export VLLM_ASCEND_LWD_DBG_SEND=0
+export VLLM_ASCEND_LWD_DEBUG=1
 
 export ASCEND_RT_VISIBLE_DEVICES=1
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
 export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
-export VLLM_LOGGING_LEVEL=ERROR
 
-export VLLM_ASCEND_LWD_DEBUG=1
+#一体机配置
 export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export HCCL_IF_BASE_PORT=16656
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
-export VLLM_ASCEND_LWD_DBG_SEND=0
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
 
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
-#export ASCEND_GLOBAL_LOG_LEVEL=3
-#export HCCL_ENTRY_LOG_ENABLE=1
-#export ASCEND_SLOG_PRINT_TO_STDOUT=1
-
-vllm serve /home/weight/Qwen3.6-27B \
+vllm serve <model_path> \
     --host 0.0.0.0 \
     --port 8095 \
-    --master-addr 76.76.7.134 \
+    --master-addr <node0 IP> \
     --master-port 29525 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size 1 \
     --trust-remote-code --nnodes 3 --node-rank 1 --edge-npu-count 1 --cloud-npu-count 4 \
     --edge-id 1 \
     --no-enable-prefix-caching \
-    --role-registry "$REGISTRY" \
-    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "http://76.76.7.158:9133/v1/chat/completions", "tenant_key_file": "/home/z30061553/vllm/2e1c/edge-cloud-tenant-key", "consumer_id": "enterprise-a-edge1", "connect_timeout":5.0}}' \
+    --role-registry "<边云全局共享的静态角色注册表yaml>" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"edge","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "control_url": "<控制url,此场景填写云侧服务监听地址>", "tenant_key_file": "<租户密钥文件>", "consumer_id": "enterprise-a-edge1", "connect_timeout":5.0}}' \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
     --max-num-seqs 230 \
     --max-num-batched-tokens 8192 \
     --async-scheduling \
     --gpu-memory-utilization 0.95 \
 ```
-（3）云测服务器
+（3）云侧服务器
 ```commandline
-#!/bin/sh
-export VLLM_VERSION=0.23.0
-export VLLM_HOST_IP=76.76.7.158
-export GLOO_SOCKET_IFNAME=enp189s0f0
-export TP_SOCKET_IFNAME=enp189s0f0
-export HCCL_SOCKET_IFNAME=enp189s0f0
+#!/bin/bash
+export VLLM_HOST_IP=<云侧业务面IP>
+export GLOO_SOCKET_IFNAME=<云侧业务面IP>
+export TP_SOCKET_IFNAME=<云侧业务面网卡>
+export HCCL_SOCKET_IFNAME=<云侧业务面网卡>
+export MASTER_ADDR=<node0 IP>
+
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=76.76.7.134  # Node 0 的实际 IP
-
 # 增大分布式超时
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -843,43 +890,38 @@ export PYTHONPATH="${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH
 export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
 export VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE=1
 export VLLM_ASCEND_ENABLE_NZ=1
-
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
-
-#export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
-export VLLM_ASCEND_LWD_PRE_OUT_HOST=76.76.7.158
 export VLLM_LOGGING_LEVEL=ERROR
-
-export HCCL_WHITELIST_DISABLE="0"
-export HCCL_WHITELIST_FILE="/home/z30061553/vllm/white_list.json"
-export RANK_TABLE_FILE='/home/z30061553/vllm/rank_table_134_158_2e1c_4card.json'
-
 #export ASCEND_GLOBAL_LOG_LEVEL=3
 #export HCCL_ENTRY_LOG_ENABLE=1
 #export ASCEND_SLOG_PRINT_TO_STDOUT=1
-
 export VLLM_ASCEND_LWD_DBG_SEND=0
 
-REGISTRY=/home/z30061553/vllm/2e1c/registry_2e1c-ytj.yaml
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export VLLM_ASCEND_LWD_PRE_OUT_PORT=6053
+export VLLM_ASCEND_LWD_POST_OUT_PORT=6054
+export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧业务面IP>
 
-vllm serve /weight/weight/Qwen3.6-27B \
-    --master-addr 76.76.7.134 \
+#一体机配置
+export HCCL_WHITELIST_DISABLE="0"
+export HCCL_WHITELIST_FILE="<白名单文件路径>"
+export RANK_TABLE_FILE="<rank_table文件路径>"
+
+vllm serve <model_path> \
+    --master-addr <node0 IP> \
     --master-port 29525 \
     --max-model-len 262144 \
-    --served-model-name qwen3.6 \
+    --served-model-name <自定义模型名称> \
     -pp 2 \
     --tensor-parallel-size 4 \
     --trust-remote-code --nnodes 3 --node-rank 2  --edge-npu-count 1 --cloud-npu-count 4 \
     --cloud-id 0 \
     --no-enable-prefix-caching \
-    --role-registry "$REGISTRY" \
-    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "listen_host": "0.0.0.0", "listen_port": 9133, "instance_id": "cloud-0"}}' \
+    --role-registry "<边云全局共享的静态角色注册表yaml>" \
+    --additional-config '{"enable_cpu_binding":true, "enable_weight_nz_layout":true, "lwd_config":{"enabled":true,"role":"cloud","mode":"prefill_only","edge_head_tail_layers":[0,0]}, "lwd_coordination": {"enabled": false, "listen_host": "0.0.0.0", "listen_port": <port>, "instance_id": "cloud-0"}}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16,20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512, 516, 520, 524, 528, 532, 536, 540, 544, 548, 552, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596, 600]}' \
     --max-num-seqs 230 \
     --max-num-batched-tokens 8192 \
@@ -888,6 +930,25 @@ vllm serve /weight/weight/Qwen3.6-27B \
     --gpu-memory-utilization 0.95 \
     --speculative-config '{"num_speculative_tokens": 3,"method": "mtp","enforce_eager": true}' \
 ```
+表 4.3.1 关键参数说明
+
+| 配置项                    | 配置说明                                                                                                                        |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| --served‑model‑name       | 模型名称。                                                                                                                      |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
+| --port                    | 模型服务端口号。                                                                                                                |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
+| --edge-id                 | 边侧设备的唯一id标识，从0开始                                                                                                   |
+| --role-registry           | 边云全局共享的yaml格式的静态角色注册表，规定边云的拓扑结构                                                                      |
+| control_url               | 控制url,需要网关调度填写网关地址，无网关地址则填写需要使用的云侧服务监听地址，例如：http://xx.xx.xx.xx:port/v1/chat/completions |
+| listen_host/port          | 云侧协调HTTP服务监听地址，默认为0.0.0.0：8100，和边侧的control_url搭配使用                                                      |
+| tenant_key_file           | 租户密钥文件，用户多个服务间隔离，只在边侧持有                                                                                  |
+| consumer_id               | 边侧标识id,每个服务不一样，例如enterprise-a-edge0                                                                               |
+| instance_id               | 云侧标识id,每个服务不一样，例如cloud-0                                                                                          |
 
 
 ## 5 功能验证

@@ -114,7 +114,7 @@ cd /vllm-workspace/vllm
 ## 边云协同分布式推理服务部署
 1. [边云都使用服务器](README_server.md)
 
-2. [边侧使用一体机，云测使用服务器](README_all-in-one.md)
+2. [边侧使用一体机，云侧使用服务器](README_all-in-one.md)
 
 
 

@@ -14,15 +14,20 @@ vLLM Ascend Plugin
 </p>
 
 ---
-*最新消息* 🔥
+*消息* 🔥
 
-- [2026/09] 我们发布了首个边云协同版本 [v0.23.0rc1]()! 请按照[官方指南]()开始在 Ascend 上部署边云协同推理服务。
+- [2026/09] 正式创建了[vllm-data-comm/vllm-ascend](https://github.com/vllm-data-comm/vllm-ascend)仓库，让vLLM边云协同可以无缝运行在Ascend NPU。
+- [2026/10] 正式创建了[基础版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)，可以部署vLLM一边一云的边云协同基础功能。
+- [2026/10] 正式创建了[云侧复用版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)，可以部署vLLM边云协同的云侧复用功能。
+- [2026/10] 正式创建了[多实例版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)，可以部署vLLM边云协同的多实例功能。
 
 <details>
 <summary>更多内容</summary>
 
-- [2026/09] vLLM社区正式创建了[vllm-router/vllm-ascend]()仓库，让vLLM可以无缝运行在Ascend NPU。
-
+- [2026/09] 正式创建了[vllm-data-comm/vllm-ascend](https://github.com/vllm-data-comm/vllm-ascend)仓库，让vLLM边云协同可以无缝运行在Ascend NPU。
+- [2026/10] 正式创建了[基础版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)，可以部署vLLM一边一云的边云协同基础功能。
+- [2026/10] 正式创建了[云侧复用版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)，可以部署vLLM边云协同的云侧复用功能。
+- [2026/10] 正式创建了[多实例版本](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)，可以部署vLLM边云协同的多实例功能。
 </details>
 
 ---
