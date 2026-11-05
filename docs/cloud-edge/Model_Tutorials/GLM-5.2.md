@@ -10,14 +10,14 @@ GLM-5.2 采用混合专家（MoE）架构，面向复杂系统工程和长周期
 
 ### 2.1 模型权重
 
-GLM-5.2-w4a8c8（实验性）：需要 1 个 Atlas 800 A3（128GB × 8）节点。[下载模型权重](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8c8)
+GLM-5.2-w4a8c8（实验性）：需要 1 个 Atlas 800 A3（128GB × 8）节点，[下载模型权重](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8c8)。
 
 ### 2.2 节点通信
 
 部署边云特性环境，需要按照[安装指南](../install.md)中的***节点通信验证***章节验证多节点通信。
 
 ### 2.3 一体机配置
-在使用一体机作为边侧设备时，需要以下配置
+在使用一体机作为边侧设备时，需要以下配置：
 
 (1) 在物理机上插入ko(仅一体机场景)
 ```
@@ -25,7 +25,7 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
 (2) 准备white_list白名单（一体机和云侧服务器都需要）
 
-创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
+创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip。
 ```commandline
 {
     "host_ip":[
@@ -184,7 +184,7 @@ docker exec -it <container-name> bash
 ```
 
 ### 3.3 进入一体机容器,在容器内安装roce驱动(仅一体机场景)
-找到SP681网卡驱动中的roce驱动，执行以下命令安装
+找到SP681网卡驱动中的roce驱动，执行以下命令安装。
 ```commandline
 dpkg hiroce3-*.deb
 ```
@@ -317,21 +317,21 @@ vllm serve <model_path> \
     --no-enable-prefix-caching \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' \
 ```
-根据实际情况修改启动命令中的关键配置参数，参数说明如下
+根据实际情况修改启动命令中的关键配置参数，参数说明如下：
 
 表4.1.1 关键配置参数说明
 
 
-| 配置项                    | 配置说明                                                                                                                        |
-|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
-| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
-| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
-| --served‑model‑name       | 模型名称。                                                                                                                      |
-| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
-| --port                    | 模型服务端口号。                                                                                                                |
-| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |                                                                                                               |
+| 配置项                    | 配置说明                                                                                                                 |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                  |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址。                                                                               |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息。                                                          |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
+| --served‑model‑name       | 模型名称。                                                                                                               |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                        |
+| --port                    | 模型服务端口号。                                                                                                         |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                     |                                                                                                               |
 ![img.png](../figure/npu-smi-info/img.png)
 
 ## 5 功能验证

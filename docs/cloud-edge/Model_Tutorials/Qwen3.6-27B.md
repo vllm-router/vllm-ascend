@@ -10,14 +10,14 @@ Qwen3.6-27B是Qwen3.6系列中的密集混合Mamba-Transformer语言模型，融
 
 ### 2.1 模型权重
 
-Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A2（64GB × 8）节点。[下载模型权重](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)
+Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A2（64GB × 8）节点，[下载模型权重](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)。
 
 ### 2.2 节点通信
 
 部署边云特性环境，需要按照[安装指南](../install.md)中的***节点通信验证***章节验证多节点通信。
 
 ### 2.3 一体机配置
-在使用一体机作为边侧设备时，需要以下配置
+在使用一体机作为边侧设备时，需要以下配置。
 
 (1) 在物理机上插入ko(仅一体机场景)
 ```
@@ -25,7 +25,7 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
 (2) 准备white_list白名单（一体机和云侧服务器都需要）
 
-创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
+创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip。
 ```commandline
 {
     "host_ip":[
@@ -176,7 +176,7 @@ docker exec -it <container-name> bash
 ```
 
 ### 3.3 进入一体机容器,在容器内安装roce驱动(仅一体机场景)
-找到SP681网卡驱动中的roce驱动，执行以下命令安装
+找到SP681网卡驱动中的roce驱动，执行以下命令安装。
 ```commandline
 dpkg hiroce3-*.deb
 ```
@@ -414,16 +414,16 @@ vllm serve <model_path> \
 表4.1.1 关键配置参数说明
 
 
-| 配置项                    | 配置说明                                                                                                                        |
-|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
-| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
-| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
-| --served‑model‑name       | 模型名称。                                                                                                                      |
-| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
-| --port                    | 模型服务端口号。                                                                                                                |
-| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
+| 配置项                    | 配置说明                                                                                                                 |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                  |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址。                                                                               |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息。                                                          |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
+| --served‑model‑name       | 模型名称。                                                                                                               |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                        |
+| --port                    | 模型服务端口号。                                                                                                         |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                     |
 
 ![img.png](../figure/npu-smi-info/img.png)
 
@@ -691,8 +691,8 @@ vllm serve <model_path> \
 | 配置项                    | 配置说明                                                                                          |
 |---------------------------|---------------------------------------------------------------------------------------------------|
 | ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                           |
-| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                          |
-| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                     |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址。                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息。                                   |
 | HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
 | --served‑model‑name       | 模型名称。                                                                                        |
 | --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                 |
@@ -700,7 +700,7 @@ vllm serve <model_path> \
 | --max‑model‑len           | 模型服务上下文长度。                                                                              |
 | --api-server-count        | 边侧实例数。                                                                                      |
 | --api-server-rpc-port     | 实例0和其他实例通信端口。                                                                         |
-| --api-server-attach       | 非实例0和实例0通信ip和端口                                                                        |
+| --api-server-attach       | 非实例0和实例0通信ip和端口。                                                                      |
 
 
 ### 4.3 云侧复用
@@ -729,7 +729,7 @@ clouds:
     zmq_base_port:<port> #假设由n个边，需要占用[port,port+2*n]区间内的端口，确保这些端口无占用
 ```
 (2) 创建租户密钥文件tenant_key_file隔离不同来源的kv
-只在边侧持有，按照十六进制写入，二进制读取，需要≥16字节，例如`7a2f9d4c810e3b56290f74ac58bd32071ce694085f213bc709426da518c4963`
+只在边侧持有，按照十六进制写入，二进制读取，需要≥16字节，例如`7a2f9d4c810e3b56290f74ac58bd32071ce694085f213bc709426da518c4963`。
 
 (3) 服务部署
 
@@ -917,23 +917,23 @@ vllm serve <model_path> \
 ```
 表 4.3.1 关键参数说明
 
-| 配置项                    | 配置说明                                                                                                                        |
-|---------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
-| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
-| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                               |
-| --served‑model‑name       | 模型名称。                                                                                                                      |
-| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
-| --port                    | 模型服务端口号。                                                                                                                |
-| --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
-| --edge-id                 | 边侧设备的唯一id标识，从0开始                                                                                                   |
-| --role-registry           | 边云全局共享的yaml格式的静态角色注册表，规定边云的拓扑结构                                                                      |
-| control_url               | 控制url,需要网关调度填写网关地址，无网关地址则填写需要使用的云侧服务监听地址，例如：http://xx.xx.xx.xx:port/v1/chat/completions |
-| listen_host/port          | 云侧协调HTTP服务监听地址，默认为0.0.0.0：8100，和边侧的control_url搭配使用                                                      |
-| tenant_key_file           | 租户密钥文件，用户多个服务间隔离，只在边侧持有                                                                                  |
-| consumer_id               | 边侧标识id,每个服务不一样，例如enterprise-a-edge0                                                                               |
-| instance_id               | 云侧标识id,每个服务不一样，例如cloud-0                                                                                          |
+| 配置项                    | 配置说明                                                                                                                          |
+|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                           |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址。                                                                                        |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息。                                                                   |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                                 |
+| --served‑model‑name       | 模型名称。                                                                                                                        |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                                 |
+| --port                    | 模型服务端口号。                                                                                                                  |
+| --max‑model‑len           | 模型服务上下文长度。                                                                                                              |
+| --edge-id                 | 边侧设备的唯一id标识，从0开始。                                                                                                   |
+| --role-registry           | 边云全局共享的yaml格式的静态角色注册表，规定边云的拓扑结构。                                                                      |
+| control_url               | 控制url,需要网关调度填写网关地址，无网关地址则填写需要使用的云侧服务监听地址，例如：http://xx.xx.xx.xx:port/v1/chat/completions。 |
+| listen_host/port          | 云侧协调HTTP服务监听地址，默认为0.0.0.0：8100，和边侧的control_url搭配使用。                                                      |
+| tenant_key_file           | 租户密钥文件，用户多个服务间隔离，只在边侧持有。                                                                                  |
+| consumer_id               | 边侧标识id,每个服务不一样，例如enterprise-a-edge0。                                                                               |
+| instance_id               | 云侧标识id,每个服务不一样，例如cloud-0。                                                                                          |
 
 
 ## 5 功能验证

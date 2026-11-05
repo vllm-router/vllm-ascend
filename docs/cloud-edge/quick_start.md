@@ -73,7 +73,9 @@ docker run -itd --privileged \
 
 - 网络部署完成，需要分别配置边云服务器业务面和参数面网卡互通
 
-(2) 边云协同服务部署 ，进入容器后，执行以下命令启动服务。
+(2) 边云协同服务部署
+
+进入容器后，执行以下命令启动服务。
 
 a. 边侧服务器
 ```bash
@@ -103,10 +105,11 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_GDN_FAST_PATH=1
 export VLLM_ASCEND_GDN_MAX_PADDING_RATIO=2.0
 export VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO=2.0
+export VLLM_LOGGING_LEVEL=INFO
+
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_ASCEND_LWD_PRE_OUT_PORT=7200
 export VLLM_ASCEND_LWD_POST_OUT_PORT=7201
-export VLLM_LOGGING_LEVEL=INFO
 
 # ========== 启动命令 ==========
 vllm serve model_path \
@@ -134,10 +137,10 @@ export VLLM_HOST_IP=<云侧业务面IP>
 export GLOO_SOCKET_IFNAME=<云侧业务面网卡>
 export TP_SOCKET_IFNAME=<云侧业务面网卡>
 export HCCL_SOCKET_IFNAME=<云侧业务面网卡>
+export MASTER_ADDR=<云侧业务面IP>
 
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HCCL_OP_EXPANSION_MODE="AIV"
-export MASTER_ADDR=<边侧IP>
 export TORCH_DISTRIBUTED_DETAIL=DEBUG
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HCCL_BUFFSIZE=1024
