@@ -703,19 +703,19 @@ vllm serve <model_path> \
 ```
 表4.2.1 关键配置参数说明
 
-| 配置项                    | 配置说明                                                                                                                 |
-|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                  |
-| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                 |
-| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                            |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
-| --served‑model‑name       | 模型名称。                                                                                                               |
-| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                        |
-| --port                    | 模型服务端口号。                                                                                                         |
-| --max‑model‑len           | 模型服务上下文长度。                                                                                                     |
-| --api-server-count        | 边侧实例数。                                                                                                             |
-| --api-server-rpc-port     | 实例0和其他实例通信端口。                                                                                                |
-| --api-server-attach       | 非实例0和实例0通信ip和端口                                                                                               |
+| 配置项                    | 配置说明                                                                                          |
+|---------------------------|---------------------------------------------------------------------------------------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                           |
+| HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                          |
+| RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                     |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id进行修改。从1号卡开始为16657，卡号每加1，端口号减1。 |
+| --served‑model‑name       | 模型名称。                                                                                        |
+| --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                 |
+| --port                    | 模型服务端口号。                                                                                  |
+| --max‑model‑len           | 模型服务上下文长度。                                                                              |
+| --api-server-count        | 边侧实例数。                                                                                      |
+| --api-server-rpc-port     | 实例0和其他实例通信端口。                                                                         |
+| --api-server-attach       | 非实例0和实例0通信ip和端口                                                                        |
 
 
 ### 4.3 云侧复用
@@ -937,7 +937,7 @@ vllm serve <model_path> \
 | ASCEND_RT_VISIBLE_DEVICES | 表示启用哪几张卡。对于每个模型实例分配的 npuIds，使用芯片逻辑 ID 表示。                                                         |
 | HCCL_WHITELIST_FILE       | 白名单文件路径，存放各服务器的业务面地址                                                                                        |
 | RANK_TABLE_FILE           | ranktable的json格式文件路径，存放各服务器的业务面和参数面信息                                                                   |
-| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id（下图中最左侧的NPU号）进行修改。从1号卡开始为16657，卡号每加1，端口号减1。        |
+| HCCL_IF_BASE_PORT         | 一体机hccl通信端口，需要根据使用npu卡的物理id进行修改。从1号卡开始为16657，卡号每加1，端口号减1。                               |
 | --served‑model‑name       | 模型名称。                                                                                                                      |
 | --host                    | 模型服务 IP，0.0.0.0 表示不指定 IP 地址，该服务器的 IP 皆可访问。                                                               |
 | --port                    | 模型服务端口号。                                                                                                                |
