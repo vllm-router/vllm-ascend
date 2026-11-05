@@ -4,7 +4,7 @@
 
 GLM-5.2 采用混合专家（MoE）架构，面向复杂系统工程和长周期智能体任务。
 
-本文档将演示模型的边云协同特性的部署方式， 我们强烈建议使用`vllm-ascend:v0.23.0rc1`镜像进行部署。
+本文档将演示模型的边云协同特性的部署方式。
 
 ## 2 前提条件
 
@@ -18,11 +18,12 @@ GLM-5.2-w4a8c8（实验性）：需要 1 个 Atlas 800 A3（128GB × 8）节点�
 
 ### 2.3 一体机配置
 在使用一体机作为边侧设备时，需要以下配置
-1. 在物理机上插入ko(仅一体机场景)
+
+(1) 在物理机上插入ko(仅一体机场景)
 ```
 insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
-2. 准备white_list白名单（一体机和云侧服务器都需要）
+(2) 准备white_list白名单（一体机和云侧服务器都需要）
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
 ```commandline
@@ -33,7 +34,7 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
     ]
 }
 ```
-3. 准备ranktable（一体机和云侧服务器都需要）
+(3) 准备ranktable（一体机和云侧服务器都需要）
 
 参考以下创建文件，写入一体机host网卡和服务器的npu网卡信息。
 ```commandline
@@ -129,12 +130,7 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 
 ## 3 环境安装
 
-可以使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后下载代码进行编译安装，以下是三个版本代码的下载路径；
-- [典型一边一云](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)
-- [多实例](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)
-- [云侧复用](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)
-
-此外我们也提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像的话可跳过3.3节。
+我们提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像进行环境准备。
 
 ### 3.1 容器创建
 参考以下命令创建容器。
@@ -172,7 +168,7 @@ docker run -itd --privileged \
 -it $IMAGE bash
 ```
 
-表 1 参数说明
+表 3.1 参数说明
 
 | 参数                                                 | 参数说明                                                                                                                                                                                                                                                                                                                                   |
 |------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -186,25 +182,16 @@ docker run -itd --privileged \
 ```commandline
 docker exec -it <container-name> bash
 ```
-### 3.3 编译安装
-下载vllm和vllm-ascend代码，并编译
-```commandline
-#设置安装的版本，需要与下载的代码版本一致 
-export VLLM_VERSION_OVERRIDE=0.23.0 
-cd /vllm-workspace/vllm
-VLLM_TARGET_DEVICE=empty pip install -v -e . 
-cd ../vllm-ascend 
-pip install -v -e . --no-build-isolation --no-deps
-```
 
-### 3.4 一体机容器内安装cann-hcomm和roce驱动(仅一体机场景)
+### 3.3 进入一体机容器,在容器内安装roce驱动(仅一体机场景)
+找到SP681网卡驱动中的roce驱动，执行以下命令安装
 ```commandline
-./cann-hcomm_*.run --full
 dpkg hiroce3-*.deb
 ```
 
 ## 4 服务部署
-(1)边侧一体机
+
+(1) 边侧一体机
 ```bash
 #!/bin/bash
 export VLLM_HOST_IP=<边侧业务面IP>
@@ -267,7 +254,7 @@ vllm serve <model_path> \
     --enable-chunked-prefill \
 ```
 
-（2）云侧服务器
+(2) 云侧服务器
 ```bash
 #!/bin/bash
 export VLLM_HOST_IP=<云侧业务面IP>

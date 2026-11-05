@@ -1,6 +1,6 @@
 # 安装指南
 
-## 环境要求
+## 1 环境要求
 - Atlas A2/A3 服务器 或 一体机 
 - 操作系统：openeuler
 - Python：>= 3.10, < 3.13
@@ -17,24 +17,24 @@
 | torch      | == 2.10.0                  | TorchNPU 和 vllm 所必需，无需手动安装，将在以下步骤中自动安装 |
 | NNAL       | == 9.1.0                   | libatb.so 所需，支持高级张量运算                              |
 
-## 操作系统环境安装
-### 服务器
+## 2 操作系统环境安装
+### 2.1 服务器
 操作系统安装参考：
 
 [Atlas服务器openEuler 22.03 LTS SP4 操作系统安装](https://support.huawei.com/enterprise/zh/doc/EDOC1100469526/426cffd9?idPath=23710424|269761314|269769397|269769917|254184887)
 
-### 一体机
+### 2.2 一体机
 操作系统安装参考：
 
 [Atlas服务器openEuler 24.03 LTS SPX 操作系统安装](https://support.huawei.com/enterprise/zh/doc/EDOC1100492838/426cffd9?idPath=23710424|269761314|269769397|269769917|261457531)
 
 
-## 昇腾配套驱动环境安装
-### 服务器
+## 3 昇腾配套驱动环境安装
+### 3.1 服务器
 NPU驱动和固件参考：
 
 [Atlas A2 中心推理和训练硬件 26.0.RCx NPU驱动和固件](https://support.huawei.com/enterprise/zh/doc/EDOC1100568431/426cffd9?idPath=23710424|269761314|269769397|269769917|254184887)
-### 一体机
+### 3.2 一体机
 NPU驱动和固件安装参考：
 
 [Atlas A2 中心推理和训练硬件 26.0.RCx NPU驱动和固件](https://support.huawei.com/enterprise/zh/doc/EDOC1100568431/426cffd9?idPath=23710424|269761314|269769397|269769917|254184887)
@@ -45,16 +45,14 @@ SP681网卡驱动安装参考：
 
 [驱动下载地址](https://support.huawei.com/enterprise/zh/computing-module/in220-pid-253287505/software/268628573?idAbsPath=fixnode01|23710424|269761301|269764423|269766398|253287505)
 
-## 使用docker软件设置环境
-vLLM-ascend提供用户部署的Docker镜像，您可以从[镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)拉取预构建进行，并使用bash运行；此外我们也提供了预先
 
-## 节点通信验证
+## 4 节点通信验证
 首先检查物理层链接，然后验证节点间链接
-### 物理层要求
+### 4.1 物理层要求
 - 服务器NPU均通过光模块链接到交换机，且连接状态正常
 - 一体机NPU无需连线，但是roce网卡需要通过光模块连接到CPE设备，且连接状态正常
-### 互连验证
-1、获取IP
+### 4.2 互连验证
+(1) 获取IP
 
 获取服务器NPU IP地址
 ```commandline
@@ -65,7 +63,7 @@ for i in {0..7}; do hccn_tool -i $i -ip -g | grep ipaddr; done
 ip addr show
 ```
 
-2、跨节点PING测试
+(2) 跨节点PING测试
 
 从服务器ping
 ```commandline
@@ -76,8 +74,8 @@ hccn_tool -i 0 -ping -g address x.x.x.x
 ping x.x.x.x
 ```
 
-## 节点容器运行
-使用vLLM-ascend官方镜像可以高效运行环境，在节点运行以下示例命令启动容器
+## 5 使用docker软件设置环境
+我们提供用户部署的Docker镜像，您可以从[镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)拉取进行，并在节点运行以下示例命令启动容器
 - A2
 ```commandline
 export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0rc1

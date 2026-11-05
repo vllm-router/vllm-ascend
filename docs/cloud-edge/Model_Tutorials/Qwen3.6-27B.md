@@ -4,13 +4,13 @@
 
 Qwen3.6-27B是Qwen3.6系列中的密集混合Mamba-Transformer语言模型，融合了架构效率、强化学习规模和全球可访问性方面的突破。它们共享相同的混合注意力设计（GDN + 全注意力），因此在Ascend NPU上的部署对两个模型遵循相同的模式。它们适用于在Ascend NPU上运行的通用文本生成任务，如对话、内容创作和代码生成。
 
-本文档将演示模型的边云协同特性的部署方式， 我们强烈建议使用`vllm-ascend:v0.23.0rc1`镜像进行部署。
+本文档将演示模型的边云协同特性的部署方式。
 
 ## 2 前提条件
 
 ### 2.1 模型权重
 
-Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A3（64GB × 16）节点或 1 个 Atlas 800 A2（64GB × 8）节点。[下载模型权重](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)
+Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A2（64GB × 8）节点。[下载模型权重](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)
 
 ### 2.2 节点通信
 
@@ -18,11 +18,12 @@ Qwen3.5-27B（BF16 版本）：需要 1 个 Atlas 800 A3（64GB × 16）节点�
 
 ### 2.3 一体机配置
 在使用一体机作为边侧设备时，需要以下配置
-1. 在物理机上插入ko(仅一体机场景)
+
+(1) 在物理机上插入ko(仅一体机场景)
 ```
 insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 ```
-2. 准备white_list白名单（一体机和云侧服务器都需要）
+(2) 准备white_list白名单（一体机和云侧服务器都需要）
 
 创建white_list.json文件，在其中写入部署推理服务所需服务器的业务面ip
 ```commandline
@@ -33,7 +34,7 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
     ]
 }
 ```
-3. 准备ranktable（一体机和云侧服务器都需要）
+(3) 准备ranktable（一体机和云侧服务器都需要）
 
 参考以下创建文件，写入一体机host网卡和服务器的npu网卡信息。
 ```commandline
@@ -129,14 +130,8 @@ insmod /usr/lib/modules/$(uname -r)$/updates/npu_peermem.ko
 
 ## 3 环境安装
 
-可以使用[vLLM-ascend镜像](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)创建容器，然后下载代码进行编译安装，以下是三个版本代码的下载路径；
-- [典型一边一云](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0)
-- [多实例](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-edge_T)
-- [云侧复用](https://github.com/vllm-data-comm/vllm-ascend/tree/release/v0.23.0_share-cloud_T)
+我们提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像进行环境准备。
 
-此外我们也提供了[编译后版本的镜像](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1),使用该镜像的话可跳过3.3节。
-
-请按需求下载代码或者预编译镜像
 ### 3.1 容器创建
 参考以下命令创建容器。
 ```commandline
@@ -179,20 +174,10 @@ docker run -itd --privileged \
 ```commandline
 docker exec -it <container-name> bash
 ```
-### 3.3 编译安装
-下载vllm和vllm-ascend代码，并编译
-```commandline
-#设置安装的版本，需要与下载的代码版本一致 
-export VLLM_VERSION_OVERRIDE=0.23.0 
-cd /vllm-workspace/vllm
-VLLM_TARGET_DEVICE=empty pip install -v -e . 
-cd ../vllm-ascend 
-pip install -v -e . --no-build-isolation --no-deps
-```
 
-### 3.4 一体机容器内安装cann-hcomm和roce驱动(仅一体机场景)
+### 3.3 进入一体机容器,在容器内安装roce驱动(仅一体机场景)
+找到SP681网卡驱动中的roce驱动，执行以下命令安装
 ```commandline
-./cann-hcomm_*.run --full
 dpkg hiroce3-*.deb
 ```
 
@@ -201,7 +186,7 @@ dpkg hiroce3-*.deb
 ### 4.1 典型一边一云
 
 #### 4.1.1 边云都是服务器部署
-（1）边侧服务器
+(1) 边侧服务器
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -253,8 +238,7 @@ vllm serve <model_path> \
     --async-scheduling \
     --gpu-memory-utilization 0.9
 ```
-（2）
-云侧服务器
+(2) 云侧服务器
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -309,7 +293,7 @@ vllm serve <model_path> \
 ```
 
 #### 4.1.2 边侧使用一体机，云侧使用服务器
-(1)边侧一体机
+(1) 边侧一体机
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -368,7 +352,7 @@ vllm serve <model_path> \
     --gpu-memory-utilization 0.9
 ```
 
-（2）云侧服务器
+(2) 云侧服务器
 ```bash
 #!/bin/bash
 # ========== 环境变量 ==========
@@ -442,6 +426,7 @@ vllm serve <model_path> \
 | --max‑model‑len           | 模型服务上下文长度。                                                                                                            |
 
 ![img.png](../figure/npu-smi-info/img.png)
+
 ### 4.2 多实例
 因为边云特性在边侧占用很少算力，所以可在边侧部署多个容器，创建多个服务和不同云侧服务器算卡对接，以下以一体机作为边侧算力，云侧使用不同服务器为例部署两实例：
 
@@ -510,7 +495,7 @@ vllm serve <model_path> \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
 ```
-(2)边侧一体机容器2
+(2) 边侧一体机容器2
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<边侧业务面IP>
@@ -575,7 +560,7 @@ vllm serve <model_path> \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
 ```
-(3)云侧服务器1
+(3) 云侧服务器1
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<云1业务面IP>
@@ -638,7 +623,7 @@ vllm serve <model_path> \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
 ```
-(4)云侧服务器2
+(4) 云侧服务器2
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<云2业务面IP>
@@ -725,7 +710,7 @@ vllm serve <model_path> \
 ![1793756876456.jpeg](../figure/1793756876456.jpeg)
 
 以下以多个一体机服务作为边侧算力，云侧使用一台服务器为例部署：
-1、创建边云全局共享的静态角色注册表，规定边云的拓扑结构（yaml格式文件）
+(1) 创建边云全局共享的静态角色注册表，规定边云的拓扑结构（yaml格式文件）
 ```commandline
 world:
     master_addr:<node0 IP,复用边1业务面IP>
@@ -743,12 +728,12 @@ clouds:
     ranks:[0,1,2,3] #使用npu的卡号
     zmq_base_port:<port> #假设由n个边，需要占用[port,port+2*n]区间内的端口，确保这些端口无占用
 ```
-2、创建租户密钥文件tenant_key_file隔离不同来源的kv
+(2) 创建租户密钥文件tenant_key_file隔离不同来源的kv
 只在边侧持有，按照十六进制写入，二进制读取，需要≥16字节，例如`7a2f9d4c810e3b56290f74ac58bd32071ce694085f213bc709426da518c4963`
 
-3、服务部署
+(3) 服务部署
 
-（1） 边侧一体机1
+a. 边侧一体机1
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<边1业务面IP>
@@ -807,7 +792,7 @@ vllm serve <model_path> \
     --async-scheduling \
     --gpu-memory-utilization 0.95 \
 ```
-（1） 边侧一体机2
+b. 边侧一体机2
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<边2业务面IP>
@@ -866,7 +851,7 @@ vllm serve <model_path> \
     --async-scheduling \
     --gpu-memory-utilization 0.95 \
 ```
-（3）云侧服务器
+c. 云侧服务器
 ```commandline
 #!/bin/bash
 export VLLM_HOST_IP=<云侧业务面IP>
