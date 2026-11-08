@@ -11,7 +11,8 @@ Owns the physical channels (UP edge->cloud, DOWN cloud->edge):
   * init-time warmup of every connection's channels in a fixed global
     order (moves the first-use HCCL rendezvous out of the pipeline, where
     the two sides could otherwise arrive on different channels and
-    deadlock).
+    deadlock); the warmup payload is an identity probe frame verified by
+    the receiver (see ``lwd_channel_probe``).
 
 In a single_instance topology the edge process serves every DP
 connection, so its endpoint rank holds the channel pairs of all of them;
@@ -22,6 +23,9 @@ Design: docs/design/lwd_data_plane.md in the vLLM repository.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
+
 import torch
 import torch.distributed as dist
 from vllm.config import get_current_vllm_config
@@ -29,9 +33,14 @@ from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
+from vllm_ascend.distributed.lwd_data_plane.lwd_channel_probe import (
+    LWD_PROBE_TIMEOUT_S,
+    lwd_probe_aggregate,
+    lwd_probe_frame,
+    lwd_probe_verify,
+    lwd_probe_wait,
+)
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
-
-_LWD_WARMUP_NUM_ELEMENTS = 8
 
 # (dp_idx, channel) -> (device_group, peer_global_rank), endpoint ranks only
 _LWD_CHANNEL_GROUPS: dict[tuple[int, LwdChannelType], tuple[dist.ProcessGroup, int]] = {}
@@ -86,26 +95,112 @@ def lwd_init_channels() -> None:
     lwd_warm_up_channels()
 
 
-def lwd_warm_up_channels() -> None:
-    """Pre-establish every connection's channel P2P links at init time.
+class _ProbeOutcome(Enum):
+    """The three possible endings of one channel probe."""
 
-    A tiny payload is exchanged on each channel in a fixed global order
-    (connection order, UP then DOWN), so both sides rendezvous identically
-    regardless of when the first real message is posted. Non-endpoint ranks
-    only join the closing world barrier.
+    OK = "ok"
+    MISMATCH = "mismatch"  # op completed, frame wrong: keep probing
+    TIMEOUT = "timeout"  # channel wedged: stop posting ops
+
+
+@dataclass(frozen=True)
+class _ChannelProbeResult:
+    outcome: _ProbeOutcome
+    detail: str = ""
+
+
+def _lwd_probe_timeout_detail(dp_idx: int, channel: LwdChannelType, peer: int) -> str:
+    """Format the shared TIMEOUT detail for a channel probe."""
+    return f"[dp_idx={dp_idx} channel={channel.value}] probe TIMEOUT after {LWD_PROBE_TIMEOUT_S:g}s (peer={peer})"
+
+
+def _lwd_probe_channel(
+    group: dist.ProcessGroup,
+    peer: int,
+    dp_idx: int,
+    channel: LwdChannelType,
+    is_sender: bool,
+) -> _ChannelProbeResult:
+    """Post one probe op on a channel and check the result.
+
+    Returns one of three outcomes: ``OK``, ``MISMATCH`` (the op completed but
+    the frame is wrong -- keep probing), or ``TIMEOUT`` (the channel is wedged
+    -- stop posting ops).  The backend check runs before any op is posted, so
+    a degraded (gloo) group fails here instead of probing a non-HCCL link.
     """
+    backend = str(dist.get_backend(group))
+    if backend != "hccl":
+        raise RuntimeError(f"channel group backend must be hccl, got {backend}")
+    my_rank = dist.get_rank()
+    if is_sender:
+        # The frame is the identity proof; the sender only needs the op done.
+        payload = lwd_probe_frame(my_rank, dp_idx, channel)
+        handle = dist.isend(payload, dst=peer, group=group)
+        if not lwd_probe_wait(handle):
+            return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(dp_idx, channel, peer))
+        return _ChannelProbeResult(_ProbeOutcome.OK)
+    # Zero-filled buffer: a no-op irecv or a stale frame fails the [0] magic
+    # check (magic is 90, so an all-zero frame is never a legal one).
+    payload = torch.zeros_like(lwd_probe_frame(peer, dp_idx, channel))
+    handle = dist.irecv(payload, src=peer, group=group)
+    if not lwd_probe_wait(handle):
+        return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(dp_idx, channel, peer))
+    # The poll above only observed completion; the CPU must sync before
+    # reading the received buffer.
+    torch.npu.synchronize()
+    problem = lwd_probe_verify(payload, peer, dp_idx, channel)
+    if problem:
+        return _ChannelProbeResult(
+            _ProbeOutcome.MISMATCH,
+            f"[dp_idx={dp_idx} channel={channel.value}] frame mismatch (peer={peer}): {problem}",
+        )
+    return _ChannelProbeResult(_ProbeOutcome.OK)
+
+
+def lwd_warm_up_channels() -> None:
+    """Pre-establish and verify every connection's channel P2P links at init.
+
+    Each channel exchanges one identity probe frame over the existing
+    isend/irecv round-trip in the fixed global order (connection order, UP
+    then DOWN, zero added P2P); the receiver compares it field by field
+    against the frame it derives from the same public facts.  Failures are
+    aggregated over the CPU/gloo world group so every rank raises with the
+    same verdict instead of hanging on the 1836s HCCL timeout; non-endpoint
+    ranks only join the aggregation and the closing barrier.
+
+    Failure policy: a verify failure is recorded and probing continues --
+    the peer's op did complete, and HCCL P2P has no tags, so the op
+    count/order must stay invariant for later pairing.  A poll TIMEOUT
+    breaks at once (the peer's op cannot complete either, so it times out
+    symmetrically) and skips the rollback destroy, which could hang on a
+    wedged communicator and forfeit the fast fail; the platform restarts
+    the process.  An unexpected raise inside the channel probe is treated
+    the same way, because posting further ops on unknown state only
+    manufactures untraceable paths.
+    """
+    failures: list[str] = []
+    aborted = False
+    skipped: list[str] = []
     if _LWD_ENDPOINTS:
         my_rank = dist.get_rank()
-        for endpoints in _LWD_ENDPOINTS:
-            for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-                group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
-                sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
-                payload = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.bfloat16, device="npu")
-                if my_rank == sender:
-                    handle = dist.isend(payload, dst=peer, group=group)
-                else:
-                    handle = dist.irecv(payload, src=peer, group=group)
-                handle.wait()
+        planned = [
+            (endpoints, channel) for endpoints in _LWD_ENDPOINTS for channel in (LwdChannelType.UP, LwdChannelType.DOWN)
+        ]
+        for index, (endpoints, channel) in enumerate(planned):
+            group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
+            sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
+            try:
+                result = _lwd_probe_channel(group, peer, endpoints.dp_idx, channel, my_rank == sender)
+            except Exception as exc:
+                # The state is unknown (OOM, broken NPU context, a degraded
+                # backend): probing on it only manufactures untraceable
+                # paths, so treat it like a TIMEOUT and stop posting ops.
+                # BaseException keeps propagating.
+                failures.append(f"[dp_idx={endpoints.dp_idx} channel={channel.value}] probe raised: {exc!r}")
+                aborted = True
+                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
+                break
+            if result.outcome is _ProbeOutcome.OK:
                 logger.info(
                     "[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d",
                     endpoints.dp_idx,
@@ -113,6 +208,31 @@ def lwd_warm_up_channels() -> None:
                     my_rank,
                     peer,
                 )
+                continue
+            failures.append(result.detail)
+            if result.outcome is _ProbeOutcome.TIMEOUT:
+                # The channel is wedged: the peer times out symmetrically,
+                # so stop posting ops entirely.
+                aborted = True
+                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
+                break
+    if skipped:
+        logger.warning(
+            "[LWD] channel probe aborted; %d channel(s) left unprobed: %s",
+            len(skipped),
+            ", ".join(skipped),
+        )
+    # Verdict over the CPU/gloo group, never through the suspected HCCL
+    # channels; every rank (endpoints and non-endpoints) must reach this.
+    if not lwd_probe_aggregate(not failures, get_world_group().cpu_group):
+        detail = "; ".join(failures) or "remote rank(s) reported probe failure"
+        logger.error("[LWD] channel probe failed: %s", detail)
+        if not aborted:
+            # All ops completed and the groups are healthy: roll back for a
+            # clean restart.  (On TIMEOUT/raise the groups' state is unknown
+            # and they are deliberately left for process exit to reclaim.)
+            lwd_destroy_channels()
+        raise RuntimeError(f"[LWD] channel probe failed: {detail}")
     get_world_group().barrier()
 
 
