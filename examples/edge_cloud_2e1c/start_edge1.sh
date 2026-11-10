@@ -5,7 +5,7 @@
 # rendezvous 地址/端口取自 registry yaml 的 world 段（优先级 yaml > CLI），
 # 本脚本不再传 --master-addr/--master-port。
 # 用法：填好下方参数区后直接 bash start_edge1.sh（建议最后启动，
-# 详见同目录 README.md 的启动顺序说明）。
+# 详见同目录 README_vllm-ascend.md 的启动顺序说明）。
 # =============================================================================
 set -euo pipefail
 

@@ -38,10 +38,10 @@ msgstr "LMCache-Ascend 是一个社区维护的插件，用于在昇腾 NPU 上�
 msgid ""
 "We provide a simple deployment guide here. For further info about deployment"
 " notes, please refer to [LMCache-Ascend "
-"doc](https://github.com/LMCache/LMCache-Ascend/blob/main/README.md)"
+"doc](https://github.com/LMCache/LMCache-Ascend/blob/main/README_vllm-ascend.md)"
 msgstr ""
 "此处提供简单的部署指南。有关部署说明的更多信息，请参考 [LMCache-Ascend "
-"文档](https://github.com/LMCache/LMCache-Ascend/blob/main/README.md)。"
+"文档](https://github.com/LMCache/LMCache-Ascend/blob/main/README_vllm-ascend.md)。"
 
 #: ../../source/user_guide/feature_guide/lmcache_ascend_deployment.md:9
 msgid "Getting Started"

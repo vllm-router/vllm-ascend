@@ -9322,12 +9322,12 @@ msgid ""
 "Disaggregate prefill works with V1 engine now. You can take a try with "
 "DeepSeek model [#950](https://github.com/vllm-project/vllm-ascend/pull/950),"
 " following this [tutorial](https://github.com/vllm-project/vllm-"
-"ascend/blob/v0.10.0rc1/examples/disaggregated_prefill_v1/README.md)."
+"ascend/blob/v0.10.0rc1/examples/disaggregated_prefill_v1/README_vllm-ascend.md)."
 msgstr ""
 "Disaggregate prefill现已支持V1引擎。您可以尝试使用DeepSeek模型 "
 "[#950](https://github.com/vllm-project/vllm-"
 "ascend/pull/950)，并按照此[教程](https://github.com/vllm-project/vllm-"
-"ascend/blob/v0.10.0rc1/examples/disaggregated_prefill_v1/README.md)操作。"
+"ascend/blob/v0.10.0rc1/examples/disaggregated_prefill_v1/README_vllm-ascend.md)操作。"
 
 #: ../../source/user_guide/release_notes.md:1589
 msgid ""
@@ -10441,11 +10441,11 @@ msgstr ""
 #: ../../source/user_guide/release_notes.md:1745
 msgid ""
 "Fix errors and non-standard parts in "
-"examples/disaggregate_prefill_v1/README.md in "
+"examples/disaggregate_prefill_v1/README_vllm-ascend.md in "
 "[#1965](https://github.com/vllm-project/vllm-ascend/pull/1965)"
 msgstr ""
 "在 [#1965](https://github.com/vllm-project/vllm-ascend/pull/1965) 中修复 "
-"examples/disaggregate_prefill_v1/README.md 中的错误和非标准部分。"
+"examples/disaggregate_prefill_v1/README_vllm-ascend.md 中的错误和非标准部分。"
 
 #: ../../source/user_guide/release_notes.md:1749
 msgid ""
