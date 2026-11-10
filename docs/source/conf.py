@@ -120,7 +120,7 @@ exclude_patterns = [
     "Thumbs.db",
     ".DS_Store",
     ".venv",
-    "README.md",
+    "README_vllm-ascend.md",
     "user_guide/release.template.md",
     # TODO(yikun): Remove this after zh supported
     "**/*.zh.md",

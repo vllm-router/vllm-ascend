@@ -217,10 +217,10 @@ msgstr "安装"
 msgid ""
 "Install the `flash_attn_npu` wheel package refer to: "
 "<https://github.com/MinghuasLab/flash-attention-"
-"npu/blob/main/README.md#installation>."
+"npu/blob/main/README_vllm-ascend.md#installation>."
 msgstr ""
 "安装`flash_attn_npu`的wheel包请参考：<https://github.com/MinghuasLab/flash-"
-"attention-npu/blob/main/README.md#installation>。"
+"attention-npu/blob/main/README_vllm-ascend.md#installation>。"
 
 #: ../../source/user_guide/feature_guide/flash_attention.md:58
 msgid "Enabling Flash Attention 3"

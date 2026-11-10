@@ -127,10 +127,10 @@ msgstr ""
 #, python-format
 msgid ""
 "`Quantization method`: "
-"[msmodelslim](https://gitcode.com/Ascend/msit/blob/master/msmodelslim/example/DeepSeek/README.md#deepseek-v31-w8a8-%E6%B7%B7%E5%90%88%E9%87%8F%E5%8C%96-mtp-%E9%87%8F%E5%8C%96)."
+"[msmodelslim](https://gitcode.com/Ascend/msit/blob/master/msmodelslim/example/DeepSeek/README_vllm-ascend.md#deepseek-v31-w8a8-%E6%B7%B7%E5%90%88%E9%87%8F%E5%8C%96-mtp-%E9%87%8F%E5%8C%96)."
 " You can use this method to quantize the model."
 msgstr ""
-"`量化方法`：[msmodelslim](https://gitcode.com/Ascend/msit/blob/master/msmodelslim/example/DeepSeek/README.md#deepseek-v31-w8a8-%E6%B7%B7%E5%90%88%E9%87%8F%E5%8C%96-mtp-%E9%87%8F%E5%8C%96)。您可以使用此方法对模型进行量化。"
+"`量化方法`：[msmodelslim](https://gitcode.com/Ascend/msit/blob/master/msmodelslim/example/DeepSeek/README_vllm-ascend.md#deepseek-v31-w8a8-%E6%B7%B7%E5%90%88%E9%87%8F%E5%8C%96-mtp-%E9%87%8F%E5%8C%96)。您可以使用此方法对模型进行量化。"
 
 #: ../../source/tutorials/models/DeepSeek-V3.1.md:32
 msgid ""
