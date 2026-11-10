@@ -75,7 +75,7 @@ ping x.x.x.x
 ```
 
 ## 5 使用docker软件设置环境
-我们提供用户部署的Docker镜像，您可以从[镜像仓库](https://quay.io/repository/ascend/vllm-ascend?tab=tags&tag=latest)拉取进行，并在节点运行以下示例命令启动容器
+我们提供用户部署的Docker镜像，您可以从[镜像仓库](https://quay.io/repository/kyoshiki/vllm-ascend-v23.0rc1?tab=tags)拉取进行，并在节点运行以下示例命令启动容器
 - A2
 ```commandline
 export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0rc1
