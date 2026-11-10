@@ -1072,6 +1072,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
         if captured is not None and self._lwd_captured_sampler_output is not None:
+            # Timed so the worker can tell the native sampling apart from
+            # the LWD collect that runs inside the same call.
+            started = time.monotonic()
             self._lwd_pending_down_payload = self._lwd_collect_down_payload(
                 captured[0],
                 captured[1],
@@ -1081,7 +1084,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 captured[5],
                 self._lwd_captured_sampler_output,
             )
+            self._lwd_collect_s = time.monotonic() - started
         return output
+
+    def take_lwd_collect_seconds(self) -> float:
+        """What this step's DOWN collect cost. Taken rather than read: a
+        step that collected nothing must report zero, not repeat the
+        previous step's figure."""
+        collect_s = getattr(self, "_lwd_collect_s", 0.0)
+        self._lwd_collect_s = 0.0
+        return collect_s
 
     def take_lwd_pending_down_payload(
         self,

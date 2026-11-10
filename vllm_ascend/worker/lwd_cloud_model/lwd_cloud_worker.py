@@ -32,6 +32,9 @@ from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
 )
+from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker_meter import (
+    LwdCloudWorkerMeter,
+)
 from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
@@ -86,6 +89,9 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._lwd_up_hidden_size = self._lwd_up_layout.hidden_size
         self._lwd_up_tail_sizes = self._lwd_up_layout.tail_sizes_per_token
+        # Splits the engine's exec_rpc, which is one number from the step
+        # thread's side of the round trip.
+        self._lwd_worker_meter = LwdCloudWorkerMeter(global_rank, self._lwd_dp_idx)
         if self._lwd_early_recv_endpoint:
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
@@ -142,14 +148,7 @@ class LwdCloudWorker(LwdWorkerBase):
     # ------------------------------------------------------------------ #
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # [Lwd][perf] Worker start time (subtract the engine's rpc-enqueue
-        # ts = dispatch-to-start latency; spread across ranks = collective
-        # alignment cost)
-        lwd_logger.debug(
-            "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
-            self.rank,
-            time.monotonic(),
-        )
+        started = time.monotonic()
         self._lwd_up_post_recvs(scheduler_output)
 
         # finished_req_ids releases runner and host-stage request state.
@@ -159,12 +158,13 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_get_data_plane().poll_completions()  # lazy keepalive reap
         _t0 = time.monotonic()
         output = super().execute_model(scheduler_output)
-        # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
-        # whole forward pass (sample/collect are itemized separately in
-        # sample_tokens)
-        lwd_logger.debug(
-            "[Lwd][perf] cloud-exec total=%.2fms",
-            (time.monotonic() - _t0) * 1000,
+        # Host time around the forward pass, not NPU time: the device is
+        # asynchronous, so part of this step's queue drains into the next
+        # call. Sharpening it would take a synchronize, which would change
+        # the pipeline being measured.
+        self._lwd_worker_meter.note_execute(
+            pre_s=_t0 - started,
+            forward_s=time.monotonic() - _t0,
         )
         return output
 
@@ -468,17 +468,27 @@ class LwdCloudWorker(LwdWorkerBase):
             # The event belongs to this output generation and must be consumed
             # before the output crosses the process boundary.
             target.lwd_meta_ready_event = ready_event
-            # [Lwd][perf] Per-step cloud timing: sample = sampling +
-            # collection (rank computation included); send = the DOWN
-            # submit (snapshot clone + isend + bridge wait); total = the
-            # whole step without output-thread meta harvest.
-            lwd_logger.debug(
-                "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
-                seqno,
-                (_t_sample - _t0) * 1000,
-                (time.monotonic() - _t_sample) * 1000,
-                (time.monotonic() - _t0) * 1000,
-                hidden.shape[0] if hidden is not None else 0,
+            # The collect runs inside the runner's sample_tokens, so the
+            # native sampling is what is left of that call once the
+            # runner's own measure of the collect is taken out.
+            collect_s = self.model_runner.take_lwd_collect_seconds()
+            self._lwd_worker_meter.note_sample(
+                native_s=max(0.0, (_t_sample - _t0) - collect_s),
+                collect_s=collect_s,
+                submit_s=time.monotonic() - _t_sample,
+                seqno=seqno,
+                rows=hidden.shape[0] if hidden is not None else 0,
+            )
+        else:
+            # Only the DOWN endpoint rank collects and sends; the others
+            # still close their step here, or their execute halves would
+            # accumulate against a step count that never advances.
+            self._lwd_worker_meter.note_sample(
+                native_s=_t_sample - _t0,
+                collect_s=0.0,
+                submit_s=0.0,
+                seqno=-1,
+                rows=0,
             )
         return output
 
