@@ -98,10 +98,10 @@ msgstr "`C-Eval`数据集。"
 msgid ""
 "Take `C-Eval` dataset as an example. You can refer to "
 "[Datasets](https://github.com/AISBench/benchmark/tree/master/ais_bench/benchmark/configs/datasets)"
-" for more datasets. Each dataset has a `README.md` with detailed download "
+" for more datasets. Each dataset has a `README_vllm-ascend.md` with detailed download "
 "and installation instructions."
 msgstr ""
-"以`C-Eval`数据集为例。更多数据集请参考[Datasets](https://github.com/AISBench/benchmark/tree/master/ais_bench/benchmark/configs/datasets)。每个数据集都有`README.md`文件，包含详细的下载和安装说明。"
+"以`C-Eval`数据集为例。更多数据集请参考[Datasets](https://github.com/AISBench/benchmark/tree/master/ais_bench/benchmark/configs/datasets)。每个数据集都有`README_vllm-ascend.md`文件，包含详细的下载和安装说明。"
 
 #: ../../source/developer_guide/evaluation/using_ais_bench.md:86
 msgid "Download dataset and install it to specific path."

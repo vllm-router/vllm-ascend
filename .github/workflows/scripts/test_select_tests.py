@@ -516,7 +516,7 @@ def test_default_cpu_ut_always_runs(tmp_path, monkeypatch, capsys):
             "--config",
             str(config_path),
             "--changed-files",
-            "README.md",
+            "README_vllm-ascend.md",
         ],
     )
     select_tests.main()

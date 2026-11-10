@@ -614,10 +614,10 @@ msgstr "首先安装 Xlite："
 #: ../../source/user_guide/feature_guide/graph_mode.md:266
 msgid ""
 "For more details about Xlite, see the [Xlite "
-"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md)."
+"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README_vllm-ascend.md)."
 msgstr ""
 "有关 Xlite 的更多详细信息，请参阅 [Xlite "
-"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md)。"
+"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README_vllm-ascend.md)。"
 
 #: ../../source/user_guide/feature_guide/graph_mode.md:268
 msgid "Common Limitations and Caveats"
@@ -683,10 +683,10 @@ msgstr "参考资料"
 #: ../../source/user_guide/feature_guide/graph_mode.md:299
 msgid ""
 "[Xlite "
-"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md)"
+"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README_vllm-ascend.md)"
 msgstr ""
 "[Xlite "
-"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md)"
+"README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README_vllm-ascend.md)"
 
 #: ../../source/user_guide/feature_guide/graph_mode.md:300
 msgid ""
