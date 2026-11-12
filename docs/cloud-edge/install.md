@@ -5,7 +5,7 @@
 - 操作系统：openeuler
 - Python：>= 3.10, < 3.13
 - 配备昇腾 NPU 的硬件，通常为 Atlas 800 A2 系列。
-- dokcer软件
+- docker软件
 - 
 软件：
 
