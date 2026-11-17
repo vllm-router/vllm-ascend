@@ -229,7 +229,7 @@ export HCCL_WHITELIST_DISABLE="0"
 export HCCL_WHITELIST_FILE="<白名单文件路径>"
 export RANK_TABLE_FILE='<rank_table文件路径>'
 export HCCL_IF_BASE_PORT=<HCCL_IF_BASE_PORT>
-export CLOUD_MACHINE_A3=1
+export CLOUD_MACHINE_A3=1 #云侧使用A3需要使用该变量
 
 vllm serve <model_path> \
     --host 0.0.0.0 \
@@ -293,6 +293,7 @@ export VLLM_ASCEND_LWD_PRE_OUT_HOST=<云侧业务面IP>
 export HCCL_WHITELIST_DISABLE="0"
 export HCCL_WHITELIST_FILE="<白名单文件路径>"
 export RANK_TABLE_FILE='<rank_table文件路径>'
+export HCCL_INTER_HCCS_DISABLE=TRUE #云侧使用A3需要该变量
 
 vllm serve <model_path> \
     --master-addr <边侧业务面IP> \
